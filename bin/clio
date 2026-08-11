@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+# clio — launcher. Starts the daemon if it is not already up, then opens a window.
+set -euo pipefail
+
+# Resolve symlinks before working out where clio lives. Without this, running
+# via a link on PATH (~/.local/bin/clio) makes ROOT the link's parent, and the
+# daemon entry point silently cannot be found.
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+DAEMON_ENTRY="$ROOT/src/daemon/index.js"
+
+if [ ! -f "$DAEMON_ENTRY" ]; then
+  echo "clio: cannot find the daemon at $DAEMON_ENTRY" >&2
+  echo "clio: resolved its own location to $ROOT — is the install intact?" >&2
+  exit 1
+fi
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-$HOME/.cache}/clio"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/clio"
+HANDSHAKE="$RUNTIME_DIR/daemon.json"
+LOG="$STATE_DIR/daemon.log"
+
+mkdir -p "$RUNTIME_DIR" "$STATE_DIR"
+
+field() { # field <key> — read a value out of the handshake file
+  [ -f "$HANDSHAKE" ] || return 1
+  node -e '
+    const fs = require("fs");
+    try {
+      const info = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      if (info[process.argv[2]] === undefined) process.exit(1);
+      console.log(info[process.argv[2]]);
+    } catch { process.exit(1); }
+  ' "$HANDSHAKE" "$1"
+}
+
+daemon_pid() {
+  local pid
+  pid="$(field pid 2>/dev/null)" || return 1
+  # A pid in the file proves nothing on its own; the process has to still exist.
+  kill -0 "$pid" 2>/dev/null || return 1
+  echo "$pid"
+}
+
+# Fetch dependencies on first run so a fresh clone needs no separate setup step.
+ensure_deps() {
+  if [ -d "$ROOT/node_modules/node-pty" ] && [ -d "$ROOT/node_modules/ws" ]; then
+    return 0
+  fi
+  echo "clio: first run — installing dependencies (this happens once)…" >&2
+  if ! (cd "$ROOT" && npm install --omit=dev --no-audit --no-fund >&2); then
+    echo "clio: npm install failed. Run it yourself in $ROOT and try again." >&2
+    return 1
+  fi
+}
+
+start_daemon() {
+  if daemon_pid >/dev/null; then return 0; fi
+
+  ensure_deps || return 1
+  rm -f "$HANDSHAKE"
+  # setsid detaches the daemon from this shell's session, so closing the
+  # terminal that launched clio cannot take the ptys down with it.
+  setsid node "$DAEMON_ENTRY" >>"$LOG" 2>&1 < /dev/null &
+  disown 2>/dev/null || true
+
+  for _ in $(seq 1 100); do
+    if daemon_pid >/dev/null; then return 0; fi
+    sleep 0.05
+  done
+
+  echo >&2
+  echo "clio: THE DAEMON DID NOT START. Your shells are gone until it does." >&2
+  echo "clio: tried $DAEMON_ENTRY" >&2
+  echo "clio: last lines of $LOG:" >&2
+  tail -n 20 "$LOG" >&2 || true
+  return 1
+}
+
+# How many windows are currently connected to the daemon; -1 if unknown.
+client_count() {
+  node -e '
+    const fs = require("fs");
+    try {
+      const i = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      fetch(`http://127.0.0.1:${i.port}/clients?token=${i.token}`)
+        .then((r) => r.json())
+        .then((j) => console.log(j.count))
+        .catch(() => console.log(-1));
+    } catch { console.log(-1); }
+  ' "$HANDSHAKE" 2>/dev/null || echo -1
+}
+
+open_window() {
+  local url
+  url="$(field url)" || { echo "clio: no daemon URL available" >&2; return 1; }
+
+  local browser=""
+  for candidate in google-chrome google-chrome-stable chromium chromium-browser brave-browser; do
+    if command -v "$candidate" >/dev/null 2>&1; then browser="$candidate"; break; fi
+  done
+
+  if [ -z "$browser" ]; then
+    echo "clio: no Chrome-family browser found; open this URL yourself:" >&2
+    echo "$url"
+    return 1
+  fi
+
+  launch() {
+    # A dedicated profile keeps the terminal out of the everyday browsing
+    # profile: no extensions injecting into it, no session-restore prompts, and
+    # clipboard permission is granted once here rather than against normal
+    # browsing.
+    #
+    # setsid, as for the daemon: without its own session the browser stays in
+    # this shell's process group and dies whenever whatever invoked clio is
+    # cleaned up — closing the terminal, or a script finishing.
+    setsid "$browser" \
+      --app="$url" \
+      --user-data-dir="$STATE_DIR/browser-profile" \
+      --class=clio \
+      --window-size=1100,700 \
+      --no-first-run \
+      --no-default-browser-check \
+      --disable-features=Translate,MediaRouter \
+      >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+  }
+
+  # Closing a window and reopening straight away can catch the browser still
+  # releasing its profile lock, in which case it exits without ever showing
+  # anything. Watch for the window actually connecting, and try once more
+  # rather than leaving the user staring at an empty desktop.
+  local before attempt count
+  before="$(client_count)"
+
+  for attempt in 1 2; do
+    launch
+    for _ in $(seq 1 40); do
+      sleep 0.25
+      count="$(client_count)"
+      if [ "$count" -gt "$before" ] 2>/dev/null; then return 0; fi
+    done
+    [ "$attempt" -eq 1 ] && echo "clio: the window did not appear — retrying…" >&2
+  done
+
+  echo "clio: could not open a window. Open this URL manually:" >&2
+  echo "$url" >&2
+  return 1
+}
+
+install_desktop() {
+  local apps="$HOME/.local/share/applications"
+  local icons="$HOME/.local/share/icons/hicolor"
+  mkdir -p "$apps" "$HOME/.local/bin"
+
+  # Crisp icons at every panel size. Chrome only ever publishes a 16x16 window
+  # icon, so the panel needs its own copies to match the window by WM_CLASS.
+  local installed=0
+  for size in 256 128 48 32; do
+    if [ -f "$ROOT/assets/icon-$size.png" ]; then
+      mkdir -p "$icons/${size}x${size}/apps"
+      cp "$ROOT/assets/icon-$size.png" "$icons/${size}x${size}/apps/clio.png"
+      installed=$((installed + 1))
+    fi
+  done
+  if [ -f "$ROOT/assets/icon.svg" ]; then
+    mkdir -p "$icons/scalable/apps"
+    cp "$ROOT/assets/icon.svg" "$icons/scalable/apps/clio.svg"
+  fi
+
+  cat > "$apps/clio.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=clio
+GenericName=Terminal
+Comment=The immortal terminal
+Exec=$SELF
+Icon=clio
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;console;
+StartupWMClass=clio
+DESKTOP
+  chmod +x "$apps/clio.desktop"
+
+  ln -sf "$SELF" "$HOME/.local/bin/clio"
+
+  command -v gtk-update-icon-cache >/dev/null 2>&1 && \
+    gtk-update-icon-cache -f -t "$icons" >/dev/null 2>&1 || true
+  command -v update-desktop-database >/dev/null 2>&1 && \
+    update-desktop-database "$apps" >/dev/null 2>&1 || true
+
+  echo "Installed:"
+  echo "  $apps/clio.desktop"
+  echo "  $installed icon size(s) into $icons"
+  echo "  $HOME/.local/bin/clio -> $SELF"
+  echo
+  echo "clio is now in your applications menu, and the panel will show its icon."
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) echo "You can run it as: clio" ;;
+    *) echo "Add ~/.local/bin to your PATH to run it as just: clio" ;;
+  esac
+}
+
+case "${1:-run}" in
+  run)
+    start_daemon
+    open_window
+    ;;
+
+  install)
+    install_desktop
+    ;;
+
+  start)
+    start_daemon
+    echo "clio daemon running (pid $(daemon_pid), $(field url | sed 's/?token=.*//'))"
+    ;;
+
+  open)
+    start_daemon
+    open_window
+    ;;
+
+  stop)
+    if pid="$(daemon_pid)"; then
+      echo "Stopping clio daemon (pid $pid). Sessions are saved and can be restored."
+      kill -TERM "$pid"
+    else
+      echo "clio daemon is not running."
+    fi
+    ;;
+
+  crash)
+    # Deliberately ungraceful: SIGKILL gives the daemon no chance to save on the
+    # way out, so this exercises the same path as a power cut, not a clean stop.
+    if pid="$(daemon_pid)"; then
+      echo "Killing clio daemon (pid $pid) with SIGKILL — no clean shutdown."
+      kill -9 "$pid"
+      sleep 1
+      echo "Restarting…"
+      start_daemon
+      echo
+      echo "Your open window should reconnect on its own within ~10 seconds and"
+      echo "offer to restore each tab. If no window is open, run: $0"
+    else
+      echo "clio daemon is not running."
+    fi
+    ;;
+
+  status)
+    if pid="$(daemon_pid)"; then
+      echo "daemon:   running (pid $pid)"
+      echo "address:  $(field url | sed 's/?token=.*//')"
+      node -e '
+        const fs = require("fs");
+        const path = process.argv[1];
+        try {
+          const state = JSON.parse(fs.readFileSync(path, "utf8"));
+          console.log(`sessions: ${state.sessions.length}`);
+          for (const s of state.sessions) {
+            const label = s.title || s.command || s.cwd || "shell";
+            console.log(`  - ${s.id}  ${label}`);
+          }
+        } catch {
+          console.log("sessions: (no saved state yet)");
+        }
+      ' "$STATE_DIR/state.json"
+    else
+      echo "daemon:   not running"
+      echo "Run 'clio start' to bring it back; saved tabs will be offered for restore."
+    fi
+    ;;
+
+  log)
+    tail -n "${2:-50}" "$LOG"
+    ;;
+
+  *)
+    cat <<'USAGE'
+clio — the immortal terminal
+
+  clio            start the daemon if needed and open a window
+  clio install    add to the applications menu, panel icon and PATH
+  clio start      start the daemon only
+  clio open       open another window onto the running daemon
+  clio stop       stop the daemon (state is saved for restore)
+  clio crash      SIGKILL the daemon and restart it, to test session restore
+  clio status     show daemon and session state
+  clio log [n]    tail the daemon log
+USAGE
+    exit 1
+    ;;
+esac

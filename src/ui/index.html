@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>clio</title>
+    <!-- Chrome uses these for the app window's taskbar icon, largest first. -->
+    <link rel="icon" type="image/png" sizes="256x256" href="/icon.png" />
+    <link rel="icon" type="image/png" sizes="128x128" href="/icon-128.png" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/icon-32.png" />
+    <link rel="stylesheet" href="/vendor/xterm.css" />
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div id="tabbar">
+      <div id="tabs">
+        <button id="newtab" title="New tab (Ctrl+Shift+T)">+</button>
+      </div>
+      <div id="fontsize">
+        <button id="font-down" title="Smaller text">&#9662;</button>
+        <button id="font-up" title="Larger text">&#9652;</button>
+      </div>
+    </div>
+
+    <div id="panes"></div>
+
+    <div id="status" hidden></div>
+
+    <div id="ctxmenu" hidden></div>
+
+    <div id="deadscreen" hidden></div>
+
+    <script src="/vendor/xterm.js"></script>
+    <script src="/vendor/addon-fit.js"></script>
+    <script src="/vendor/addon-web-links.js"></script>
+    <script src="/app.js"></script>
+  </body>
+</html>
