@@ -22,6 +22,18 @@ ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 CLIO="$ROOT/bin/clio"
 TMP="$(mktemp -d)"
 
+# A clio of this test's own, from the first line to the last.
+#
+# Everything below drives the launcher for real — `clio stop`, and `clio crash`,
+# which SIGKILLs the daemon it finds and starts another. The daemon it finds is
+# whichever one these two variables point at, so inheriting them means a test
+# run reaching into the shells somebody is working in: their processes killed,
+# their tabs rebuilt around new ones, and their daemon left running out of this
+# checkout. That is not a thing a test may do, however carefully the sections
+# further down isolate themselves.
+export XDG_RUNTIME_DIR="$TMP/run" XDG_STATE_HOME="$TMP/state"
+mkdir -p "$XDG_RUNTIME_DIR" "$XDG_STATE_HOME"
+
 XVFB_PID=""
 WM_PID=""
 
@@ -211,27 +223,56 @@ if command -v wmctrl >/dev/null 2>&1 && start_display; then
   check "the daemon tracks them as two separate windows" $?
 
   echo
-  echo "7. closing a window closes its tabs"
-  # What closing a terminal window has always meant. The daemon is there so that
-  # the daemon dying cannot take your shells; closing a window is not that.
+  echo "7. closing a window keeps its tabs"
+  # Closing a window closes the window. The shells in it are the work, and they
+  # go on running under a name until somebody opens them again — which is the
+  # whole of what clio is for, applied to the case people actually hit.
   close_ours
   [ "$(on_screen)" -eq 0 ]; check "closing them leaves nothing on screen" $?
   sleep 13 # past the grace period the daemon allows for a page reloading
-  [ "$("$CLIO" status | grep -c '^  window ')" -eq 0 ]
-  check "and the shells in them are gone" $?
+  [ "$("$CLIO" status | grep -c '^  window ')" -eq 2 ]
+  check "both windows are still known to the daemon" $?
+  [ "$("$CLIO" status | grep -c 'closed, its shells are still running')" -eq 2 ]
+  check "as closed, with their shells still running" $?
+  "$CLIO" windows | grep -q "Closed windows, still running"
+  check "and clio windows lists them" $?
 
+  # With windows waiting, `clio` is a question rather than an answer: one window
+  # opens onto the picker instead of two windows opening themselves.
   "$CLIO" >/dev/null 2>&1; rc=$?
   [ $rc -eq 0 ]; check "clio still opens a window afterwards" $?
-  sleep 2
-  [ "$(on_screen)" -eq 1 ]; check "a fresh one, not the two just closed" $?
+  sleep 3
+  [ "$(on_screen)" -eq 1 ]; check "one window, to choose in — not the two just closed" $?
+  [ "$("$CLIO" status | grep -c 'closed, its shells are still running')" -eq 2 ]
+  check "and choosing nothing leaves both where they were" $?
+  close_ours
+  sleep 13
 
   echo
   echo "7b. windows come back from a daemon that died"
   # The loss clio does exist for, in the only order a reboot can happen in: the
   # daemon goes first, so nothing is left to hear the windows close.
-  "$CLIO" >/dev/null 2>&1
-  sleep 2
-  [ "$(on_screen)" -eq 2 ]; check "two windows open again" $?
+  #
+  # Both windows are put back by name first — the terminal's way into the same
+  # picker — so that what is on screen when the daemon is killed is known.
+  # Names can carry spaces, so they come out of the daemon one per line rather
+  # than through word splitting.
+  kept_names() {
+    node -e '
+      const fs = require("fs");
+      const info = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      fetch(`http://127.0.0.1:${info.port}/status?token=${info.token}`)
+        .then((r) => r.json())
+        .then((s) => s.containers.filter((c) => c.saved).forEach((c) => console.log(c.name || c.id)));
+    ' "$XDG_RUNTIME_DIR/clio/daemon.json"
+  }
+
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    "$CLIO" open "$name" >/dev/null 2>&1
+    sleep 2
+  done < <(kept_names)
+  [ "$(on_screen)" -eq 2 ]; check "two windows open again, by name" $?
   kill -9 "$(pid_now)" 2>/dev/null || true
   sleep 1
   close_ours

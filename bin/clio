@@ -80,15 +80,17 @@ start_daemon() {
 # the tab row asks for one too and cannot spawn a browser, so both go through
 # the same path and a window opened either way is the same window.
 #
-# This brings back every set of tabs that has no window on it — that is how two
-# windows left open before a reboot come back as two windows — and opens a new
-# one only when there was nothing to restore. The display variables go with the
-# request because the daemon may have been started from a session that has since
-# gone away, leaving it pointing at a display that no longer exists.
-open_windows() {
+# Every window that was open when the daemon last stopped comes back — that is
+# how two windows left open before a reboot come back as two windows. With none
+# of those but some closed and kept, one window opens onto the picker and the
+# choice is the user's. With neither, a new window. The display variables go
+# with the request because the daemon may have been started from a session that
+# has since gone away, leaving it pointing at a display that no longer exists.
+open_windows() { # open_windows [name-or-id of one window to open]
   node -e '
     const fs = require("fs");
     const file = process.argv[1];
+    const container = process.argv[2] || null;
 
     let info;
     try {
@@ -107,7 +109,7 @@ open_windows() {
     fetch(`http://127.0.0.1:${info.port}/windows?token=${info.token}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ cwd: process.cwd(), env }),
+      body: JSON.stringify({ cwd: process.cwd(), env, container }),
     })
       .then((res) => res.json())
       .then((out) => {
@@ -121,6 +123,38 @@ open_windows() {
       })
       .catch((err) => {
         console.error(`clio: the daemon did not open a window (${err.message})`);
+        process.exit(1);
+      });
+  ' "$HANDSHAKE" "${1:-}"
+}
+
+# The picker, for people who are already in a terminal. Everything it lists is a
+# window that was closed with shells still running in it.
+list_windows() {
+  node -e '
+    const fs = require("fs");
+    const info = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    fetch(`http://127.0.0.1:${info.port}/status?token=${info.token}`)
+      .then((res) => res.json())
+      .then((state) => {
+        const kept = state.containers.filter((c) => c.saved);
+        if (!kept.length) {
+          console.log("No closed windows are waiting. Run clio for a new one.");
+          return;
+        }
+        console.log("Closed windows, still running:");
+        for (const container of kept) {
+          const tabs = container.sessions.length;
+          console.log(`  ${container.name || container.id}  (${tabs} tab${tabs === 1 ? "" : "s"})`);
+          for (const tab of container.sessions) {
+            console.log(`      ${tab.title || tab.command || tab.cwd || "shell"}`);
+          }
+        }
+        console.log();
+        console.log("Open one with: clio open <name>");
+      })
+      .catch(() => {
+        console.error("clio: the daemon did not answer");
         process.exit(1);
       });
   ' "$HANDSHAKE"
@@ -140,7 +174,21 @@ reload_daemon() {
   node -e '
     const fs = require("fs");
     const info = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-    fetch(`http://127.0.0.1:${info.port}/reload?token=${info.token}`, { method: "POST" })
+
+    // Which clio to become, and which desktop it is on. A daemon started from a
+    // copy of the tree, or from a session with no display, is put right by
+    // being reloaded from the installation you are running here.
+    const env = {};
+    for (const key of ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY",
+                       "DBUS_SESSION_BUS_ADDRESS", "XDG_SESSION_TYPE"]) {
+      if (process.env[key]) env[key] = process.env[key];
+    }
+
+    fetch(`http://127.0.0.1:${info.port}/reload?token=${info.token}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ entry: process.argv[2], env }),
+    })
       .then((res) => {
         if (res.status === 202) return;
         if (res.status === 404) {
@@ -156,7 +204,7 @@ reload_daemon() {
         console.error(`clio: could not ask for a reload (${err.message})`);
         process.exit(1);
       });
-  ' "$HANDSHAKE" || return 1
+  ' "$HANDSHAKE" "$DAEMON_ENTRY" || return 1
 
   # The successor writes the handshake file only once it holds the shells, so a
   # new pid there is the whole proof that this worked.
@@ -239,6 +287,23 @@ case "${1:-run}" in
     open_windows
     ;;
 
+  windows)
+    if daemon_pid >/dev/null; then
+      list_windows
+    else
+      echo "clio daemon is not running — run clio to start it and bring the windows back."
+    fi
+    ;;
+
+  open)
+    if [ -z "${2:-}" ]; then
+      echo "clio: which window? Run 'clio windows' to see what is waiting." >&2
+      exit 1
+    fi
+    start_daemon
+    open_windows "$2"
+    ;;
+
   install)
     install_desktop
     ;;
@@ -317,16 +382,21 @@ case "${1:-run}" in
           .then((res) => res.json())
           .then((state) => {
             const shown = state.containers.filter((c) => c.onScreen).length;
-            console.log(`windows:  ${state.containers.length} (${shown} on screen)`);
+            const kept = state.containers.filter((c) => c.saved).length;
+            console.log(
+              `windows:  ${state.containers.length} (${shown} on screen` +
+                (kept ? `, ${kept} closed and kept` : "") + ")",
+            );
             state.containers.forEach((container, index) => {
-              // A window with nothing on it is either one the daemon is about to
-              // clear up after, or one left over from a daemon that went down.
+              // A window with nothing on it was either closed and put away, or
+              // left behind by a daemon that went down.
+              const name = container.name ? ` “${container.name}”` : "";
               const note = container.onScreen
                 ? ""
-                : container.closing
-                  ? "  — window closed, its shells are ending"
+                : container.saved
+                  ? "  — closed, its shells are still running; open it from the picker"
                   : "  — no window on it, run clio to bring it back";
-              console.log(`  window ${index + 1}${note}`);
+              console.log(`  window ${index + 1}${name}${note}`);
               for (const tab of container.sessions) {
                 console.log(`    ${tab.id}  ${tab.title || tab.command || tab.cwd || "shell"}`);
               }
@@ -343,7 +413,9 @@ case "${1:-run}" in
           const containers = state.containers?.length ? state.containers : [{ id: null }];
           console.log(`saved:    ${state.sessions.length} tab(s) in ${containers.length} window(s)`);
           containers.forEach((container, index) => {
-            console.log(`  window ${index + 1}`);
+            const name = container.name ? ` “${container.name}”` : "";
+            const note = container.closedAt ? "  — was closed and kept" : "";
+            console.log(`  window ${index + 1}${name}${note}`);
             for (const tab of state.sessions) {
               if (container.id && tab.container !== container.id) continue;
               console.log(`    ${tab.id}  ${tab.title || tab.command || tab.cwd || "shell"}`);
@@ -354,7 +426,8 @@ case "${1:-run}" in
         }
       ' "$STATE_DIR/state.json"
       echo
-      echo "Run 'clio' to bring it back: every saved window reopens with its tabs."
+      echo "Run 'clio' to bring it back: every window that was open reopens with its"
+      echo "tabs, and any you closed are offered by name."
     fi
     ;;
 
@@ -366,7 +439,10 @@ case "${1:-run}" in
     cat <<'USAGE'
 clio — the immortal terminal
 
-  clio            reopen the windows a stopped daemon left, or start a new one
+  clio            reopen the windows a stopped daemon left, offer the ones you
+                  closed, or start a new one
+  clio windows    list the windows you closed, whose shells are still running
+  clio open NAME  put one of those back on screen
   clio install    add to the applications menu, panel icon and PATH
   clio start      start the daemon only
   clio reload     run the code that is on disk now, keeping every shell running

@@ -23,6 +23,37 @@ function newId() {
   return randomBytes(6).toString('hex');
 }
 
+function basename(path) {
+  const parts = String(path || '').split('/').filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : '';
+}
+
+/**
+ * Put the terminal back the way a shell expects to find it.
+ *
+ * A full-screen program turns things on at startup — mouse reporting, focus
+ * reporting, bracketed paste, the alternate screen — and turns them off again
+ * on the way out. One that was killed never got to. Those modes belong to the
+ * terminal, not the process, so they outlive it: the next shell inherits a
+ * terminal that answers every mouse twitch with an escape sequence, which the
+ * shell has no idea what to do with and echoes as line noise at the prompt.
+ *
+ * It goes into the scrollback ahead of the seam rather than being written to
+ * the pty, because the replay is what actually reaches a terminal — including
+ * the replay into a window that opens tomorrow.
+ */
+const RESET_MODES = [
+  '\x1b[?1049l', // leave the alternate screen
+  '\x1b[?1000l\x1b[?1002l\x1b[?1003l', // mouse click, drag and motion reporting off
+  '\x1b[?1005l\x1b[?1006l\x1b[?1015l', // and the extended encodings that carry them
+  '\x1b[?1004l', // focus in/out reporting off
+  '\x1b[?2004l', // bracketed paste off
+  '\x1b[?1l\x1b>', // cursor keys and keypad back to normal
+  '\x1b[r', // scrolling region back to the whole screen
+  '\x1b[?7h\x1b[?25h', // wrap back on, cursor visible again
+  '\x1b(B\x1b[0m', // ASCII charset, no leftover colours or bold
+].join('');
+
 /**
  * Owns every pty on the machine for this user, independent of any window.
  *
@@ -36,6 +67,15 @@ export class SessionManager extends EventEmitter {
     this.containers = new Map();
     this.nextContainerOrder = 0;
     this.stateTimer = null;
+    /**
+     * What the launcher last said about the desktop this is running on, handed
+     * to every shell opened from here.
+     *
+     * The daemon's own environment is whatever started it, which may be a shell
+     * with no display in it — and a terminal whose tabs cannot open a link, or
+     * reach the session bus, is a terminal that quietly does not work.
+     */
+    this.launchEnv = {};
 
     this.procTimer = setInterval(() => this.pollProcInfo(), PROC_POLL_MS);
     this.flushTimer = setInterval(() => this.flushScrollback(), SCROLLBACK_FLUSH_MS);
@@ -59,6 +99,12 @@ export class SessionManager extends EventEmitter {
    * and brought back with the same tabs in it, and what stops two windows from
    * being two views of one set of shells — where a tab closed in one vanishes
    * from under the other.
+   *
+   * A container is either open — a window is showing it, or was showing it when
+   * the daemon last went down — or closed, meaning the window was closed and
+   * the tabs were put away under a name to be opened again later. `closedAt` is
+   * the whole difference, and it is what `clio` reads to decide which windows
+   * to put back on screen by itself and which to offer.
    */
 
   containerList() {
@@ -79,10 +125,113 @@ export class SessionManager extends EventEmitter {
     const existing = this.containers.get(wanted);
     if (existing) return existing;
 
-    const container = { id: wanted, order: this.nextContainerOrder++ };
+    const container = {
+      id: wanted,
+      order: this.nextContainerOrder++,
+      name: null,
+      closedAt: null,
+    };
     this.containers.set(wanted, container);
     this.scheduleSave();
     return container;
+  }
+
+  /** Rebuild a container from a saved or handed-over record. */
+  absorbContainer(saved) {
+    if (!saved?.id || !CONTAINER_ID.test(saved.id)) return null;
+    const order = Number.isFinite(saved.order) ? saved.order : this.nextContainerOrder;
+    const container = {
+      id: saved.id,
+      order,
+      name: typeof saved.name === 'string' && saved.name.trim() ? saved.name.trim() : null,
+      closedAt: Number.isFinite(saved.closedAt) ? saved.closedAt : null,
+    };
+    this.containers.set(container.id, container);
+    this.nextContainerOrder = Math.max(this.nextContainerOrder, order + 1);
+    return container;
+  }
+
+  /**
+   * Put a window away rather than ending it.
+   *
+   * Closing a window closes the window. The shells in it are the work, not the
+   * frame around it, and they carry on running exactly as they do when the
+   * daemon is replaced under them — the tabs are simply not on screen for a
+   * while. The group keeps a name so it can be told apart from every other one
+   * when it is opened again.
+   */
+  parkContainer(containerId) {
+    const container = this.containers.get(containerId);
+    if (!container) return 0;
+
+    const sessions = this.sessionsIn(containerId);
+    // Nothing to put away: this window's last tab was closed, which is the one
+    // way of ending shells that is unambiguously what was asked for.
+    if (!sessions.length) {
+      this.containers.delete(containerId);
+      this.scheduleSave();
+      return 0;
+    }
+
+    if (!container.name) container.name = this.suggestName(sessions);
+    container.closedAt = Date.now();
+    this.scheduleSave();
+    this.emit('containers');
+    return sessions.length;
+  }
+
+  /** A window is showing this container again, so it is no longer put away. */
+  reviveContainer(containerId) {
+    const container = this.containers.get(containerId);
+    if (!container || container.closedAt === null) return;
+    container.closedAt = null;
+    this.scheduleSave();
+    this.emit('containers');
+  }
+
+  renameContainer(containerId, name) {
+    const container = this.containers.get(containerId);
+    if (!container) return;
+    container.name = name && name.trim() ? name.trim().slice(0, 80) : null;
+    this.scheduleSave();
+    this.emit('containers');
+  }
+
+  /**
+   * A name for a window nobody has named, taken from what is in it — the same
+   * thing its first tab is labelled with, which is what the person closing it
+   * was just looking at. Duplicates are numbered rather than merged: two
+   * windows both full of `core` are still two windows.
+   */
+  suggestName(sessions) {
+    const first = sessions[0];
+    const base =
+      first?.title ||
+      (first?.command ? basename(first.command.split(/\s+/)[0]) : '') ||
+      basename(first?.cwd || '') ||
+      'shell';
+
+    const taken = new Set([...this.containers.values()].map((c) => c.name).filter(Boolean));
+    if (!taken.has(base)) return base;
+    for (let n = 2; ; n++) {
+      const candidate = `${base} (${n})`;
+      if (!taken.has(candidate)) return candidate;
+    }
+  }
+
+  /** What the window picker shows for one container. */
+  describeContainer(container) {
+    const sessions = this.sessionsIn(container.id);
+    return {
+      id: container.id,
+      name: container.name || this.suggestName(sessions),
+      closedAt: container.closedAt,
+      tabs: sessions.map((s) => ({
+        id: s.id,
+        label: s.title || (s.command ? basename(s.command.split(/\s+/)[0]) : '') || basename(s.cwd) || '~',
+        cwd: s.cwd,
+      })),
+    };
   }
 
   /**
@@ -100,9 +249,9 @@ export class SessionManager extends EventEmitter {
   /**
    * End a whole window: every shell in it dies and the container is forgotten.
    *
-   * This is what closing a window means, here as in any other terminal. The
-   * daemon exists so that a *daemon* going down does not take the shells with
-   * it — not so that a window you closed can be undone.
+   * Closing a window does not come here — that puts it away, see parkContainer.
+   * This is for a group somebody has asked to be rid of, in the one place that
+   * offers it: the picker that would otherwise go on listing it forever.
    */
   closeContainer(containerId) {
     for (const session of this.sessionsIn(containerId)) this.close(session.id);
@@ -121,12 +270,7 @@ export class SessionManager extends EventEmitter {
   restoreFromDisk() {
     const { containers, sessions } = readState();
 
-    for (const saved of containers) {
-      if (!saved?.id || !CONTAINER_ID.test(saved.id)) continue;
-      const order = Number.isFinite(saved.order) ? saved.order : this.nextContainerOrder;
-      this.containers.set(saved.id, { id: saved.id, order });
-      this.nextContainerOrder = Math.max(this.nextContainerOrder, order + 1);
-    }
+    for (const saved of containers) this.absorbContainer(saved);
 
     // Tabs saved before windows were first-class do not name one. They were all
     // being shown by a single window, so that is what they come back as.
@@ -170,12 +314,7 @@ export class SessionManager extends EventEmitter {
    * seam, no redraw, nothing restarted. A shell cannot tell this happened.
    */
   adoptHandover({ containers = [], sessions = [] }) {
-    for (const saved of containers) {
-      if (!saved?.id || !CONTAINER_ID.test(saved.id)) continue;
-      const order = Number.isFinite(saved.order) ? saved.order : this.nextContainerOrder;
-      this.containers.set(saved.id, { id: saved.id, order });
-      this.nextContainerOrder = Math.max(this.nextContainerOrder, order + 1);
-    }
+    for (const saved of containers) this.absorbContainer(saved);
 
     for (const saved of sessions) {
       if (!saved?.id) continue;
@@ -242,7 +381,7 @@ export class SessionManager extends EventEmitter {
       container: this.openContainer(container).id,
     });
     this.wire(session);
-    session.spawn({ cwd: session.cwd, cols, rows });
+    session.spawn({ cwd: session.cwd, cols, rows, env: this.launchEnv });
     this.sessions.set(session.id, session);
     this.scheduleSave();
     this.emit('update');
@@ -263,10 +402,10 @@ export class SessionManager extends EventEmitter {
     const note = session.command
       ? `──── new shell ${when} — ${session.command} was running here and was not restarted ────`
       : `──── new shell ${when} ────`;
-    session.append(`\r\n\x1b[38;5;244m${note}\x1b[0m\r\n`);
+    session.append(`${RESET_MODES}\r\n\x1b[38;5;244m${note}\x1b[0m\r\n`);
 
     try {
-      session.spawn({ cwd: this.validCwd(session.cwd), cols, rows });
+      session.spawn({ cwd: this.validCwd(session.cwd), cols, rows, env: this.launchEnv });
     } catch (err) {
       // Say so in the tab itself. The alternative is a pane that silently
       // swallows everything typed into it.

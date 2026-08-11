@@ -63,6 +63,7 @@ const el = {
   panes: document.getElementById('panes'),
   status: document.getElementById('status'),
   ctxmenu: document.getElementById('ctxmenu'),
+  picker: document.getElementById('picker'),
   fontUp: document.getElementById('font-up'),
   fontDown: document.getElementById('font-down'),
   devbadge: document.getElementById('devbadge'),
@@ -113,53 +114,13 @@ function setFontSize(next) {
 const stepUp = () => setFontSize(Math.floor(fontSize) + 1);
 const stepDown = () => setFontSize(Math.ceil(fontSize) - 1);
 
-// ------------------------------------------------------------- closing guard
-
 /*
- * Closing a window ends every shell in it. That is what closing a terminal
- * window has always meant, and the tabs do not come back — the daemon is there
- * so that a *daemon* going down cannot take your shells with it, not so that a
- * window you closed can be undone. Worth a question, then, and worth being able
- * to turn the question off.
+ * Nothing guards closing a window any more, and nothing should.
  *
- * Kept beside the font size in this profile's storage, so the answer holds for
- * every clio window rather than for whichever one it was given in.
+ * There used to be a browser dialog here, because closing a window ended every
+ * shell in it. It does not: the tabs are put away under a name and come back
+ * from the picker, so the question it asked no longer has anything behind it.
  */
-const WARN_KEY = 'clio.warnOnClose';
-
-function loadWarnOnClose() {
-  try {
-    return localStorage.getItem(WARN_KEY) !== 'off';
-  } catch {
-    return true;
-  }
-}
-
-let warnOnClose = loadWarnOnClose();
-
-function setWarnOnClose(next) {
-  warnOnClose = next;
-  try {
-    localStorage.setItem(WARN_KEY, next ? 'on' : 'off');
-  } catch {
-    /* the setting simply will not persist */
-  }
-}
-
-/*
- * The browser's own dialog is the only one available here: a window being torn
- * down cannot be drawn over, so anything of ours would go unseen. Chrome writes
- * the wording; all this decides is whether it appears at all.
- *
- * Nothing to ask about with no tabs left — closing the last one is what closes
- * the window — nor when this window has already been disowned and its shells
- * belong to somebody else.
- */
-window.addEventListener('beforeunload', (event) => {
-  if (!warnOnClose || disowned || !sessions.size) return;
-  event.preventDefault();
-  event.returnValue = ''; // older browsers want a value, not just a cancelled event
-});
 
 function updateFontButtons() {
   const shown = Number.isInteger(fontSize) ? fontSize : fontSize.toFixed(1);
@@ -187,12 +148,26 @@ let order = [];
  * window's shells.
  */
 let containerId = new URLSearchParams(location.search).get('c') || '';
+/**
+ * This window has not been told which tabs it is showing yet.
+ *
+ * It opened onto the picker: there are windows put away, and which of them —
+ * or none of them — this frame becomes is the user's to say. Everything that
+ * would otherwise happen to an empty window, opening a first tab above all,
+ * waits for that answer.
+ */
+let picking = new URLSearchParams(location.search).get('pick') === '1';
+/** The name this window was given, if it has one. */
+let windowName = null;
 let ws = null;
 let reconnectDelay = 250;
 let HOME = '';
 let bootstrapped = false;
 // Set when the daemon is reachable but refuses this window's credentials.
 let disowned = false;
+// Set when the daemon closed our socket to make way for a new one running the
+// code on disk now; see connect().
+let daemonReplaced = false;
 let lastTabsSignature = null;
 let renaming = false;
 
@@ -204,19 +179,36 @@ let renaming = false;
 //
 // The container id stays: it is this window's identity, and a reload that lost
 // it would come back showing somebody else's tabs.
+function query() {
+  const parts = [];
+  if (containerId) parts.push(`c=${encodeURIComponent(containerId)}`);
+  // Kept in the address bar as well, so that reloading a window still on the
+  // picker comes back to the picker rather than quietly opening a shell.
+  if (picking) parts.push('pick=1');
+  return parts.length ? `?${parts.join('&')}` : '';
+}
+
 function rememberContainer() {
-  const query = containerId ? `?c=${encodeURIComponent(containerId)}` : '';
-  history.replaceState(null, '', `${location.pathname}${query}`);
+  history.replaceState(null, '', `${location.pathname}${query()}`);
 }
 
 if (new URLSearchParams(location.search).has('token')) rememberContainer();
 
 function connect() {
   if (disowned) return;
-  const query = containerId ? `?c=${encodeURIComponent(containerId)}` : '';
-  ws = new WebSocket(`ws://${location.host}/${query}`);
+  ws = new WebSocket(`ws://${location.host}/${query()}`);
 
   ws.onopen = () => {
+    // The daemon that dropped us was making way for one running the code on
+    // disk now. The shells came across untouched, but this page is still the
+    // version that was served before the swap — so it is one reload behind the
+    // clio the user just asked for, and every window has to be told before it
+    // is worth having asked. Nothing is lost: the tabs are in the daemon.
+    if (daemonReplaced) {
+      location.reload();
+      return;
+    }
+
     reconnectDelay = 250;
     disowned = false;
     hideStatus();
@@ -235,7 +227,10 @@ function connect() {
     // 1012 is the daemon saying it is being replaced, not that it has gone: a
     // successor is already coming up with these shells still running. Backing
     // off would leave the window dark for seconds after it could have returned.
-    if (event.code === 1012) reconnectDelay = 250;
+    if (event.code === 1012) {
+      reconnectDelay = 250;
+      daemonReplaced = true;
+    }
     if (!disowned) reconnect();
   };
 
@@ -309,12 +304,30 @@ function handle(msg) {
     case 'sessions':
       // The daemon has the last word on which container this is: it names one
       // when we arrive without an id, and again if the one we asked for is gone.
+      // Being handed a different one is also the answer to the picker — the
+      // only thing that moves a window from one set of tabs to another.
       if (msg.container && msg.container !== containerId) {
         containerId = msg.container;
-        rememberContainer();
+        settle();
       }
+      windowName = msg.name || null;
       setDev(msg.dev);
       syncSessions(msg.sessions, msg.home);
+      refreshTitle();
+      break;
+
+    // The windows that were closed and kept, for a window that has not been
+    // told which tabs it is showing yet.
+    case 'groups':
+      if (!picking) break;
+      // Nothing to choose between: the last one was taken by another window
+      // while this was on its way up. Asking would be asking about an empty
+      // list, so this becomes an ordinary new window.
+      if (!msg.groups?.length && el.picker.hidden) {
+        chooseNewWindow();
+        break;
+      }
+      renderPicker(msg.groups || [], msg.error);
       break;
 
     // The UI files on disk changed. Nothing here is compiled or cached, so the
@@ -349,7 +362,7 @@ function handle(msg) {
       const pane = ensurePane(msg.id);
       pane.attached = true;
       pane.term.reset();
-      if (msg.scrollback) pane.term.write(msg.scrollback);
+      if (msg.scrollback) replay(pane, msg.scrollback);
       renderTabs();
       break;
     }
@@ -391,6 +404,9 @@ function syncSessions(list, home) {
   order = list.slice().sort((a, b) => a.order - b.order).map((m) => m.id);
 
   if (!sessions.size) {
+    // Still on the picker: this window is empty because it has not been told
+    // what to be yet, and opening a shell in it would be answering for the user.
+    if (picking) return;
     // Opening onto an empty daemon means a fresh start; running out of tabs
     // later means the user closed the last one, which should close the window.
     if (bootstrapped) {
@@ -433,6 +449,249 @@ function newTab() {
 function newWindow() {
   const cwd = activeId ? sessions.get(activeId)?.cwd : null;
   send({ t: 'newwindow', cwd });
+}
+
+// -------------------------------------------------------------- window picker
+
+/*
+ * Which set of tabs this window is going to be.
+ *
+ * Closing a window puts its tabs away rather than ending them, so over a few
+ * days there are several sitting in the daemon with shells still running in
+ * them. A window that opens while any of those exist opens here first: the list
+ * of what is waiting, and the choice to take one or start something new. It is
+ * the only screen in clio that is not a terminal, and it is on screen for one
+ * click.
+ */
+
+/** Held while a name is being typed, so a push from the daemon cannot eat it. */
+let pickerEditing = false;
+/** Which group is asking to be confirmed before its shells are ended. */
+let confirmingDiscard = null;
+let lastGroups = [];
+
+/** This window now knows what it is showing; the picker's work is done. */
+function settle() {
+  picking = false;
+  confirmingDiscard = null;
+  hidePicker();
+  rememberContainer();
+}
+
+function hidePicker() {
+  el.picker.hidden = true;
+  el.picker.replaceChildren();
+}
+
+function ago(when) {
+  if (!when) return 'just now';
+  const seconds = Math.max(0, Math.round((Date.now() - when) / 1000));
+  if (seconds < 60) return 'just now';
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+  const days = Math.round(hours / 24);
+  return `${days} day${days === 1 ? '' : 's'} ago`;
+}
+
+function renderPicker(groups, error) {
+  lastGroups = groups;
+  if (pickerEditing) return;
+
+  refreshTitle();
+  el.picker.replaceChildren();
+
+  const card = document.createElement('div');
+  card.className = 'picker-card';
+
+  const heading = document.createElement('h1');
+  heading.textContent = 'Open a window';
+  card.append(heading);
+
+  const sub = document.createElement('p');
+  sub.className = 'picker-sub';
+  sub.textContent = groups.length
+    ? 'These windows were closed, but their shells never stopped. Pick one up where you left it, or start something new.'
+    : 'Nothing is waiting. Every window you closed has been opened again.';
+  card.append(sub);
+
+  if (error) {
+    const warning = document.createElement('p');
+    warning.className = 'picker-error';
+    warning.textContent = error;
+    card.append(warning);
+  }
+
+  const list = document.createElement('div');
+  list.className = 'picker-list';
+  for (const group of groups) list.append(renderGroup(group));
+  card.append(list);
+
+  const fresh = document.createElement('button');
+  fresh.className = 'picker-new';
+  fresh.textContent = 'New window';
+  fresh.onclick = () => chooseNewWindow();
+  card.append(fresh);
+
+  el.picker.append(card);
+  el.picker.hidden = false;
+  fresh.focus();
+}
+
+function renderGroup(group) {
+  const row = document.createElement('div');
+  row.className = 'group';
+
+  if (confirmingDiscard === group.id) {
+    const question = document.createElement('div');
+    question.className = 'group-question';
+    question.textContent = `Discard “${group.name}” and end its ${group.tabs.length} shell${
+      group.tabs.length === 1 ? '' : 's'
+    }?`;
+    row.append(question);
+
+    const yes = document.createElement('button');
+    yes.className = 'group-confirm danger';
+    yes.textContent = 'Discard';
+    yes.onclick = () => {
+      confirmingDiscard = null;
+      send({ t: 'discard', container: group.id });
+    };
+
+    const no = document.createElement('button');
+    no.className = 'group-confirm';
+    no.textContent = 'Keep it';
+    no.onclick = () => {
+      confirmingDiscard = null;
+      renderPicker(lastGroups);
+    };
+
+    row.append(yes, no);
+    return row;
+  }
+
+  const open = document.createElement('button');
+  open.className = 'group-open';
+
+  const name = document.createElement('span');
+  name.className = 'group-name';
+  name.textContent = group.name;
+  open.append(name);
+
+  const meta = document.createElement('span');
+  meta.className = 'group-meta';
+  meta.textContent = `${group.tabs.length} tab${group.tabs.length === 1 ? '' : 's'} · closed ${ago(
+    group.closedAt,
+  )}`;
+  open.append(meta);
+
+  const tabs = document.createElement('span');
+  tabs.className = 'group-tabs';
+  tabs.textContent = group.tabs.map((tab) => tab.label).join(' · ');
+  tabs.title = group.tabs.map((tab) => `${tab.label} — ${tab.cwd}`).join('\n');
+  open.append(tabs);
+
+  open.onclick = () => send({ t: 'adopt', container: group.id });
+  open.ondblclick = (event) => event.preventDefault();
+  row.append(open);
+
+  const rename = document.createElement('button');
+  rename.className = 'group-icon';
+  rename.textContent = '✎';
+  rename.title = 'Rename this window';
+  rename.onclick = () => startGroupRename(name, group);
+  row.append(rename);
+
+  const discard = document.createElement('button');
+  discard.className = 'group-icon danger';
+  discard.textContent = '×';
+  discard.title = 'End the shells in this window';
+  discard.onclick = () => {
+    confirmingDiscard = group.id;
+    renderPicker(lastGroups);
+  };
+  row.append(discard);
+
+  return row;
+}
+
+function startGroupRename(holder, group) {
+  const input = document.createElement('input');
+  input.className = 'group-rename';
+  input.value = group.name;
+  holder.replaceChildren(input);
+  input.focus();
+  input.select();
+
+  pickerEditing = true;
+  let done = false;
+  const commit = (save) => {
+    if (done) return;
+    done = true;
+    pickerEditing = false;
+    if (save) send({ t: 'renamewindow', container: group.id, name: input.value });
+    renderPicker(lastGroups);
+  };
+
+  input.onclick = (event) => event.stopPropagation();
+  input.onkeydown = (event) => {
+    event.stopPropagation();
+    if (event.key === 'Enter') commit(true);
+    if (event.key === 'Escape') commit(false);
+  };
+  input.onblur = () => commit(true);
+}
+
+/** The answer that is not one of the listed windows: start a fresh one. */
+function chooseNewWindow() {
+  if (!picking) return;
+  settle();
+  newTab();
+}
+
+// Escape is the way out of any list, and out of this one means the plain
+// answer: a new window.
+window.addEventListener('keydown', (event) => {
+  if (picking && event.key === 'Escape') chooseNewWindow();
+});
+
+/*
+ * An empty window is never left standing.
+ *
+ * The picker is drawn from a message the daemon sends on connection. If one
+ * never comes — an older daemon that has not been reloaded yet, a list that
+ * emptied while the browser was starting — this window would sit there blank
+ * with no way to do anything at all. So it waits a moment and then does what it
+ * would have done without a picker: opens a shell.
+ */
+function pickerFallback() {
+  if (!picking || !el.picker.hidden) return;
+  // Not connected yet is not the same as never coming: keep waiting, because
+  // the daemon being slow is not a reason to open a shell nobody asked for.
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    setTimeout(pickerFallback, 1000);
+    return;
+  }
+  chooseNewWindow();
+}
+
+setTimeout(pickerFallback, 4000);
+
+/**
+ * Write recovered scrollback with the pane's answering machine switched off.
+ *
+ * The flag is cleared when xterm says it has finished parsing, and again on a
+ * timer in case that callback never comes: a pane that stayed muted would look
+ * exactly like a shell that had stopped taking input.
+ */
+function replay(pane, scrollback) {
+  pane.replaying = true;
+  const done = () => {
+    pane.replaying = false;
+  };
+  pane.term.write(scrollback, done);
+  setTimeout(done, 2000);
 }
 
 function attach(id) {
@@ -508,7 +767,16 @@ function ensurePane(id) {
   term.loadAddon(new WebLinksAddon((event, uri) => send({ t: 'openurl', url: uri })));
   term.open(termEl);
 
-  term.onData((data) => send({ t: 'input', id, data }));
+  // Replayed history is not typing, and must never be answered as though it
+  // were. Scrollback is a recording of everything a program wrote, questions
+  // included: `\x1b]11;?` asking what colour the background is, `\x1b[c` asking
+  // what kind of terminal this is. Replaying it asks them again, xterm answers
+  // as it should, and the answers land in the shell that is there *now* — which
+  // is how `11;rgb:0000/0000/0000` ends up typed at a bash prompt.
+  term.onData((data) => {
+    if (panes.get(id)?.replaying) return;
+    send({ t: 'input', id, data });
+  });
   term.onResize(({ cols, rows }) => send({ t: 'resize', id, cols, rows }));
   // Kept outside `sessions`, which is wholesale replaced on every server
   // broadcast and would drop the title a couple of seconds after it arrived.
@@ -525,7 +793,7 @@ function ensurePane(id) {
     openContextMenu(event.clientX, event.clientY, id);
   });
 
-  pane = { id, root, termEl, term, fit, attached: false };
+  pane = { id, root, termEl, term, fit, attached: false, replaying: false };
   panes.set(id, pane);
   return pane;
 }
@@ -563,7 +831,20 @@ function activate(id) {
   pane.term.focus();
 
   renderTabs();
-  document.title = `${tabLabel(sessions.get(id))} — clio`;
+  refreshTitle();
+}
+
+/**
+ * A named window says so in its title, which is all the desktop's window list
+ * and alt-tab have to go on when six of these are open at once.
+ */
+function refreshTitle() {
+  if (picking) {
+    document.title = 'clio — open a window';
+    return;
+  }
+  const where = windowName ? `${windowName} · clio` : 'clio';
+  document.title = activeId ? `${tabLabel(sessions.get(activeId))} — ${where}` : where;
 }
 
 /** Resize a pane to its container, ignoring proposals from an unlaid-out pane. */
@@ -835,14 +1116,11 @@ function buildMenu(id) {
       run: () => confirmCloseOthers(id, others),
     },
     { sep: true },
-    // Where the "and don't ask me again" of the close warning lives. A dialog
-    // the browser draws cannot carry a checkbox of ours, so the checkbox is
-    // here, one right-click from the window it is about.
-    {
-      label: 'Ask before closing a window',
-      checked: warnOnClose,
-      run: () => setWarnOnClose(!warnOnClose),
-    },
+    // Closing this window keeps its tabs under a name, and this is where that
+    // name is chosen rather than guessed from what happens to be in the first
+    // tab. Naming it before it is put away is the difference between finding it
+    // again and reading a list of directories.
+    { label: 'Name This Window…', run: renameWindowMenu },
   );
 
   return entries;
@@ -866,6 +1144,24 @@ function confirmCloseOthers(id, count) {
   ]);
 }
 
+/**
+ * Name this window, in the menu it was asked for from.
+ *
+ * A name given here outlives the window: it is what the tabs are put away under
+ * when it is closed, and what the picker lists them by. Empty clears it, and
+ * the automatic name — whatever the first tab is called — takes over again.
+ */
+function renameWindowMenu() {
+  renderMenu([
+    {
+      input: true,
+      value: windowName || '',
+      placeholder: 'Name this window',
+      run: (value) => send({ t: 'renamewindow', name: value }),
+    },
+  ]);
+}
+
 /** Where the menu was summoned, so a follow-up menu opens in the same place. */
 let menuAt = { x: 0, y: 0 };
 
@@ -878,11 +1174,40 @@ function renderMenu(entries) {
   const menu = el.ctxmenu;
   menu.replaceChildren();
 
+  let focusMe = null;
+
   for (const entry of entries) {
     if (entry.sep) {
       const sep = document.createElement('div');
       sep.className = 'sep';
       menu.append(sep);
+      continue;
+    }
+
+    // A menu item that is typed into rather than chosen. The only alternative
+    // is prompt(), which is a dialog the browser draws in the middle of the
+    // screen with clio's URL above it.
+    if (entry.input) {
+      const field = document.createElement('div');
+      field.className = 'item field';
+      const input = document.createElement('input');
+      input.value = entry.value || '';
+      input.placeholder = entry.placeholder || '';
+      input.onkeydown = (event) => {
+        event.stopPropagation();
+        if (event.key === 'Enter') {
+          closeContextMenu();
+          entry.run(input.value);
+          panes.get(activeId)?.term.focus();
+        }
+        if (event.key === 'Escape') {
+          closeContextMenu();
+          panes.get(activeId)?.term.focus();
+        }
+      };
+      field.append(input);
+      menu.append(field);
+      focusMe = input;
       continue;
     }
 
@@ -926,6 +1251,10 @@ function renderMenu(entries) {
   const rect = menu.getBoundingClientRect();
   if (rect.right > window.innerWidth) menu.style.left = `${window.innerWidth - rect.width - 4}px`;
   if (rect.bottom > window.innerHeight) menu.style.top = `${window.innerHeight - rect.height - 4}px`;
+
+  // After placing, or the caret lands somewhere the menu is not yet.
+  focusMe?.focus();
+  focusMe?.select();
 }
 
 function closeContextMenu() {

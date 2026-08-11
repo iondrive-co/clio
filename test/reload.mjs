@@ -65,12 +65,29 @@ const env = {
   XDG_RUNTIME_DIR: join(tree, 'run'),
   XDG_STATE_HOME: join(tree, 'state'),
   CLIO_DEV: '1',
+  // Started from inside an agent's own shell, deliberately. A daemon inherits
+  // whatever launched it and hands it to every tab for as long as it runs, so
+  // these are here to prove they get no further than the daemon itself.
+  CLAUDECODE: '1',
+  CLAUDE_CODE_SESSION_ID: 'a-session-that-is-not-this-shell',
+  CLAUDE_CODE_CHILD_SESSION: '1',
+  TRACEPARENT: '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01',
 };
 const HANDSHAKE = join(tree, 'run', 'clio', 'daemon.json');
 
+/** Other copies of clio made along the way, cleared up after the daemon stops. */
+const extraTrees = [];
+
 function setUp() {
   for (const item of ['src', 'bin', 'assets', 'package.json']) {
-    execFileSync('cp', ['-a', join(REPO, item), tree]);
+    // -L, and never -a alone. This test deliberately breaks a source file to
+    // prove a failed reload keeps its shells, and it breaks the one in `tree`.
+    // A plain `cp -a` copies a symlink as a symlink, so if the tree it was run
+    // from has one where its `src` should be — a scratch install pointed back
+    // at a real checkout, which is exactly the thing someone does while getting
+    // a daemon out of trouble — the sabotage is written through it into the
+    // real file. Dereferencing here means the copy is always a copy.
+    execFileSync('cp', ['-aL', join(REPO, item), tree]);
   }
   // Shared rather than copied: node-pty is the one thing here that took a
   // compiler to produce.
@@ -84,13 +101,16 @@ function tearDown() {
     /* never started */
   }
   if (process.env.CLIO_KEEP_TREE === '1') {
-    console.log(`\nsandbox left behind for inspection: ${tree}`);
+    console.log(`\nsandbox left behind for inspection: ${[tree, ...extraTrees].join(', ')}`);
     return;
   }
-  try {
-    rmSync(tree, { recursive: true, force: true });
-  } catch {
-    /* leave it for the OS */
+  // The daemon is stopped by now, including one running out of extraTrees.
+  for (const path of [tree, ...extraTrees]) {
+    try {
+      rmSync(path, { recursive: true, force: true });
+    } catch {
+      /* leave it for the OS */
+    }
   }
 }
 
@@ -200,6 +220,22 @@ async function main() {
   await sleep(800);
   const backgrounded = childrenOf(shellPid);
   check('it has a process running under it', backgrounded.length > 0);
+
+  // What the daemon was started with must not reach the tab. A `claude` run in
+  // one of these otherwise reads the markers, decides it is a child of a
+  // session that ended days ago, and stops saving its transcript.
+  win.send({
+    t: 'input',
+    id,
+    data: 'echo "markers:[${CLAUDECODE:-}][${CLAUDE_CODE_SESSION_ID:-}][${TRACEPARENT:-}]"\n',
+  });
+  await sleep(800);
+  const seen = win.output.get(id) || '';
+  check(
+    'the shell did not inherit the agent session that started the daemon',
+    seen.includes('markers:[][][]'),
+    seen.slice(-160),
+  );
 
   win.send({ t: 'rename', id, title: 'work-in-progress' });
   // Past the scrollback flush, so nothing here depends on lucky timing.
@@ -320,6 +356,59 @@ async function main() {
 
   check('the window is told to reload', !!(await win4.await((m) => m.t === 'reload', 4000)));
   check('and the shell is untouched by that', alive(shellPid));
+
+  // ---- 7. the desktop comes from the launcher ------------------------------
+  //
+  // A daemon inherits its environment from whatever started it, and that is
+  // often a session with no display in it — a service, a script, an agent's
+  // shell. Every shell it opens then inherits the same nothing, and the first
+  // anyone hears of it is `Cannot open display` from something that had no
+  // reason to expect one. The launcher knows better and says so on every run.
+  console.log('\n7. a reload takes the display it was run from');
+  const beforeDisplay = handshake().pid;
+  execFileSync(clio, ['reload'], { env: { ...env, DISPLAY: ':77' }, encoding: 'utf8' });
+  const fourth = await daemonAfter(beforeDisplay);
+  check('it reloaded', !!fourth);
+  if (!fourth) return;
+
+  const win5 = new Client(fourth, windowId);
+  await win5.connect();
+  await win5.await((m) => m.t === 'sessions');
+  win5.send({ t: 'create', cwd: '/tmp', cols: 80, rows: 24 });
+  const fresh = await win5.await((m) => m.t === 'created');
+  check('a new tab opened', !!fresh);
+
+  const shellEnv = readFileSync(`/proc/${fresh?.session.pid}/environ`, 'utf8').split('\0');
+  check('and its shell has the display the launcher had', shellEnv.includes('DISPLAY=:77'));
+  check('with the terminal settings still right', shellEnv.includes('TERM=xterm-256color'));
+  // Nothing can change the environment of a process already running, and the
+  // handover deliberately does not try: the tab from before is as it was.
+  check('the shell that was already open is untouched', alive(shellPid));
+
+  // ---- 8. reloading from somewhere else ------------------------------------
+  //
+  // The launcher sends its own installation, so a daemon that was started from
+  // a copy of the tree — a test tree, an old checkout, a scratch directory that
+  // is about to be deleted — can be moved onto the clio you actually run
+  // without the shells in it noticing.
+  console.log('\n8. reloading into a different copy of clio');
+  const elsewhere = mkdtempSync(join(tmpdir(), 'clio-elsewhere-'));
+  extraTrees.push(elsewhere);
+  for (const item of ['src', 'bin', 'assets', 'package.json']) {
+    execFileSync('cp', ['-a', join(tree, item), elsewhere]);
+  }
+  symlinkSync(join(REPO, 'node_modules'), join(elsewhere, 'node_modules'));
+
+  const beforeMove = handshake().pid;
+  execFileSync(join(elsewhere, 'bin', 'clio'), ['reload'], { env, encoding: 'utf8' });
+  const moved = await daemonAfter(beforeMove);
+  check('it reloaded', !!moved);
+  if (!moved) return;
+
+  const cmdline = readFileSync(`/proc/${moved.pid}/cmdline`, 'utf8');
+  check('the daemon is running the other copy now', cmdline.includes(elsewhere), cmdline);
+  check('and the shell came across with it', alive(shellPid));
+  check('still with its child', childrenOf(shellPid) === backgrounded);
 }
 
 main()

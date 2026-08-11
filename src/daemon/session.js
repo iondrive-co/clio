@@ -40,8 +40,16 @@ export class Session {
     return this.pty ? this.pty.pid : null;
   }
 
-  /** Boot a real shell for this session. */
-  spawn({ cwd = this.cwd, cols = this.cols, rows = this.rows, shell = null } = {}) {
+  /**
+   * Boot a real shell for this session.
+   *
+   * `env` is what the launcher last told the daemon about the desktop it is
+   * running on. A daemon inherits its environment from whatever started it, and
+   * that can be a session with no display at all — a service, a script, an
+   * agent's shell — in which case every shell it spawns is one where xdg-open,
+   * and everything built on it, silently has nowhere to open anything.
+   */
+  spawn({ cwd = this.cwd, cols = this.cols, rows = this.rows, shell = null, env = {} } = {}) {
     const file = shell || process.env.SHELL || '/bin/bash';
     this.cols = cols;
     this.rows = rows;
@@ -55,6 +63,7 @@ export class Session {
         rows,
         env: {
           ...process.env,
+          ...env,
           TERM: 'xterm-256color',
           COLORTERM: 'truecolor',
           CLIO_SESSION: this.id,

@@ -248,10 +248,11 @@ async function main() {
   });
   page.on('pageerror', (err) => consoleErrors.push(String(err)));
 
-  // Closing the window ends the shells in it, so the window asks first — and a
-  // reload is the same event as far as the browser is concerned. Nothing in
-  // this file is a person choosing to stay, so every one of these is accepted;
-  // the count is what two of the tests below actually turn on.
+  // Nothing should ever ask about leaving: closing a window puts its tabs away
+  // rather than ending them, so there is nothing to warn about. Anything that
+  // does appear is accepted, and counted — a dialog here means the guard came
+  // back, and a browser dialog in the way is how a person ends up closing a
+  // window twice.
   let closeDialogs = 0;
   page.on('dialog', async (dialog) => {
     if (dialog.type() === 'beforeunload') closeDialogs++;
@@ -352,8 +353,8 @@ async function main() {
   console.log('\n6. reload');
   await page.reload();
   await page.waitForTimeout(2500);
-  // Leaving takes the shells with it, so the browser is asked to ask first.
-  check('leaving the page was asked about', closeDialogs === 1, `${closeDialogs} dialogs`);
+  // Nothing is lost by leaving, so nothing asks about it.
+  check('leaving the page asked nothing', closeDialogs === 0, `${closeDialogs} dialogs`);
   check('still no dead screen after reload', await page.locator('#deadscreen').isHidden());
   const reloadTabs = await page.locator('.tab').count();
   check('tabs came back after reload', reloadTabs >= 3, `${reloadTabs} tabs`);
@@ -380,45 +381,101 @@ async function main() {
   await page.mouse.click(550, 400);
   await page.waitForTimeout(300);
 
-  // ---- turning the closing question off ----------------------------------
+  // ---- naming this window -------------------------------------------------
   //
-  // The browser writes the wording of that dialog and will not carry a checkbox
-  // of ours, so "and don't ask me again" has to live somewhere in the app. This
-  // is that switch, and the only thing that makes the guard bearable: a warning
-  // you cannot turn off is one people learn to click through.
-  console.log('\n7b. the ask-before-closing switch');
-  const setting = page.locator('#ctxmenu .item', { hasText: 'Ask before closing' });
+  // The name is what the tabs are put away under when the window is closed, and
+  // what the picker lists them by. Given here, before it is needed, it is the
+  // difference between finding a window again and reading a list of
+  // directories.
+  console.log('\n7b. naming this window');
+  const naming = page.locator('#ctxmenu .item', { hasText: 'Name This Window' });
 
   await page.locator('.pane.active .xterm-screen').click({ button: 'right' });
   await page.waitForTimeout(400);
-  check('the menu carries the setting', (await setting.count()) === 1);
-  check('and it is on until it is turned off', (await setting.innerText()).includes('✓'),
-    await setting.innerText());
+  check('the menu offers to name the window', (await naming.count()) === 1);
 
-  await setting.click();
+  await naming.click();
   await page.waitForTimeout(300);
-  check('the menu closes on choosing it', await page.locator('#ctxmenu').isHidden());
+  const nameField = page.locator('#ctxmenu .item.field input');
+  check('choosing it opens a field to type in', await nameField.isVisible());
+  await nameField.fill('the window under test');
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(800);
+  check('the menu closes on Enter', await page.locator('#ctxmenu').isHidden());
   check(
-    'the answer is remembered for every clio window, not this page',
-    (await page.evaluate(() => localStorage.getItem('clio.warnOnClose'))) === 'off',
+    'the name reached the daemon',
+    (await daemonStatus()).containers.find((c) => c.id === testWindow)?.name ===
+      'the window under test',
+  );
+  check(
+    'and the window says so in its title',
+    (await page.title()).includes('the window under test'),
+    await page.title(),
   );
 
-  const askedBefore = closeDialogs;
-  await page.reload();
-  await page.waitForTimeout(2500);
-  check('and nothing asks any more', closeDialogs === askedBefore,
-    `${closeDialogs - askedBefore} dialogs`);
-  check('the window is still working', await page.locator('#deadscreen').isHidden());
+  // ---- the picker --------------------------------------------------------
+  //
+  // The whole point of closing a window being survivable: the tabs are put away
+  // under a name, and a window that opens while any are waiting opens onto the
+  // list of them instead of a blank shell.
+  console.log('\n7c. a closed window comes back from the picker');
+  const parked = randomBytes(4).toString('hex');
+  const away = await windowOnto(parked);
+  away.ws.send(JSON.stringify({ t: 'create', cwd: '/tmp', cols: 80, rows: 24 }));
+  await sleep(1200);
+  away.ws.send(JSON.stringify({ t: 'renamewindow', name: 'parked for the picker' }));
+  await sleep(600);
+  away.ws.close();
+  // Past the grace period the daemon allows for a page that is only reloading.
+  await sleep(13000);
 
-  await page.locator('.pane.active .xterm-screen').click({ button: 'right' });
-  await page.waitForTimeout(400);
-  check('the tick is gone from the menu', !(await setting.innerText()).includes('✓'),
-    await setting.innerText());
-  await setting.click(); // back on, so the rest of the run is the default app
-  await page.waitForTimeout(300);
+  const beforePick = (await daemonStatus()).containers.find((c) => c.id === parked);
+  check('the closed window is being kept', !!beforePick?.saved);
+
+  const chooser = await context.newPage();
+  chooser.on('pageerror', (err) => consoleErrors.push(`picker: ${err}`));
+  await chooser.goto(
+    `${origin}/?token=${info.token}&c=${randomBytes(4).toString('hex')}&pick=1`,
+  );
+  await chooser.waitForTimeout(2000);
+  check('a window opened with pick=1 shows the picker', await chooser.locator('#picker').isVisible());
+  await chooser.screenshot({ path: join(SHOTS, '04b-picker.png') });
+  await sweepContrast(chooser, 'window picker');
+
+  const offered = await chooser.locator('#picker .group-name').allInnerTexts();
+  check('it lists the window that was closed, by name', offered.includes('parked for the picker'),
+    offered.join(' | '));
+
+  await chooser.locator('#picker .group-open', { hasText: 'parked for the picker' }).click();
+  await chooser.waitForTimeout(2500);
+  check('choosing it puts the picker away', await chooser.locator('#picker').isHidden());
+  check('and the tabs are on screen', (await chooser.locator('.tab').count()) === 1,
+    `${await chooser.locator('.tab').count()} tabs`);
   check(
-    'and it can be turned back on',
-    (await page.evaluate(() => localStorage.getItem('clio.warnOnClose'))) === 'on',
+    'the daemon counts it as open again, not as one still waiting',
+    (await daemonStatus()).containers.find((c) => c.id === parked)?.saved === false,
+  );
+  check(
+    'and the window it opened on is not left behind as an empty one',
+    (await daemonStatus()).containers.every((c) => c.sessions.length > 0),
+  );
+
+  // Leave nothing running: these shells outlive the browser by design, and a
+  // window left waiting here changes what every later test sees.
+  //
+  // The page goes first and the tabs are closed from outside it. Done the other
+  // way round, a window whose last tab closes tries to close itself, and a page
+  // the browser will not close for a script opens a fresh shell rather than sit
+  // there dead — leaving exactly the window this is trying to clear up.
+  await chooser.close();
+  await sleep(1500);
+  const { ws: tidy, tabs: tidyTabs } = await windowOnto(parked);
+  for (const tab of tidyTabs) tidy.send(JSON.stringify({ t: 'close', id: tab.id }));
+  await sleep(1000);
+  tidy.close();
+  check(
+    'and nothing is left waiting once its tabs are closed',
+    !(await daemonStatus()).containers.some((c) => c.id === parked),
   );
 
   // ---- closing tabs ------------------------------------------------------
@@ -667,6 +724,13 @@ async function main() {
     const known = (await daemonStatus()).containers.map((c) => c.id);
     const tabsHere = await page.locator('.tab').count();
 
+    // What + does depends on whether anything is waiting: with windows put
+    // away it opens onto the picker, so that + is also the way back to one.
+    // With nothing waiting — the case here — it is a shell, straight away.
+    const waiting = (await daemonStatus()).containers.filter((c) => c.saved);
+    check('nothing is waiting, so + means a new shell', waiting.length === 0,
+      JSON.stringify(waiting.map((c) => c.name)));
+
     await page.locator('#newwindow').click();
 
     // A real browser window has to start and connect, which on a cold profile
@@ -871,6 +935,59 @@ async function main() {
     (await pane.innerText()).includes('/etc/apt'),
   );
   await page.screenshot({ path: join(SHOTS, '07-after-restore.png') });
+
+  // ---- reloading the daemon brings the window with it ---------------------
+  //
+  // A reload swaps the daemon for one running the code on disk, and the shells
+  // cross untouched — but the page in front of you is still the one that was
+  // served before the swap. A window that reconnects without reloading is a
+  // window running yesterday's UI against today's daemon, which is how "I
+  // reloaded and nothing changed" happens.
+  //
+  // Only ever done to a sandbox. Reloading the daemon somebody's real shells
+  // are in, from a test, is not this file's business.
+  const { dev, pid: pidBefore } = await daemonStatus();
+  if (!dev) {
+    console.log('\n17. reload refreshes the window — skipped (needs a `clio dev` sandbox)');
+  } else {
+    console.log('\n17. reloading the daemon refreshes the window');
+    await page.evaluate(() => {
+      window.__servedBeforeReload = true;
+    });
+
+    await fetch(`${origin}/reload?token=${info.token}`, { method: 'POST' });
+
+    let pidNow = pidBefore;
+    for (let i = 0; i < 60 && pidNow === pidBefore; i++) {
+      await sleep(500);
+      try {
+        pidNow = (await daemonStatus()).pid;
+      } catch {
+        /* mid-handover the port is nobody's for a moment */
+      }
+    }
+    check('a daemon running the code on disk took over', pidNow !== pidBefore);
+
+    let refreshed = false;
+    for (let i = 0; i < 40 && !refreshed; i++) {
+      await sleep(500);
+      refreshed = await page
+        .evaluate(() => window.__servedBeforeReload === undefined)
+        .catch(() => false);
+    }
+    check('the window reloaded itself onto the new code', refreshed);
+    check('with its tabs still on screen', (await page.locator('.tab').count()) >= 1);
+    check('and no dead screen', await page.locator('#deadscreen').isHidden());
+
+    await page.locator('.pane.active .xterm-screen').click();
+    await page.keyboard.type('echo alive-after-reload');
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(1800);
+    check(
+      'the shell is still the same one, still taking typing',
+      (await page.locator('.pane.active').innerText()).includes('alive-after-reload'),
+    );
+  }
 
   await browser.close();
 

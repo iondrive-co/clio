@@ -2,12 +2,14 @@ import { writeFileSync, readFileSync, renameSync, unlinkSync, readdirSync } from
 import { join } from 'node:path';
 import { STATE_FILE, SCROLLBACK_DIR, scrollbackFile } from './paths.js';
 
-// 2 added containers — which window each tab belongs to. Version 1 files are
-// still read: their tabs simply predate windows being a thing clio tracks, and
-// dropping them on an upgrade would mean losing the shells that were open at
-// the moment the new code first ran.
-const STATE_VERSION = 2;
-const READABLE_VERSIONS = new Set([1, 2]);
+// 2 added containers — which window each tab belongs to.
+// 3 added a name and a closedAt to each: a window that has been closed is kept
+//   rather than ended, and has to be told apart from one that was still on
+//   screen when the daemon went down. Older files are still read — their
+//   windows simply come back as ones that were open, which for a version 2 file
+//   is true by definition, since closing a window used to end it.
+const STATE_VERSION = 3;
+const READABLE_VERSIONS = new Set([1, 2, 3]);
 
 // Write-then-rename so a crash mid-write can never leave a half-parsed state
 // file — the restore path is exactly the code that runs after a crash, so it
@@ -27,7 +29,7 @@ export function writeState(containers, sessions) {
     savedAt: Date.now(),
     containers: containers
       .filter((c) => occupied.has(c.id))
-      .map((c) => ({ id: c.id, order: c.order })),
+      .map((c) => ({ id: c.id, order: c.order, name: c.name ?? null, closedAt: c.closedAt ?? null })),
     sessions: sessions.map((s) => s.toState()),
   };
   try {
