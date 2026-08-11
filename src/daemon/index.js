@@ -1,16 +1,18 @@
 import http from 'node:http';
-import { readFileSync, writeFileSync, unlinkSync } from 'node:fs';
+import { readFileSync, writeFileSync, unlinkSync, existsSync, watch } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { join, dirname, extname } from 'node:path';
 import { WebSocketServer } from 'ws';
 
-import { ensureDirs, HANDSHAKE_FILE, IDENTITY_FILE } from './paths.js';
+import { ensureDirs, HANDSHAKE_FILE, HANDOVER_FILE, IDENTITY_FILE } from './paths.js';
 import { isAlive } from './procinfo.js';
 import { SessionManager } from './manager.js';
 import { openBrowserWindow } from './window.js';
 
-const HERE = dirname(fileURLToPath(import.meta.url));
+const ENTRY = fileURLToPath(import.meta.url);
+const HERE = dirname(ENTRY);
 const ROOT = join(HERE, '..', '..');
 const UI = join(ROOT, 'src', 'ui');
 const MODULES = join(ROOT, 'node_modules');
@@ -48,6 +50,26 @@ const COOKIE_NAME = 'clio_token';
 // been asked for leaves two windows onto one set of tabs.
 const WINDOW_WAIT_MS = 12000;
 const WINDOW_ATTEMPTS = 2;
+
+// How long a successor gets to come up and claim the shells before we conclude
+// the new code is broken and take everything back.
+const HANDOVER_WAIT_MS = 15000;
+
+// Where inherited pty masters start in the successor's descriptor table. 0, 1
+// and 2 are the usual three; everything above is ours to hand over.
+const FIRST_HANDOVER_FD = 3;
+
+// Long enough that an editor writing a file in several goes only reloads the
+// windows once.
+const UI_WATCH_DEBOUNCE_MS = 300;
+
+// A daemon that is about to be replaced wants its own port back within seconds,
+// not eventually.
+const BIND_ATTEMPTS = 25;
+
+// Set by `clio dev`: a sandbox instance, on its own port, state and browser
+// profile. Windows say so, because typing into the wrong one is the whole risk.
+const DEV = process.env.CLIO_DEV === '1';
 
 // How long a window's shells outlive the connection that was showing them.
 //
@@ -223,11 +245,59 @@ export function runningDaemon() {
   return null;
 }
 
+/**
+ * The manifest a departing daemon left for this one, or null if we were started
+ * the ordinary way.
+ *
+ * It names the sessions whose pty masters are already open in this process, put
+ * there by the daemon that spawned us. Nothing in it is trusted beyond shape:
+ * it is read once, at startup, from a file only this user can write.
+ */
+function readHandover() {
+  const path = process.env.CLIO_HANDOVER;
+  if (!path) return null;
+  try {
+    const manifest = JSON.parse(readFileSync(path, 'utf8'));
+    if (!manifest || !Array.isArray(manifest.sessions)) return null;
+    return manifest;
+  } catch (err) {
+    // Carrying on without it would restart every shell the predecessor was
+    // trying to save, so say why before that happens.
+    console.error(`[clio] could not read the handover manifest: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Bind the port we want, waiting out a predecessor still letting go of it.
+ *
+ * Keeping the same port is what lets windows reconnect on their own, so it is
+ * worth a few seconds of trying before settling for a different one.
+ */
+async function bindPreferred(server, preferred, attempts) {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await listenOn(server, preferred);
+    } catch (err) {
+      if (err.code !== 'EADDRINUSE' && err.code !== 'EACCES') throw err;
+      if (attempt === attempts) break;
+      await sleep(200);
+    }
+  }
+  console.log(`[clio] port ${preferred} unavailable, taking another`);
+  return listenOn(server, 0);
+}
+
 async function main() {
   ensureDirs();
 
+  const handover = readHandover();
+
   const existing = runningDaemon();
-  if (existing) {
+  // The daemon we are replacing is still up while it hands over — that one is
+  // expected. Any other means a second daemon, and two of those fighting over
+  // one set of state is worse than not starting at all.
+  if (existing && !(handover && existing.pid === handover.from)) {
     console.error(`[clio] daemon already running (pid ${existing.pid}, port ${existing.port})`);
     process.exit(3);
   }
@@ -246,8 +316,13 @@ async function main() {
   const launchCommand = join(ROOT, 'bin', 'clio');
 
   const manager = new SessionManager();
-  const restored = manager.restoreFromDisk();
-  if (restored) console.log(`[clio] recovered ${restored} session(s) from the last run`);
+  if (handover) {
+    const taken = manager.adoptHandover(handover);
+    console.log(`[clio] took ${taken} running session(s) over from pid ${handover.from}`);
+  } else {
+    const restored = manager.restoreFromDisk();
+    if (restored) console.log(`[clio] recovered ${restored} session(s) from the last run`);
+  }
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, origin);
@@ -278,6 +353,8 @@ async function main() {
       res.end(
         JSON.stringify({
           windows: clients.size,
+          dev: DEV,
+          pid: process.pid,
           containers: manager.containerList().map((container) => ({
             id: container.id,
             onScreen: containerHasClient(container.id),
@@ -291,6 +368,30 @@ async function main() {
           })),
         }),
       );
+      return;
+    }
+
+    // Swap this daemon for one running the code that is on disk now, keeping
+    // every shell. The reply goes out first and on purpose: the socket carrying
+    // it is one of the things the handover takes down.
+    if (path === '/reload') {
+      if (!authorized(req, url, token)) {
+        res.writeHead(403);
+        res.end();
+      } else if (req.method !== 'POST') {
+        res.writeHead(405);
+        res.end();
+      } else if (handingOver) {
+        res.writeHead(409, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        res.end(JSON.stringify({ error: 'a reload is already under way' }));
+      } else {
+        res.writeHead(202, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+        res.end(JSON.stringify({ from: process.pid, sessions: manager.list().length }), () => {
+          setTimeout(() => {
+            handOver().catch((err) => console.error('[clio] reload failed:', err));
+          }, 100);
+        });
+      }
       return;
     }
 
@@ -407,6 +508,216 @@ async function main() {
     closing.set(id, timer);
   }
 
+  /* ------------------------------------------------------------- handover */
+
+  /*
+   * Replacing the daemon without disturbing the shells.
+   *
+   * A pty dies when the last copy of its master descriptor is closed, and until
+   * now that copy was always in this process — so every restart, however
+   * careful, took the shells with it. The way out is not to keep the process
+   * alive but to keep the descriptors: a successor is started with them already
+   * open in its own table, and only once it says it has them does this one go.
+   *
+   * Nothing is destroyed on the way. If the new code cannot start, the shells
+   * are still here, still ours, and this daemon carries on as though nothing
+   * had been tried.
+   */
+
+  let handingOver = false;
+
+  /**
+   * Take up an address, and leave the note that says where we are.
+   *
+   * Done on every bind rather than once at startup, because a daemon whose
+   * handover failed binds a second time and may not get the same port back.
+   */
+  function announce(boundPort) {
+    port = boundPort;
+    origin = `http://${HOST}:${port}`;
+    saveIdentity({ token, port });
+    writeFileSync(
+      HANDSHAKE_FILE,
+      JSON.stringify({
+        pid: process.pid,
+        port,
+        token,
+        url: `${origin}/?token=${token}`,
+        startedAt: Date.now(),
+      }),
+      { mode: 0o600 },
+    );
+  }
+
+  /** Stop answering and let go of the port, without touching a single pty. */
+  function stopListening() {
+    return new Promise((resolve) => {
+      // 1012 is "service restart", and the page treats it as a promise that we
+      // are coming back: it retries immediately rather than easing off the way
+      // it does for a daemon that has died.
+      //
+      // Marked first, and permanently. A socket we closed ourselves must never
+      // be read as a window closing, and the close event for it can arrive at
+      // any point afterwards — including after a failed handover has given up
+      // and put everything back, which is exactly when ending a window's shells
+      // would be least forgivable.
+      for (const client of clients) {
+        client.replaced = true;
+        try {
+          client.ws.close(1012, 'reloading');
+        } catch {
+          /* already gone */
+        }
+      }
+
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        resolve();
+      };
+
+      server.close(finish);
+      // A connection still hanging on would hold the port past the successor's
+      // first attempt at it.
+      server.closeAllConnections?.();
+      setTimeout(finish, 1000);
+    });
+  }
+
+  /**
+   * Wait for the successor to say it has the shells.
+   *
+   * It says so twice over: by deleting the manifest, which it does once the
+   * descriptors are adopted, and by putting its own pid in the handshake file.
+   * Waiting for both is what makes the failure case safe — anything less and we
+   * would exit on a daemon that had started but not yet taken anything.
+   */
+  async function successorReady(child) {
+    const deadline = Date.now() + HANDOVER_WAIT_MS;
+    while (Date.now() < deadline) {
+      if (child.exitCode !== null || child.signalCode) return false; // died on the way up
+      const info = readHandshake();
+      if (!existsSync(HANDOVER_FILE) && info && info.pid !== process.pid && isAlive(info.pid)) {
+        return true;
+      }
+      await sleep(100);
+    }
+    return false;
+  }
+
+  /** Hand every running shell to a daemon started from the code on disk now. */
+  async function handOver() {
+    if (handingOver) return { ok: false, error: 'a reload is already under way' };
+    handingOver = true;
+
+    // Stop reading before anything else. What the shells write from here on
+    // waits in the kernel's buffers for whoever reads next, rather than being
+    // read into a process that is about to exit and never reaching a window.
+    manager.pauseAll();
+    manager.saveNow();
+
+    const fds = [];
+    const sessions = manager.list().map((session) => {
+      const carried = {
+        ...session.toState(),
+        pid: session.shellPid,
+        unseenOutput: session.unseenOutput,
+        fd: null,
+      };
+      // A tab whose shell has already died has nothing to pass on. The
+      // successor gives it a new one, exactly as a restart would.
+      if (session.fd !== null) {
+        carried.fd = FIRST_HANDOVER_FD + fds.length;
+        fds.push(session.fd);
+      }
+      return carried;
+    });
+
+    writeFileSync(
+      HANDOVER_FILE,
+      JSON.stringify({ from: process.pid, containers: manager.containerList(), sessions }),
+      { mode: 0o600 },
+    );
+
+    await stopListening();
+
+    const child = spawn(process.execPath, [ENTRY], {
+      detached: true,
+      cwd: ROOT,
+      env: { ...process.env, CLIO_HANDOVER: HANDOVER_FILE },
+      // 1 and 2 are the log the launcher opened for us. Everything after is a
+      // pty master, landing in the successor at FIRST_HANDOVER_FD onwards.
+      stdio: ['ignore', 1, 2, ...fds],
+    });
+    child.unref();
+
+    if (await successorReady(child)) {
+      console.log(`[clio] pid ${child.pid} has the ${sessions.length} session(s) — standing down`);
+      // Deliberately not the ordinary shutdown: the handshake file belongs to
+      // the successor now, and the windows that just dropped are its to expect
+      // back, not ours to give up on.
+      process.exit(0);
+    }
+
+    console.error('[clio] the replacement did not come up — keeping the shells here');
+    // Kill it before reading resumes: two daemons on one pty would split the
+    // output between them, and half a line each is worse than either.
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      /* never started */
+    }
+    try {
+      unlinkSync(HANDOVER_FILE);
+    } catch {
+      /* ignore */
+    }
+
+    manager.resumeAll();
+    handingOver = false;
+
+    try {
+      announce(await bindPreferred(server, port, BIND_ATTEMPTS));
+      console.log(`[clio] still running the old code, on ${origin}`);
+      return { ok: false, error: 'the new daemon did not start; this one kept the shells' };
+    } catch (err) {
+      // The shells are alive but nothing can reach them: worth shouting about.
+      console.error('[clio] could not listen again after a failed reload:', err.message);
+      return { ok: false, error: `reload failed and the daemon is no longer listening: ${err.message}` };
+    }
+  }
+
+  /**
+   * Windows reload themselves when the UI changes.
+   *
+   * The pages are read off disk on every request, so a window that reloads is
+   * already running whatever is there now — no restart, and nobody has to
+   * notice the change and press the key.
+   */
+  function watchUi() {
+    if (process.env.CLIO_NO_UI_WATCH === '1') return;
+    let timer = null;
+    try {
+      watch(UI, () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          const payload = JSON.stringify({ t: 'reload' });
+          let told = 0;
+          for (const client of clients) {
+            if (client.ws.readyState !== client.ws.OPEN) continue;
+            client.ws.send(payload);
+            told++;
+          }
+          if (told) console.log(`[clio] ui changed — reloading ${told} window(s)`);
+        }, UI_WATCH_DEBOUNCE_MS);
+        timer.unref?.();
+      });
+    } catch (err) {
+      console.log(`[clio] not watching ${UI} for changes: ${err.message}`);
+    }
+  }
+
   /** The window came back. Whatever it was, it was not a close. */
   function cancelContainerClose(id) {
     const timer = closing.get(id);
@@ -451,6 +762,9 @@ async function main() {
       container: containerId,
       sessions: manager.sessionsIn(containerId).map((s) => s.toJSON()),
       home: process.env.HOME || '',
+      // A sandbox window says so in the tab row. Two clios on screen look
+      // identical otherwise, and typing into the wrong one is the whole risk.
+      dev: DEV,
     };
   }
 
@@ -599,7 +913,15 @@ async function main() {
     // A window showing these tabs again: whatever dropped the last connection,
     // it was not the window being closed.
     cancelContainerClose(container.id);
-    const client = { ws, container: container.id, attached: new Set(), focused: null };
+    const client = {
+      ws,
+      container: container.id,
+      attached: new Set(),
+      focused: null,
+      // Set when this daemon closes the socket itself to make way for its
+      // replacement; see stopListening.
+      replaced: false,
+    };
     clients.add(client);
 
     /** Mark a session as being looked at, clearing any activity flag. */
@@ -720,6 +1042,9 @@ async function main() {
     // scheduleContainerClose.
     const left = () => {
       clients.delete(client);
+      // A socket the daemon closed on its way out of the way of a replacement.
+      // The page is already coming back to whoever is listening now.
+      if (client.replaced) return;
       scheduleContainerClose(client.container);
     };
     ws.on('close', left);
@@ -727,29 +1052,23 @@ async function main() {
   });
 
   // Prefer the port we used last time so open windows can find us again; if
-  // something else has taken it in the meantime, any free port will do.
-  try {
-    port = await listenOn(server, identity.port);
-  } catch (err) {
-    if (err.code !== 'EADDRINUSE' && err.code !== 'EACCES') throw err;
-    console.log(`[clio] port ${identity.port} unavailable, taking another`);
-    port = await listenOn(server, 0);
+  // something else has taken it in the meantime, any free port will do. A
+  // successor waits the predecessor out rather than giving up on the address
+  // the windows already know.
+  port = await bindPreferred(server, identity.port, handover ? BIND_ATTEMPTS : 1);
+  announce(port);
+  console.log(`[clio] daemon listening on ${origin}${DEV ? ' (dev sandbox)' : ''}`);
+
+  // The receipt the predecessor is waiting on: the shells are ours, it can go.
+  if (handover) {
+    try {
+      unlinkSync(process.env.CLIO_HANDOVER);
+    } catch {
+      /* it will time out instead */
+    }
   }
 
-  origin = `http://${HOST}:${port}`;
-  saveIdentity({ token, port });
-  writeFileSync(
-    HANDSHAKE_FILE,
-    JSON.stringify({
-      pid: process.pid,
-      port,
-      token,
-      url: `${origin}/?token=${token}`,
-      startedAt: Date.now(),
-    }),
-    { mode: 0o600 },
-  );
-  console.log(`[clio] daemon listening on ${origin}`);
+  watchUi();
 
   let shuttingDown = false;
   const shutdown = (signal) => {
@@ -759,7 +1078,9 @@ async function main() {
     flushContainerCloses();
     manager.saveNow();
     try {
-      unlinkSync(HANDSHAKE_FILE);
+      // Mid-handover the file on disk is the successor's, and taking it away
+      // would leave a running daemon nothing could find.
+      if (!handingOver) unlinkSync(HANDSHAKE_FILE);
     } catch {
       /* ignore */
     }
@@ -768,6 +1089,12 @@ async function main() {
 
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
+
+  // The signal spelling of `clio reload`, for anything that has a pid rather
+  // than a token to hand.
+  process.on('SIGUSR2', () => {
+    handOver().catch((err) => console.error('[clio] reload failed:', err));
+  });
 
   // A crash must still leave a usable snapshot behind — that is the whole point.
   process.on('uncaughtException', (err) => {

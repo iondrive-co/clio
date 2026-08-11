@@ -14,12 +14,10 @@ To put it on your PATH, applications menu, and panel:
 ```bash
 bin/clio install
 ```
-
-
-
 | Other commands: | What it does |
 | --- | --- |
 | `clio start` | Start the daemon only, no window |
+| `clio reload` | Run the code that is on disk now, keeping every shell running |
 | `clio stop` | Stop the daemon (state is saved first) |
 | `clio status` | Show the daemon, its windows and their tabs |
 | `clio log [n]` | Tail the daemon log |

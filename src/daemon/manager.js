@@ -160,6 +160,67 @@ export class SessionManager extends EventEmitter {
     return this.list().length;
   }
 
+  /**
+   * Take over the sessions of the daemon this process is replacing.
+   *
+   * Every entry names a master descriptor this process inherited at startup, so
+   * the shells are already ours by the time we get here; what is left is to
+   * rebuild the tabs around them. Scrollback comes off disk, flushed by the
+   * outgoing daemon on its way out, and the ptys carry on mid-sentence: no
+   * seam, no redraw, nothing restarted. A shell cannot tell this happened.
+   */
+  adoptHandover({ containers = [], sessions = [] }) {
+    for (const saved of containers) {
+      if (!saved?.id || !CONTAINER_ID.test(saved.id)) continue;
+      const order = Number.isFinite(saved.order) ? saved.order : this.nextContainerOrder;
+      this.containers.set(saved.id, { id: saved.id, order });
+      this.nextContainerOrder = Math.max(this.nextContainerOrder, order + 1);
+    }
+
+    for (const saved of sessions) {
+      if (!saved?.id) continue;
+      const session = new Session({
+        id: saved.id,
+        title: saved.title,
+        order: saved.order,
+        cwd: saved.cwd,
+        container: this.openContainer(saved.container).id,
+      });
+      session.command = saved.command || null;
+      session.unseenOutput = !!saved.unseenOutput;
+      session.seedScrollback(readScrollback(saved.id));
+      this.wire(session);
+      this.sessions.set(session.id, session);
+
+      if (Number.isInteger(saved.fd)) {
+        session.adopt({ fd: saved.fd, pid: saved.pid, cols: saved.cols, rows: saved.rows });
+      } else {
+        // A tab whose shell had already died has nothing to hand over. Give it
+        // one, exactly as a restart from disk would.
+        this.reopen(session, { cols: saved.cols, rows: saved.rows });
+      }
+    }
+
+    pruneScrollback(new Set(this.sessions.keys()));
+    this.scheduleSave();
+    return this.list().length;
+  }
+
+  /**
+   * Stop and start reading every pty.
+   *
+   * Paused for the length of a handover: whatever the shells write while the
+   * daemon is changing hands waits in the kernel's buffers and is read by the
+   * daemon that takes over, rather than by the one on its way out.
+   */
+  pauseAll() {
+    for (const session of this.sessions.values()) session.pause();
+  }
+
+  resumeAll() {
+    for (const session of this.sessions.values()) session.resume();
+  }
+
   wire(session) {
     session.onData = (data) => this.emit('data', session.id, data);
     session.onExit = () => {

@@ -19,6 +19,11 @@ export const SCROLLBACK_DIR = join(STATE_DIR, 'scrollback');
 export const BROWSER_PROFILE_DIR = join(STATE_DIR, 'browser-profile');
 
 export const HANDSHAKE_FILE = join(RUNTIME_DIR, 'daemon.json');
+
+// Written by a daemon that is handing its shells to a replacement, and deleted
+// by the replacement once it has them. Its presence is the successor's proof
+// that the descriptors it inherited are meant for it.
+export const HANDOVER_FILE = join(RUNTIME_DIR, 'handover.json');
 export const STATE_FILE = join(STATE_DIR, 'state.json');
 
 // Port and token are kept stable across daemon restarts so that a window left

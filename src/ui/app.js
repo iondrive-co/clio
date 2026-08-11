@@ -65,6 +65,7 @@ const el = {
   ctxmenu: document.getElementById('ctxmenu'),
   fontUp: document.getElementById('font-up'),
   fontDown: document.getElementById('font-down'),
+  devbadge: document.getElementById('devbadge'),
 };
 
 // ----------------------------------------------------------------- font size
@@ -230,7 +231,11 @@ function connect() {
 
   ws.onmessage = (event) => handle(JSON.parse(event.data));
 
-  ws.onclose = () => {
+  ws.onclose = (event) => {
+    // 1012 is the daemon saying it is being replaced, not that it has gone: a
+    // successor is already coming up with these shells still running. Backing
+    // off would leave the window dark for seconds after it could have returned.
+    if (event.code === 1012) reconnectDelay = 250;
     if (!disowned) reconnect();
   };
 
@@ -286,6 +291,19 @@ function send(msg) {
   else showStatus('Not connected to the clio daemon yet — that did nothing.', 3000);
 }
 
+/**
+ * Say out loud when this window belongs to a sandbox.
+ *
+ * `clio dev` runs a second daemon with its own state, port and shells, and its
+ * windows are pixel-identical to the real ones. The badge and the title are
+ * what stop a command meant for a throwaway shell from landing in a real one.
+ */
+function setDev(dev) {
+  if (el.devbadge) el.devbadge.toggleAttribute('hidden', !dev);
+  const title = dev ? 'clio (dev)' : 'clio';
+  if (document.title !== title) document.title = title;
+}
+
 function handle(msg) {
   switch (msg.t) {
     case 'sessions':
@@ -295,7 +313,15 @@ function handle(msg) {
         containerId = msg.container;
         rememberContainer();
       }
+      setDev(msg.dev);
       syncSessions(msg.sessions, msg.home);
+      break;
+
+    // The UI files on disk changed. Nothing here is compiled or cached, so the
+    // new version is one reload away — and the shells are in the daemon, which
+    // is not reloading. Whatever was on screen comes straight back.
+    case 'reload':
+      location.reload();
       break;
 
     // Only ever sent when opening a window failed; a window that appeared

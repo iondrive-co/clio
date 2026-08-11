@@ -1,4 +1,4 @@
-import * as pty from 'node-pty';
+import { spawnPty, adoptPty } from './pty.js';
 import { cwdOf, foregroundCommand } from './procinfo.js';
 
 // How much raw output we keep per session. This is what gets replayed on
@@ -45,38 +45,58 @@ export class Session {
     const file = shell || process.env.SHELL || '/bin/bash';
     this.cols = cols;
     this.rows = rows;
-
-    this.pty = pty.spawn(file, [], {
-      name: 'xterm-256color',
-      cols,
-      rows,
-      cwd,
-      env: {
-        ...process.env,
-        TERM: 'xterm-256color',
-        COLORTERM: 'truecolor',
-        CLIO_SESSION: this.id,
-      },
-    });
-
-    this.status = 'live';
-    this.exitCode = null;
     this.cwd = cwd;
 
-    this.pty.onData((data) => {
+    this.take(
+      spawnPty({
+        file,
+        cwd,
+        cols,
+        rows,
+        env: {
+          ...process.env,
+          TERM: 'xterm-256color',
+          COLORTERM: 'truecolor',
+          CLIO_SESSION: this.id,
+        },
+      }),
+    );
+
+    return this;
+  }
+
+  /**
+   * Pick up a pty that was already running under the previous daemon.
+   *
+   * The shell is mid-conversation with whatever is on the other end, so nothing
+   * here announces itself: no seam in the scrollback, no redraw, no resize. As
+   * far as the shell is concerned nothing happened, which is the point.
+   */
+  adopt({ fd, pid, cols = this.cols, rows = this.rows }) {
+    this.cols = cols;
+    this.rows = rows;
+    this.take(adoptPty({ fd, pid }));
+    return this;
+  }
+
+  /** Wire a pty of either kind up to this session. */
+  take(handle) {
+    this.pty = handle;
+    this.status = 'live';
+    this.exitCode = null;
+
+    handle.onData((data) => {
       this.append(data);
       if (this.onData) this.onData(data);
     });
 
-    this.pty.onExit(({ exitCode }) => {
+    handle.onExit((exitCode) => {
       this.status = 'exited';
       this.exitCode = exitCode;
       this.pty = null;
       this.command = null;
       if (this.onExit) this.onExit(exitCode);
     });
-
-    return this;
   }
 
   append(data) {
@@ -115,6 +135,27 @@ export class Session {
         /* pty raced with exit */
       }
     }
+  }
+
+  /** The pty master, which is what a reload hands to the next daemon. */
+  get fd() {
+    return this.pty ? this.pty.fd : null;
+  }
+
+  /**
+   * Stop and start reading the pty.
+   *
+   * Both sides of a handover use this. Output that arrives after we stop
+   * reading waits in the kernel's own buffer for whoever picks the descriptor
+   * up next, instead of being read into a process that is about to exit — which
+   * is how bytes go missing across a reload.
+   */
+  pause() {
+    this.pty?.pause();
+  }
+
+  resume() {
+    this.pty?.resume();
   }
 
   /**

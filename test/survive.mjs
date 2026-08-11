@@ -151,8 +151,32 @@ async function reloadSurvivesAuth(info) {
   console.log('');
 }
 
+/**
+ * Refuse to run against the clio somebody is working in.
+ *
+ * This test SIGKILLs the daemon it is pointed at and ends shells inside it. On
+ * a sandbox that is the point; on the daemon holding a day's worth of terminals
+ * it is not a failing test, it is a lost afternoon.
+ */
+async function onlyAgainstASandbox(info) {
+  const status = await fetch(`http://127.0.0.1:${info.port}/status?token=${info.token}`)
+    .then((res) => res.json())
+    .catch(() => null);
+  if (status?.dev) return;
+
+  console.error('This test kills the daemon and the shells in it, so it only runs');
+  console.error('against a sandbox. Start one, and point this at it:');
+  console.error('');
+  console.error('  bin/clio dev start        # `bin/clio dev status` says where it lives');
+  console.error('  XDG_RUNTIME_DIR=<that>/run XDG_STATE_HOME=<that>/state node test/survive.mjs');
+  console.error('');
+  console.error('Set CLIO_TEST_LIVE=1 to override, if the daemon really is disposable.');
+  if (process.env.CLIO_TEST_LIVE !== '1') process.exit(2);
+}
+
 async function main() {
   const info = handshake();
+  await onlyAgainstASandbox(info);
   console.log(`daemon on port ${info.port}, pid ${info.pid}\n`);
 
   await reloadSurvivesAuth(info);

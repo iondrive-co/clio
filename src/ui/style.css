@@ -69,6 +69,20 @@ body {
   display: none;
 }
 
+/* The sandbox's only visible difference from the real thing, so it is loud. */
+#devbadge {
+  align-self: center;
+  margin: 0 6px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #7a4a00;
+  color: #ffd9a0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
 .tab {
   display: flex;
   align-items: center;
