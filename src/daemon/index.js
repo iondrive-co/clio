@@ -9,7 +9,7 @@ import { WebSocketServer } from 'ws';
 import { ensureDirs, HANDSHAKE_FILE, HANDOVER_FILE, IDENTITY_FILE } from './paths.js';
 import { isAlive } from './procinfo.js';
 import { SessionManager } from './manager.js';
-import { openBrowserWindow } from './window.js';
+import { openBrowserWindow, openUrl } from './window.js';
 
 const ENTRY = fileURLToPath(import.meta.url);
 const HERE = dirname(ENTRY);
@@ -984,6 +984,22 @@ async function main() {
           });
           break;
         }
+
+        // A link in a tab was clicked. A page cannot start a program, and this
+        // one should not be choosing the browser anyway: the desktop knows
+        // which one, and will put it in a tab of the window already open.
+        case 'openurl':
+          try {
+            // The launcher's display, not whatever this daemon was born with,
+            // for the same reason opening a window uses it.
+            const opener = openUrl(msg.url, { ...process.env, ...launchOverrides });
+            // Deliberately not logging the link itself: what someone clicks in
+            // their own terminal is not the daemon log's business.
+            console.log(`[clio] handed a link to ${opener}`);
+          } catch (err) {
+            send({ t: 'link', ok: false, error: err.message });
+          }
+          break;
 
         case 'focus':
           if (mine(msg.id)) focus(msg.id);

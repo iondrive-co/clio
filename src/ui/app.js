@@ -330,6 +330,12 @@ function handle(msg) {
       if (!msg.ok) showStatus(`Could not open a new window — ${msg.error}`, 6000);
       break;
 
+    // Same bargain as a window: only ever sent when the click went nowhere. A
+    // browser that came up says so by being on screen.
+    case 'link':
+      if (!msg.ok) showStatus(`Could not open that link — ${msg.error}`, 6000);
+      break;
+
     case 'created':
       sessions.set(msg.id, msg.session);
       ensurePane(msg.id);
@@ -493,7 +499,13 @@ function ensurePane(id) {
 
   const fit = new FitAddon();
   term.loadAddon(fit);
-  term.loadAddon(new WebLinksAddon());
+  // Clicking a link is a job for the browser you actually use, in a tab
+  // alongside everything else you have open — which is what every other
+  // terminal does. Left to itself the addon calls window.open, and in a Chrome
+  // app window that means a bare new window of clio's own private profile:
+  // signed in to nothing, remembering nothing, and not where you were reading.
+  // The daemon hands it to the desktop instead.
+  term.loadAddon(new WebLinksAddon((event, uri) => send({ t: 'openurl', url: uri })));
   term.open(termEl);
 
   term.onData((data) => send({ t: 'input', id, data }));

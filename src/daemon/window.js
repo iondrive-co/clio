@@ -33,6 +33,60 @@ export function findBrowser(env = process.env) {
   return null;
 }
 
+// How a Linux desktop is asked to open something. Both consult the same
+// mimeapps.list your file manager does, so a link clicked in clio lands in the
+// browser you actually use, as a tab next to everything else you have open —
+// which is what clicking a link in any other terminal does.
+const URL_OPENERS = [
+  ['xdg-open', []],
+  ['gio', ['open']],
+];
+
+// Schemes a click in a terminal could sensibly mean. The text on screen is not
+// something the user wrote — it is the contents of a file, or the output of
+// whatever ran last — so this list is short on purpose.
+const OPENABLE = new Set(['http:', 'https:', 'mailto:']);
+
+/**
+ * Hand a URL to the desktop, and say what opened it.
+ *
+ * The URL is passed as an argument to a program that is executed directly, so
+ * there is no shell for anything in it to reach. Parsing it first is what makes
+ * that true: what goes out is a URL with a scheme from the list above, never a
+ * loose string that might read as an option.
+ *
+ * CLIO_URL_OPENER names a program to use instead, for a desktop that has
+ * neither of these or a person who wants a particular browser.
+ */
+export function openUrl(raw, env = process.env) {
+  let url;
+  try {
+    url = new URL(String(raw));
+  } catch {
+    throw new Error('that does not look like a link');
+  }
+  if (!OPENABLE.has(url.protocol)) {
+    throw new Error(`clio does not open ${url.protocol.replace(':', '')} links`);
+  }
+
+  const override = env.CLIO_URL_OPENER || process.env.CLIO_URL_OPENER;
+  const candidates = override ? [[override, []]] : URL_OPENERS;
+
+  for (const [command, args] of candidates) {
+    const found = command.includes('/') ? command : onPath(command, env);
+    if (!found) continue;
+    const child = spawn(found, [...args, url.href], { detached: true, stdio: 'ignore', env });
+    child.unref();
+    return found;
+  }
+
+  throw new Error(
+    override
+      ? `${override} could not be run`
+      : `nothing on this machine opens links (tried ${URL_OPENERS.map(([c]) => c).join(', ')})`,
+  );
+}
+
 /**
  * Put a clio window on screen, showing whichever container the URL names.
  *
