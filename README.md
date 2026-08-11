@@ -1,7 +1,7 @@
 # clio
 
-Terminal persistence daemon. Shells run in a background daemon, so windows can be closed
-and reattached without losing state. When the daemon goes down (restart, crash etc) tabs come 
+Terminal persistence daemon. Shells run in a background daemon, so tabs and their containing 
+windows can be closed and reattached without losing state. When the daemon crashes tabs come 
 back remembering their name, directory and the command that was running, and offer to pick up 
 where they left off. Built on Node + [xterm.js](https://xtermjs.org) + node-pty, displayed in 
 a Chrome app window. Currently Linux-only. To install or run:
@@ -9,21 +9,19 @@ a Chrome app window. Currently Linux-only. To install or run:
 bin/clio
 ```
 On first run it fetches dependencies, starts the background daemon and opens a terminal window. 
-Run it again whenever you want another window. To put it on your PATH, applications menu, and panel:
+To put it on your PATH, applications menu, and panel:
 
 ```bash
 bin/clio install
 ```
 
-### Commands
 
-| Command | What it does |
+
+| Other commands: | What it does |
 | --- | --- |
-| `clio` | Start the daemon if needed, open a window |
-| `clio open` | Open another window onto the same sessions |
 | `clio start` | Start the daemon only, no window |
 | `clio stop` | Stop the daemon (state is saved first) |
-| `clio status` | Show the daemon and its sessions |
+| `clio status` | Show the daemon, its windows and their tabs |
 | `clio log [n]` | Tail the daemon log |
 
 ## Keys
@@ -42,4 +40,5 @@ bin/clio install
 
 `Ctrl+C`, `Ctrl+D`, `Ctrl+Z` and friends go to the shell untouched.
 Text size can be increased and decreased via arrows at the right end 
-of the tab row, and changes will be saved.
+of the tab row, and changes will be saved. New windows are opened
+with the plus button after the arrows.

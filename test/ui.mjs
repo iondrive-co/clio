@@ -9,10 +9,23 @@
  * Run with the daemon up:  node test/ui.mjs
  */
 import { chromium } from 'playwright';
-import { readFileSync, mkdirSync } from 'node:fs';
-import { execSync } from 'node:child_process';
+import { readFileSync, mkdirSync, existsSync } from 'node:fs';
+import { execSync, spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import WebSocket from 'ws';
+
+// Most of this file is headless, but one section asks the daemon for a real
+// browser window. That window must never land on the desktop of whoever is
+// running the tests: it steals their focus, and a window a person is clicking
+// on or closing does not behave the way the assertions expect — failures that
+// look for all the world like bugs in clio.
+//
+// Dropped here, before anything can inherit it, and handed back only as a
+// display this file started for itself. See startDisplay below.
+delete process.env.DISPLAY;
+delete process.env.WAYLAND_DISPLAY;
 
 const HANDSHAKE = join(
   process.env.XDG_RUNTIME_DIR || join(homedir(), '.cache'),
@@ -20,6 +33,65 @@ const HANDSHAKE = join(
   'daemon.json',
 );
 const SHOTS = join(process.cwd(), 'test', 'screenshots');
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// wmctrl is not involved here, but a browser window with no window manager has
+// nothing to give it a frame or a close button, so keep the same requirement.
+const WINDOW_MANAGERS = ['openbox', 'xfwm4', 'marco', 'icewm', 'fluxbox', 'jwm', 'metacity'];
+
+function installed(command) {
+  try {
+    execSync(`command -v ${command}`, { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const displayProcesses = [];
+
+function stopDisplay() {
+  while (displayProcesses.length) {
+    try {
+      displayProcesses.pop().kill();
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+// However this run ends — a passing exit, a failed assertion, a throw — the
+// display goes with it rather than being left on the machine.
+process.on('exit', stopDisplay);
+
+/**
+ * A display of this test's own making, or null if the machine cannot provide
+ * one. Null means the window section is skipped: using the display that is
+ * already there is not an alternative.
+ */
+async function startDisplay() {
+  if (!installed('Xvfb')) return null;
+  const wm = WINDOW_MANAGERS.find(installed);
+  if (!wm) return null;
+
+  for (let n = 91; n < 120; n++) {
+    if (existsSync(`/tmp/.X${n}-lock`)) continue;
+    const display = `:${n}`;
+
+    const xvfb = spawn('Xvfb', [display, '-screen', '0', '1280x900x24'], { stdio: 'ignore' });
+    displayProcesses.push(xvfb);
+    await sleep(1500);
+    if (xvfb.exitCode !== null) continue; // that number was taken after all
+
+    displayProcesses.push(
+      spawn(wm, [], { stdio: 'ignore', env: { ...process.env, DISPLAY: display } }),
+    );
+    await sleep(1500);
+    return display;
+  }
+  return null;
+}
 
 let passed = 0;
 let failed = 0;
@@ -144,6 +216,28 @@ async function main() {
   const info = JSON.parse(readFileSync(HANDSHAKE, 'utf8'));
   const origin = `http://127.0.0.1:${info.port}`;
 
+  /** Live view of the daemon's windows and their tabs. */
+  const daemonStatus = async () =>
+    (await fetch(`${origin}/status?token=${info.token}`, { cache: 'no-store' })).json();
+
+  /** Another window onto a container, for driving one this page cannot touch. */
+  const windowOnto = (container) =>
+    new Promise((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${info.port}/?token=${info.token}&c=${container}`, {
+        origin,
+      });
+      ws.on('error', reject);
+      ws.on('message', (raw) => {
+        const msg = JSON.parse(raw);
+        if (msg.t === 'sessions') resolve({ ws, tabs: msg.sessions });
+      });
+    });
+
+  // This run gets a window of its own. Sharing one with whatever the machine
+  // already has open would mean a test that closes tabs closing somebody's
+  // work, and assertions that depend on what was there before it started.
+  const testWindow = randomBytes(4).toString('hex');
+
   const browser = await chromium.launch();
   const context = await browser.newContext({ viewport: { width: 1100, height: 700 } });
   const page = await context.newPage();
@@ -154,14 +248,31 @@ async function main() {
   });
   page.on('pageerror', (err) => consoleErrors.push(String(err)));
 
+  // Closing the window ends the shells in it, so the window asks first — and a
+  // reload is the same event as far as the browser is concerned. Nothing in
+  // this file is a person choosing to stay, so every one of these is accepted;
+  // the count is what two of the tests below actually turn on.
+  let closeDialogs = 0;
+  page.on('dialog', async (dialog) => {
+    if (dialog.type() === 'beforeunload') closeDialogs++;
+    await dialog.accept();
+  });
+
   // ---- load exactly like the launcher does ------------------------------
   console.log('1. first load');
-  await page.goto(`${origin}/?token=${info.token}`);
+  await page.goto(`${origin}/?token=${info.token}&c=${testWindow}`);
   await page.waitForTimeout(2500);
   await page.screenshot({ path: join(SHOTS, '01-first-load.png') });
 
   check('no dead screen', await page.locator('#deadscreen').isHidden());
   check('a tab is present', (await page.locator('.tab').count()) >= 1);
+  // The token is scrubbed from the address bar; which window this is must not
+  // be, or a reload comes back showing another window's tabs.
+  check(
+    'the window keeps its own name in the URL',
+    (await page.evaluate(() => location.search)) === `?c=${testWindow}`,
+    await page.evaluate(() => location.search),
+  );
   check('terminal rendered', await page.locator('.xterm-screen').isVisible());
   check('no console errors', consoleErrors.length === 0, consoleErrors[0]);
 
@@ -241,6 +352,8 @@ async function main() {
   console.log('\n6. reload');
   await page.reload();
   await page.waitForTimeout(2500);
+  // Leaving takes the shells with it, so the browser is asked to ask first.
+  check('leaving the page was asked about', closeDialogs === 1, `${closeDialogs} dialogs`);
   check('still no dead screen after reload', await page.locator('#deadscreen').isHidden());
   const reloadTabs = await page.locator('.tab').count();
   check('tabs came back after reload', reloadTabs >= 3, `${reloadTabs} tabs`);
@@ -256,7 +369,7 @@ async function main() {
   check('menu opened on right-click', await page.locator('#ctxmenu').isVisible());
   await page.screenshot({ path: join(SHOTS, '04-context-menu.png') });
   const menuItems = await page.locator('#ctxmenu .item').allInnerTexts();
-  check('menu has entries', menuItems.length === 6, menuItems.join(' | '));
+  check('menu has entries', menuItems.length === 7, menuItems.join(' | '));
   check(
     'menu offers to close the other tabs',
     menuItems.some((t) => t.startsWith('Close Other Tab')),
@@ -266,6 +379,47 @@ async function main() {
   await page.keyboard.press('Escape');
   await page.mouse.click(550, 400);
   await page.waitForTimeout(300);
+
+  // ---- turning the closing question off ----------------------------------
+  //
+  // The browser writes the wording of that dialog and will not carry a checkbox
+  // of ours, so "and don't ask me again" has to live somewhere in the app. This
+  // is that switch, and the only thing that makes the guard bearable: a warning
+  // you cannot turn off is one people learn to click through.
+  console.log('\n7b. the ask-before-closing switch');
+  const setting = page.locator('#ctxmenu .item', { hasText: 'Ask before closing' });
+
+  await page.locator('.pane.active .xterm-screen').click({ button: 'right' });
+  await page.waitForTimeout(400);
+  check('the menu carries the setting', (await setting.count()) === 1);
+  check('and it is on until it is turned off', (await setting.innerText()).includes('✓'),
+    await setting.innerText());
+
+  await setting.click();
+  await page.waitForTimeout(300);
+  check('the menu closes on choosing it', await page.locator('#ctxmenu').isHidden());
+  check(
+    'the answer is remembered for every clio window, not this page',
+    (await page.evaluate(() => localStorage.getItem('clio.warnOnClose'))) === 'off',
+  );
+
+  const askedBefore = closeDialogs;
+  await page.reload();
+  await page.waitForTimeout(2500);
+  check('and nothing asks any more', closeDialogs === askedBefore,
+    `${closeDialogs - askedBefore} dialogs`);
+  check('the window is still working', await page.locator('#deadscreen').isHidden());
+
+  await page.locator('.pane.active .xterm-screen').click({ button: 'right' });
+  await page.waitForTimeout(400);
+  check('the tick is gone from the menu', !(await setting.innerText()).includes('✓'),
+    await setting.innerText());
+  await setting.click(); // back on, so the rest of the run is the default app
+  await page.waitForTimeout(300);
+  check(
+    'and it can be turned back on',
+    (await page.evaluate(() => localStorage.getItem('clio.warnOnClose'))) === 'on',
+  );
 
   // ---- closing tabs ------------------------------------------------------
   console.log('\n8. closing tabs');
@@ -463,6 +617,103 @@ async function main() {
     `+ at ${geometry.plusLeft} of ${geometry.windowWidth}`,
   );
 
+  // ---- the other + : a whole new window ----------------------------------
+  //
+  // Two buttons that both mean "new" and do very different things, so this
+  // checks where it sits and that it looks nothing like the tab one, as well as
+  // what it does.
+  console.log('\n13b. the new-window button');
+  const winButton = await page.evaluate(() => {
+    const button = document.getElementById('newwindow').getBoundingClientRect();
+    const arrows = document.getElementById('fontsize').getBoundingClientRect();
+    const plus = document.getElementById('newtab');
+    return {
+      rightOfArrows: button.left >= arrows.right - 1,
+      onScreen: button.right <= window.innerWidth && button.width > 0 && button.height > 0,
+      drawn: !!document.querySelector('#newwindow svg'),
+      typed: plus.textContent.trim(),
+      says: document.getElementById('newwindow').title,
+    };
+  });
+  check('it is to the right of the font arrows', winButton.rightOfArrows);
+  check('and inside the window', winButton.onScreen);
+  check('it is drawn, not the same + as the tab button', winButton.drawn && winButton.typed === '+');
+  check('it says what it does on hover', winButton.says === 'New window', winButton.says);
+
+  // Everything above is headless; this part is not.
+  const display = await startDisplay();
+  if (!display) {
+    console.log('  - the rest needs Xvfb and a window manager of its own; skipped');
+  } else {
+    console.log(`  (on ${display}, started for this test and taken down after it)`);
+
+    // Somewhere identifiable, so where the new window starts is provable.
+    await page.locator('.pane.active .xterm-screen').click();
+    await page.keyboard.type('cd /usr/share');
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(2600); // the daemon polls /proc every 2s
+
+    // The daemon is what spawns browser windows, and it aims them at whatever
+    // display the launcher last handed it — which may be the one this test just
+    // disowned. Run the launcher once against ours to point it somewhere safe;
+    // that opens a window of its own, which is closed again below.
+    const beforeSeed = (await daemonStatus()).containers.map((c) => c.id);
+    execSync('./bin/clio', { stdio: 'ignore', env: { ...process.env, DISPLAY: display } });
+    await page.waitForTimeout(1500);
+    const seeded = (await daemonStatus()).containers
+      .map((c) => c.id)
+      .filter((id) => !beforeSeed.includes(id));
+
+    const known = (await daemonStatus()).containers.map((c) => c.id);
+    const tabsHere = await page.locator('.tab').count();
+
+    await page.locator('#newwindow').click();
+
+    // A real browser window has to start and connect, which on a cold profile
+    // is not quick. Reporting it as open before it is there is the failure this
+    // is looking for, so give it room rather than a fixed sleep.
+    let opened = null;
+    for (let i = 0; i < 80 && !opened?.onScreen; i++) {
+      await page.waitForTimeout(500);
+      opened = (await daemonStatus()).containers.find((c) => !known.includes(c.id));
+    }
+
+    check('a second window opened', !!opened?.onScreen, JSON.stringify(opened));
+    check('it is a window of its own, with one shell in it', opened?.sessions.length === 1,
+      JSON.stringify(opened?.sessions));
+    check(
+      'it starts where the tab it was opened from is',
+      opened?.sessions?.[0]?.cwd === '/usr/share',
+      opened?.sessions?.[0]?.cwd,
+    );
+    check(
+      'and this window carries on unchanged',
+      (await page.locator('.tab').count()) === tabsHere,
+      `${tabsHere} tabs before`,
+    );
+
+    // Tidy up after ourselves, which is also the last thing worth proving: a
+    // window whose final tab closes goes away rather than sitting there empty.
+    if (opened) {
+      const { ws, tabs } = await windowOnto(opened.id);
+      for (const tab of tabs) ws.send(JSON.stringify({ t: 'close', id: tab.id }));
+      await page.waitForTimeout(2500);
+      ws.close();
+      const left = (await daemonStatus()).containers.some((c) => c.id === opened.id);
+      check('closing its last tab takes the window with it', !left);
+    }
+
+    // And the window the launcher was run for, which was only ever a way to
+    // tell the daemon where the desktop is.
+    for (const id of seeded) {
+      const { ws, tabs } = await windowOnto(id);
+      for (const tab of tabs) ws.send(JSON.stringify({ t: 'close', id: tab.id }));
+      await page.waitForTimeout(1200);
+      ws.close();
+    }
+    stopDisplay();
+  }
+
   // ---- a program's announced title becomes the tab name -------------------
   console.log('\n14. tab takes its name from the running program');
   // A fresh tab: a title the user set by hand deliberately outranks anything a
@@ -622,6 +873,18 @@ async function main() {
   await page.screenshot({ path: join(SHOTS, '07-after-restore.png') });
 
   await browser.close();
+
+  // The window this run was using is closed for good, so a later `clio` does
+  // not put a test's leftovers back on somebody's desktop.
+  const { ws, tabs } = await windowOnto(testWindow);
+  for (const tab of tabs) ws.send(JSON.stringify({ t: 'close', id: tab.id }));
+  await new Promise((r) => setTimeout(r, 800));
+  ws.close();
+  check(
+    'the test window cleaned itself up',
+    !(await daemonStatus()).containers.some((c) => c.id === testWindow),
+  );
+
   console.log(`\n${passed} passed, ${failed} failed`);
   console.log(`screenshots in ${SHOTS}`);
   process.exit(failed ? 1 : 0);

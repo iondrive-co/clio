@@ -19,6 +19,18 @@
         <button id="font-down" title="Smaller text">&#9662;</button>
         <button id="font-up" title="Larger text">&#9652;</button>
       </div>
+      <!-- Drawn rather than typed: a bare + is what opens a tab a few
+           centimetres to the left, and these two must not be mistaken for each
+           other. A plus inside a window frame says which one this is. -->
+      <div id="windowbar">
+        <button id="newwindow" title="New window" aria-label="New window">
+          <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+            <rect x="1.5" y="2.5" width="13" height="11" rx="1.5" />
+            <path d="M1.5 5.5h13" />
+            <path d="M8 7.4v4.2M5.9 9.5h4.2" />
+          </svg>
+        </button>
+      </div>
     </div>
 
     <div id="panes"></div>

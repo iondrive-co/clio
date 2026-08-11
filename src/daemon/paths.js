@@ -13,6 +13,11 @@ export const RUNTIME_DIR = join(runtimeBase, 'clio');
 export const STATE_DIR = join(stateBase, 'clio');
 export const SCROLLBACK_DIR = join(STATE_DIR, 'scrollback');
 
+// A dedicated browser profile keeps the terminal out of the everyday browsing
+// profile: no extensions injecting into it, no session-restore prompts, and
+// clipboard permission granted once here rather than against normal browsing.
+export const BROWSER_PROFILE_DIR = join(STATE_DIR, 'browser-profile');
+
 export const HANDSHAKE_FILE = join(RUNTIME_DIR, 'daemon.json');
 export const STATE_FILE = join(STATE_DIR, 'state.json');
 

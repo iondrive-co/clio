@@ -9,6 +9,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { execSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import WebSocket from 'ws';
 
 const HANDSHAKE = join(process.env.XDG_RUNTIME_DIR || join(homedir(), '.cache'), 'clio', 'daemon.json');
@@ -32,17 +33,26 @@ function handshake() {
   return JSON.parse(readFileSync(HANDSHAKE, 'utf8'));
 }
 
-/** A stand-in for a browser window: connects, talks, and can be killed off. */
+/**
+ * A stand-in for a browser window: connects, talks, and can be killed off.
+ *
+ * The container it names is the window it is: the daemon hands back that
+ * window's tabs and nobody else's, and naming the same one again is how a
+ * window that was closed — or a daemon that was killed — comes back as itself.
+ */
 class Client {
-  constructor(info) {
+  constructor(info, container = null) {
     this.info = info;
+    this.container = container;
+    this.sessions = [];
     this.messages = [];
     this.output = new Map();
   }
 
   connect() {
+    const query = `?token=${this.info.token}${this.container ? `&c=${this.container}` : ''}`;
     return new Promise((resolve, reject) => {
-      this.ws = new WebSocket(`ws://127.0.0.1:${this.info.port}/?token=${this.info.token}`, {
+      this.ws = new WebSocket(`ws://127.0.0.1:${this.info.port}/${query}`, {
         origin: `http://127.0.0.1:${this.info.port}`,
       });
       this.ws.on('open', resolve);
@@ -50,6 +60,10 @@ class Client {
       this.ws.on('message', (raw) => {
         const msg = JSON.parse(raw);
         this.messages.push(msg);
+        if (msg.t === 'sessions') {
+          this.container = msg.container;
+          this.sessions = msg.sessions;
+        }
         if (msg.t === 'data') {
           this.output.set(msg.id, (this.output.get(msg.id) || '') + msg.data);
         }
@@ -58,6 +72,10 @@ class Client {
         }
       });
     });
+  }
+
+  has(id) {
+    return this.sessions.some((s) => s.id === id);
   }
 
   send(msg) {
@@ -139,9 +157,15 @@ async function main() {
 
   await reloadSurvivesAuth(info);
 
+  // Two windows for this run, named up front. Real ids so a rerun cannot
+  // inherit tabs from the last one, and so nothing here can touch a window a
+  // person actually has open.
+  const windowA = randomBytes(4).toString('hex');
+  const windowB = randomBytes(4).toString('hex');
+
   // ---- 1. a session runs and produces output -----------------------------
   console.log('1. basic session');
-  const win1 = new Client(info);
+  const win1 = new Client(info, windowA);
   await win1.connect();
   win1.send({ t: 'create', cwd: '/tmp', cols: 80, rows: 24 });
 
@@ -155,8 +179,14 @@ async function main() {
   await sleep(700);
   check('command output came back', (win1.output.get(id) || '').includes('hello-from-clio'));
 
-  // ---- 2. a long-running process survives the window closing -------------
-  console.log('\n2. window closes while a process runs');
+  // ---- 2. a dropped connection does not touch the processes ---------------
+  //
+  // A page that is reloading drops its socket in exactly the way a window being
+  // closed does, and nothing in the event says which happened. So the shells are
+  // held either way until something comes back for them — which is what makes a
+  // reload, or a browser that restarted itself, survivable. Section 6 is the
+  // other side of it: nothing comes back, so they end.
+  console.log('\n2. the connection drops while a process runs');
   win1.send({ t: 'input', id, data: 'sleep 120 & echo started-$!\n' });
   await sleep(800);
 
@@ -166,7 +196,7 @@ async function main() {
   const shellPid = created.session.pid;
   check('shell pid reported', !!shellPid);
 
-  win1.close(); // this is the window being closed / crashing
+  win1.close(); // the socket goes, as it would on a reload
   await sleep(1200);
 
   let alive = true;
@@ -175,15 +205,15 @@ async function main() {
   } catch {
     alive = false;
   }
-  check('shell still alive after the window closed', alive);
+  check('shell still alive with the connection only just gone', alive);
 
   const sleepAlive =
     execSync(`pgrep -P ${shellPid} 2>/dev/null || true`, { encoding: 'utf8' }).trim().length > 0;
-  check('child process still running after the window closed', sleepAlive);
+  check('child process still running too', sleepAlive);
 
-  // ---- 3. a new window reattaches to the live session --------------------
-  console.log('\n3. new window reattaches');
-  const win2 = new Client(info);
+  // ---- 3. the window comes back and picks its tabs up again --------------
+  console.log('\n3. the window comes back');
+  const win2 = new Client(info, windowA);
   await win2.connect();
 
   const list = await win2.await((m) => m.t === 'sessions');
@@ -214,6 +244,33 @@ async function main() {
   win2.send({ t: 'rename', id, title: 'my-tab' });
   await sleep(600);
 
+  // ---- 3b. a second window is a second set of tabs ------------------------
+  //
+  // Not two views of one set. Two windows showing the same shells means a tab
+  // closed in one vanishes out of the other, and typing lands in both.
+  console.log('\n3b. a second window has its own tabs');
+  const other = new Client(info, windowB);
+  await other.connect();
+  await other.await((m) => m.t === 'sessions');
+  other.send({ t: 'create', cwd: '/etc', cols: 80, rows: 24 });
+  const otherTab = await other.await((m) => m.t === 'created');
+  check('the second window opened its own tab', !!otherTab);
+  await sleep(600);
+
+  check('it is a different window', other.container !== win2.container,
+    `${other.container} vs ${win2.container}`);
+  check("it does not show the first window's tabs", !other.has(id));
+  check("and the first window does not show its tab", !win2.has(otherTab.id));
+
+  // Knowing the id is not enough: a tab belongs to one window.
+  other.send({ t: 'attach', id, cols: 80, rows: 24 });
+  check('it cannot attach to a tab from the other window',
+    !!(await other.await((m) => m.t === 'gone' && m.id === id, 2000)));
+
+  other.send({ t: 'input', id: otherTab.id, data: 'echo second-window-mark\n' });
+  await sleep(4000); // past the scrollback flush, so the crash below cannot lose it
+  other.close();
+
   // Leave something running in the foreground: what the daemon does with it
   // across a crash is the part people care about.
   win2.send({ t: 'input', id, data: 'sleep 300\n' });
@@ -243,7 +300,7 @@ async function main() {
   check('kept the same port', info2.port === info.port, `${info.port} -> ${info2.port}`);
   check('kept the same token', info2.token === info.token);
 
-  const win3 = new Client(info2);
+  const win3 = new Client(info2, windowA);
   await win3.connect();
   const list2 = await win3.await((m) => m.t === 'sessions');
   const recovered = list2?.sessions.find((s) => s.id === id);
@@ -289,12 +346,108 @@ async function main() {
     (win3.output.get(id) || '').includes('typed-without-being-asked'),
   );
 
+  // ---- 4b. both windows come back, not just the one -----------------------
+  //
+  // The point of tracking windows at all: two of them open before the crash is
+  // two of them afterwards, each with the tabs that were in it.
+  console.log('\n4b. the second window came back too');
+  const other2 = new Client(info2, windowB);
+  await other2.connect();
+  const otherList = await other2.await((m) => m.t === 'sessions');
+  check('it is still the same window', other2.container === windowB, other2.container);
+  check('with its own tab in it', other2.has(otherTab.id), JSON.stringify(otherList?.sessions));
+  check("and none of the other window's", !other2.has(id));
+
+  other2.send({ t: 'attach', id: otherTab.id, cols: 80, rows: 24 });
+  const otherAttached = await other2.await((m) => m.t === 'attached');
+  check(
+    'its scrollback came back with it',
+    (otherAttached?.scrollback || '').includes('second-window-mark'),
+    JSON.stringify((otherAttached?.scrollback || '').slice(-120)),
+  );
+
+  const live = await (
+    await fetch(`http://127.0.0.1:${info2.port}/status?token=${info2.token}`)
+  ).json();
+  const known = live.containers.filter((c) => c.id === windowA || c.id === windowB);
+  check('the daemon knows about both windows', known.length === 2,
+    JSON.stringify(live.containers.map((c) => c.id)));
+  check('and has a window open on each', known.every((c) => c.onScreen));
+
+  // ---- 6. a window that is closed for good takes its shells with it -------
+  //
+  // The line this whole design draws. The daemon carries shells across its own
+  // death; it does not carry them across a window being closed. A connection
+  // that drops and never comes back was a window somebody closed, and its tabs
+  // end there — no lingering shells, and nothing for a later `clio` to put back
+  // on the desktop.
+  console.log('\n6. a closed window ends its shells');
+  const windowC = randomBytes(4).toString('hex');
+  const win4 = new Client(info2, windowC);
+  await win4.connect();
+  await win4.await((m) => m.t === 'sessions');
+  win4.send({ t: 'create', cwd: '/tmp', cols: 80, rows: 24 });
+
+  const doomed = await win4.await((m) => m.t === 'created');
+  check('a window to close, with a shell in it', !!doomed);
+  if (!doomed) return report();
+
+  const doomedPid = doomed.session.pid;
+  await sleep(700);
+  // A background job as well: closing a terminal window ends what was running
+  // in it, not just the shell that was running it.
+  win4.send({ t: 'input', id: doomed.id, data: 'sleep 601 &\n' });
+  await sleep(800);
+  const jobs = () =>
+    // The brackets keep the pattern from matching the shell running the pgrep,
+    // whose own command line contains it verbatim.
+    execSync('pgrep -f "sleep 6[0]1" 2>/dev/null || true', { encoding: 'utf8' }).trim();
+  check('its background job is running', jobs().length > 0);
+
+  win4.close();
+  // Long enough to be past the daemon's grace period, which is deliberately
+  // longer than any reload takes.
+  await sleep(13000);
+
+  let survivor = true;
+  try {
+    process.kill(doomedPid, 0);
+  } catch {
+    survivor = false;
+  }
+  check('the shell in the closed window is gone', !survivor);
+  check('and the job it was running went with it', jobs().length === 0, jobs());
+
+  const afterClose = await (
+    await fetch(`http://127.0.0.1:${info2.port}/status?token=${info2.token}`)
+  ).json();
+  check(
+    'the window itself is forgotten, so no later clio puts it back',
+    !afterClose.containers.some((c) => c.id === windowC),
+    JSON.stringify(afterClose.containers.map((c) => c.id)),
+  );
+
   // ---- cleanup ------------------------------------------------------------
   win3.send({ t: 'close', id });
   await sleep(400);
   const list3 = await win3.await((m) => m.t === 'sessions' && !m.sessions.some((s) => s.id === id));
   check('closing a tab removes it', !!list3);
+
+  // A window with no tabs left is no longer a window. Leaving these behind
+  // would mean `clio` reopening this test on somebody's desktop tomorrow.
+  for (const tab of other2.sessions) other2.send({ t: 'close', id: tab.id });
+  await sleep(600);
+  const cleaned = await (
+    await fetch(`http://127.0.0.1:${info2.port}/status?token=${info2.token}`)
+  ).json();
+  check(
+    'a window whose last tab closed is forgotten',
+    !cleaned.containers.some((c) => c.id === windowA || c.id === windowB),
+    JSON.stringify(cleaned.containers.map((c) => c.id)),
+  );
+
   win3.close();
+  other2.close();
 
   report();
 }

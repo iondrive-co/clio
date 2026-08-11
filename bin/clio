@@ -76,76 +76,54 @@ start_daemon() {
   return 1
 }
 
-# How many windows are currently connected to the daemon; -1 if unknown.
-client_count() {
+# Windows are put on screen by the daemon, not from here. The + at the end of
+# the tab row asks for one too and cannot spawn a browser, so both go through
+# the same path and a window opened either way is the same window.
+#
+# This brings back every set of tabs that has no window on it — that is how two
+# windows left open before a reboot come back as two windows — and opens a new
+# one only when there was nothing to restore. The display variables go with the
+# request because the daemon may have been started from a session that has since
+# gone away, leaving it pointing at a display that no longer exists.
+open_windows() {
   node -e '
     const fs = require("fs");
+    const file = process.argv[1];
+
+    let info;
     try {
-      const i = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-      fetch(`http://127.0.0.1:${i.port}/clients?token=${i.token}`)
-        .then((r) => r.json())
-        .then((j) => console.log(j.count))
-        .catch(() => console.log(-1));
-    } catch { console.log(-1); }
-  ' "$HANDSHAKE" 2>/dev/null || echo -1
-}
+      info = JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch {
+      console.error("clio: the daemon left no handshake file — is it running?");
+      process.exit(1);
+    }
 
-open_window() {
-  local url
-  url="$(field url)" || { echo "clio: no daemon URL available" >&2; return 1; }
+    const env = {};
+    for (const key of ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY",
+                       "DBUS_SESSION_BUS_ADDRESS", "XDG_SESSION_TYPE"]) {
+      if (process.env[key]) env[key] = process.env[key];
+    }
 
-  local browser=""
-  for candidate in google-chrome google-chrome-stable chromium chromium-browser brave-browser; do
-    if command -v "$candidate" >/dev/null 2>&1; then browser="$candidate"; break; fi
-  done
-
-  if [ -z "$browser" ]; then
-    echo "clio: no Chrome-family browser found; open this URL yourself:" >&2
-    echo "$url"
-    return 1
-  fi
-
-  launch() {
-    # A dedicated profile keeps the terminal out of the everyday browsing
-    # profile: no extensions injecting into it, no session-restore prompts, and
-    # clipboard permission is granted once here rather than against normal
-    # browsing.
-    #
-    # setsid, as for the daemon: without its own session the browser stays in
-    # this shell's process group and dies whenever whatever invoked clio is
-    # cleaned up — closing the terminal, or a script finishing.
-    setsid "$browser" \
-      --app="$url" \
-      --user-data-dir="$STATE_DIR/browser-profile" \
-      --class=clio \
-      --window-size=1100,700 \
-      --no-first-run \
-      --no-default-browser-check \
-      --disable-features=Translate,MediaRouter \
-      >/dev/null 2>&1 &
-    disown 2>/dev/null || true
-  }
-
-  # Closing a window and reopening straight away can catch the browser still
-  # releasing its profile lock, in which case it exits without ever showing
-  # anything. Watch for the window actually connecting, and try once more
-  # rather than leaving the user staring at an empty desktop.
-  local before attempt count
-  before="$(client_count)"
-
-  for attempt in 1 2; do
-    launch
-    for _ in $(seq 1 40); do
-      sleep 0.25
-      count="$(client_count)"
-      if [ "$count" -gt "$before" ] 2>/dev/null; then return 0; fi
-    done
-    [ "$attempt" -eq 1 ] && echo "clio: the window did not appear — retrying…" >&2
-  done
-
-  echo "clio: could not open a window. Open this URL manually:" >&2
-  echo "$url" >&2
-  return 1
+    fetch(`http://127.0.0.1:${info.port}/windows?token=${info.token}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ cwd: process.cwd(), env }),
+    })
+      .then((res) => res.json())
+      .then((out) => {
+        for (const failure of out.failed || []) console.error(`clio: ${failure.error}`);
+        if ((out.opened || []).length) return;
+        if (out.url) {
+          console.error("clio: open this address yourself to get the window:");
+          console.error(out.url);
+        }
+        process.exit(1);
+      })
+      .catch((err) => {
+        console.error(`clio: the daemon did not open a window (${err.message})`);
+        process.exit(1);
+      });
+  ' "$HANDSHAKE"
 }
 
 install_desktop() {
@@ -205,7 +183,7 @@ DESKTOP
 case "${1:-run}" in
   run)
     start_daemon
-    open_window
+    open_windows
     ;;
 
   install)
@@ -215,11 +193,6 @@ case "${1:-run}" in
   start)
     start_daemon
     echo "clio daemon running (pid $(daemon_pid), $(field url | sed 's/?token=.*//'))"
-    ;;
-
-  open)
-    start_daemon
-    open_window
     ;;
 
   stop)
@@ -252,23 +225,53 @@ case "${1:-run}" in
     if pid="$(daemon_pid)"; then
       echo "daemon:   running (pid $pid)"
       echo "address:  $(field url | sed 's/?token=.*//')"
+      # Asked of the daemon rather than read from the state file: the file is
+      # written on a debounce and knows nothing about what is on screen.
       node -e '
         const fs = require("fs");
-        const path = process.argv[1];
-        try {
-          const state = JSON.parse(fs.readFileSync(path, "utf8"));
-          console.log(`sessions: ${state.sessions.length}`);
-          for (const s of state.sessions) {
-            const label = s.title || s.command || s.cwd || "shell";
-            console.log(`  - ${s.id}  ${label}`);
-          }
-        } catch {
-          console.log("sessions: (no saved state yet)");
-        }
-      ' "$STATE_DIR/state.json"
+        const info = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+        fetch(`http://127.0.0.1:${info.port}/status?token=${info.token}`)
+          .then((res) => res.json())
+          .then((state) => {
+            const shown = state.containers.filter((c) => c.onScreen).length;
+            console.log(`windows:  ${state.containers.length} (${shown} on screen)`);
+            state.containers.forEach((container, index) => {
+              // A window with nothing on it is either one the daemon is about to
+              // clear up after, or one left over from a daemon that went down.
+              const note = container.onScreen
+                ? ""
+                : container.closing
+                  ? "  — window closed, its shells are ending"
+                  : "  — no window on it, run clio to bring it back";
+              console.log(`  window ${index + 1}${note}`);
+              for (const tab of container.sessions) {
+                console.log(`    ${tab.id}  ${tab.title || tab.command || tab.cwd || "shell"}`);
+              }
+            });
+          })
+          .catch(() => console.log("windows:  (the daemon did not answer)"));
+      ' "$HANDSHAKE"
     else
       echo "daemon:   not running"
-      echo "Run 'clio start' to bring it back; saved tabs will be offered for restore."
+      node -e '
+        const fs = require("fs");
+        try {
+          const state = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+          const containers = state.containers?.length ? state.containers : [{ id: null }];
+          console.log(`saved:    ${state.sessions.length} tab(s) in ${containers.length} window(s)`);
+          containers.forEach((container, index) => {
+            console.log(`  window ${index + 1}`);
+            for (const tab of state.sessions) {
+              if (container.id && tab.container !== container.id) continue;
+              console.log(`    ${tab.id}  ${tab.title || tab.command || tab.cwd || "shell"}`);
+            }
+          });
+        } catch {
+          console.log("saved:    (no saved state yet)");
+        }
+      ' "$STATE_DIR/state.json"
+      echo
+      echo "Run 'clio' to bring it back: every saved window reopens with its tabs."
     fi
     ;;
 
@@ -280,13 +283,12 @@ case "${1:-run}" in
     cat <<'USAGE'
 clio — the immortal terminal
 
-  clio            start the daemon if needed and open a window
+  clio            reopen the windows a stopped daemon left, or start a new one
   clio install    add to the applications menu, panel icon and PATH
   clio start      start the daemon only
-  clio open       open another window onto the running daemon
   clio stop       stop the daemon (state is saved for restore)
   clio crash      SIGKILL the daemon and restart it, to test session restore
-  clio status     show daemon and session state
+  clio status     show the daemon, its windows and their tabs
   clio log [n]    tail the daemon log
 USAGE
     exit 1

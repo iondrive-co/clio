@@ -8,10 +8,71 @@
 # found the daemon already running masked the bug.
 set -uo pipefail
 
+# Nothing in this file may reach the desktop it was started from. Later sections
+# put real browser windows on screen, and dropping those over somebody's work is
+# both rude and useless as a test: a window a person is clicking on, focusing or
+# closing does not behave the way the assertions expect, and the failures that
+# produces look exactly like bugs in clio.
+#
+# So the display goes here, before anything can inherit it, and comes back only
+# as one this script made for itself in start_display below.
+unset DISPLAY WAYLAND_DISPLAY
+
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 CLIO="$ROOT/bin/clio"
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+
+XVFB_PID=""
+WM_PID=""
+
+stop_display() {
+  [ -n "$WM_PID" ] && kill "$WM_PID" 2>/dev/null
+  [ -n "$XVFB_PID" ] && kill "$XVFB_PID" 2>/dev/null
+  WM_PID=""
+  XVFB_PID=""
+  unset DISPLAY
+}
+
+# A display of our own, with a window manager on it — wmctrl asks the window
+# manager for the client list, so bare Xvfb would answer nothing at all.
+#
+# Returns 1 when the machine has no Xvfb or no window manager, and the window
+# tests are then skipped. Falling back to whatever display is at hand is the one
+# thing this must never do.
+start_display() {
+  command -v Xvfb >/dev/null 2>&1 || return 1
+
+  local wm=""
+  for candidate in openbox xfwm4 marco icewm fluxbox jwm metacity; do
+    if command -v "$candidate" >/dev/null 2>&1; then wm="$candidate"; break; fi
+  done
+  [ -n "$wm" ] || return 1
+
+  local n
+  for n in $(seq 91 120); do
+    [ -e "/tmp/.X${n}-lock" ] && continue
+
+    Xvfb ":$n" -screen 0 1280x900x24 >/dev/null 2>&1 &
+    XVFB_PID=$!
+    sleep 1.5
+    kill -0 "$XVFB_PID" 2>/dev/null || { XVFB_PID=""; continue; }
+
+    export DISPLAY=":$n"
+    "$wm" >/dev/null 2>&1 &
+    WM_PID=$!
+    sleep 1.5
+    # Proof it is really there and answering, rather than a display number and
+    # some hope.
+    wmctrl -m >/dev/null 2>&1 && return 0
+
+    stop_display
+  done
+  return 1
+}
+
+# The browser can still be letting go of its profile directory as this runs, so
+# do not make a noisy failure out of tidying up.
+trap 'stop_display; sleep 1; rm -rf "$TMP" 2>/dev/null || true' EXIT
 
 passed=0
 failed=0
@@ -115,35 +176,91 @@ grep -q 'rel="icon"' "$ROOT/src/ui/index.html"; check "the page declares it as i
 
 echo
 echo "6. opening a window is confirmed, not assumed"
-if [ -n "${DISPLAY:-}" ] && command -v wmctrl >/dev/null 2>&1; then
-  "$CLIO" start >/dev/null 2>&1; sleep 1
-  # Close any existing window, then reopen immediately — the browser may still
-  # be releasing its profile lock, which used to fail silently.
-  for id in $(wmctrl -l | grep -i clio | awk '{print $1}'); do wmctrl -i -c "$id"; done
-  sleep 1
-  "$CLIO" open >/dev/null 2>&1; rc=$?
-  [ $rc -eq 0 ]; check "reopening straight after closing succeeds" $?
+if command -v wmctrl >/dev/null 2>&1 && start_display; then
+  echo "  (on $DISPLAY, which this test started and will take down again)"
+  # An isolated clio from here on: its own state, and so its own browser
+  # profile. That profile is what makes these windows identifiable — a window
+  # belongs to this test when the browser holding it was started with that
+  # directory. Nothing else on the desktop is counted, let alone closed.
+  export XDG_STATE_HOME="$TMP/win/state" XDG_RUNTIME_DIR="$TMP/win/run"
+  mkdir -p "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR"
+  PROFILE="$XDG_STATE_HOME/clio/browser-profile"
+
+  ours() { # ids of the windows this test put on screen
+    local id desktop pid rest
+    while read -r id desktop pid rest; do
+      [ -r "/proc/$pid/cmdline" ] || continue
+      tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q -- "--user-data-dir=$PROFILE" && echo "$id"
+    done < <(wmctrl -l -p)
+  }
+  on_screen() { ours | wc -l; }
+  close_ours() { for id in $(ours); do wmctrl -i -c "$id"; done; sleep 2; }
+
+  "$CLIO" >/dev/null 2>&1; rc=$?
+  [ $rc -eq 0 ]; check "clio reports opening a window" $?
   sleep 2
-  [ -n "$(wmctrl -l | grep -i clio)" ]; check "a window is really on screen" $?
-  for id in $(wmctrl -l | grep -i clio | awk '{print $1}'); do wmctrl -i -c "$id"; done
-  sleep 1
+  [ "$(on_screen)" -eq 1 ]; check "and one is really on screen" $?
+
+  # A second window is a second set of tabs. Two windows onto the same shells
+  # is the thing this must never do: a tab closed in one would disappear from
+  # under the other, and typing would land in both.
+  "$CLIO" >/dev/null 2>&1
+  sleep 2
+  [ "$(on_screen)" -eq 2 ]; check "running clio again opens another window" $?
+  [ "$("$CLIO" status | grep -c '^  window ')" -eq 2 ]
+  check "the daemon tracks them as two separate windows" $?
 
   echo
-  echo "7. the window outlives whatever launched it"
+  echo "7. closing a window closes its tabs"
+  # What closing a terminal window has always meant. The daemon is there so that
+  # the daemon dying cannot take your shells; closing a window is not that.
+  close_ours
+  [ "$(on_screen)" -eq 0 ]; check "closing them leaves nothing on screen" $?
+  sleep 13 # past the grace period the daemon allows for a page reloading
+  [ "$("$CLIO" status | grep -c '^  window ')" -eq 0 ]
+  check "and the shells in them are gone" $?
+
+  "$CLIO" >/dev/null 2>&1; rc=$?
+  [ $rc -eq 0 ]; check "clio still opens a window afterwards" $?
+  sleep 2
+  [ "$(on_screen)" -eq 1 ]; check "a fresh one, not the two just closed" $?
+
+  echo
+  echo "7b. windows come back from a daemon that died"
+  # The loss clio does exist for, in the only order a reboot can happen in: the
+  # daemon goes first, so nothing is left to hear the windows close.
+  "$CLIO" >/dev/null 2>&1
+  sleep 2
+  [ "$(on_screen)" -eq 2 ]; check "two windows open again" $?
+  kill -9 "$(pid_now)" 2>/dev/null || true
+  sleep 1
+  close_ours
+
+  "$CLIO" >/dev/null 2>&1; rc=$?
+  [ $rc -eq 0 ]; check "clio starts the daemon again and reopens them" $?
+  sleep 3
+  [ "$(on_screen)" -eq 2 ]; check "both windows are back, not one" $?
+
+  echo
+  echo "8. a window outlives whatever launched it"
+  close_ours
   # Run clio inside its own process group, then kill that whole group — the
   # same thing that happens when you close the terminal you typed clio in.
-  # Without setsid on the browser, this took the terminal window down with it.
-  setsid bash -c "'$CLIO' open >/dev/null 2>&1" &
+  # Without a session of its own, the browser goes down with it.
+  setsid bash -c "'$CLIO' >/dev/null 2>&1" &
   group=$!
-  sleep 6
+  sleep 10
   kill -TERM -"$group" 2>/dev/null || true
   kill -KILL -"$group" 2>/dev/null || true
   sleep 3
-  [ -n "$(wmctrl -l | grep -i clio)" ]
+  [ "$(on_screen)" -ge 1 ]
   check "window survives its launching shell being killed" $?
-  for id in $(wmctrl -l | grep -i clio | awk '{print $1}'); do wmctrl -i -c "$id"; done
+
+  close_ours
+  "$CLIO" stop >/dev/null 2>&1
+  stop_display
 else
-  echo "  - skipped (no DISPLAY or wmctrl)"
+  echo "  - skipped (needs wmctrl, Xvfb and a window manager; never the real display)"
 fi
 
 echo

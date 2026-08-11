@@ -2,7 +2,12 @@ import { writeFileSync, readFileSync, renameSync, unlinkSync, readdirSync } from
 import { join } from 'node:path';
 import { STATE_FILE, SCROLLBACK_DIR, scrollbackFile } from './paths.js';
 
-const STATE_VERSION = 1;
+// 2 added containers — which window each tab belongs to. Version 1 files are
+// still read: their tabs simply predate windows being a thing clio tracks, and
+// dropping them on an upgrade would mean losing the shells that were open at
+// the moment the new code first ran.
+const STATE_VERSION = 2;
+const READABLE_VERSIONS = new Set([1, 2]);
 
 // Write-then-rename so a crash mid-write can never leave a half-parsed state
 // file — the restore path is exactly the code that runs after a crash, so it
@@ -13,10 +18,16 @@ function atomicWrite(path, data) {
   renameSync(tmp, path);
 }
 
-export function writeState(sessions) {
+export function writeState(containers, sessions) {
+  // A container with no tabs is a window with nothing in it; restoring one would
+  // put an empty frame on screen.
+  const occupied = new Set(sessions.map((s) => s.container));
   const payload = {
     version: STATE_VERSION,
     savedAt: Date.now(),
+    containers: containers
+      .filter((c) => occupied.has(c.id))
+      .map((c) => ({ id: c.id, order: c.order })),
     sessions: sessions.map((s) => s.toState()),
   };
   try {
@@ -27,21 +38,25 @@ export function writeState(sessions) {
 }
 
 export function readState() {
+  const empty = { containers: [], sessions: [] };
   let raw;
   try {
     raw = readFileSync(STATE_FILE, 'utf8');
   } catch {
-    return { sessions: [] };
+    return empty;
   }
   try {
     const parsed = JSON.parse(raw);
-    if (parsed.version !== STATE_VERSION || !Array.isArray(parsed.sessions)) {
-      return { sessions: [] };
+    if (!READABLE_VERSIONS.has(parsed.version) || !Array.isArray(parsed.sessions)) {
+      return empty;
     }
-    return parsed;
+    return {
+      containers: Array.isArray(parsed.containers) ? parsed.containers : [],
+      sessions: parsed.sessions,
+    };
   } catch {
     console.error('[clio] state file was unreadable; starting fresh');
-    return { sessions: [] };
+    return empty;
   }
 }
 

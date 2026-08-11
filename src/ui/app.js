@@ -59,6 +59,7 @@ const MIN_ROWS = 5;
 const el = {
   tabs: document.getElementById('tabs'),
   newtab: document.getElementById('newtab'),
+  newwindow: document.getElementById('newwindow'),
   panes: document.getElementById('panes'),
   status: document.getElementById('status'),
   ctxmenu: document.getElementById('ctxmenu'),
@@ -111,6 +112,54 @@ function setFontSize(next) {
 const stepUp = () => setFontSize(Math.floor(fontSize) + 1);
 const stepDown = () => setFontSize(Math.ceil(fontSize) - 1);
 
+// ------------------------------------------------------------- closing guard
+
+/*
+ * Closing a window ends every shell in it. That is what closing a terminal
+ * window has always meant, and the tabs do not come back — the daemon is there
+ * so that a *daemon* going down cannot take your shells with it, not so that a
+ * window you closed can be undone. Worth a question, then, and worth being able
+ * to turn the question off.
+ *
+ * Kept beside the font size in this profile's storage, so the answer holds for
+ * every clio window rather than for whichever one it was given in.
+ */
+const WARN_KEY = 'clio.warnOnClose';
+
+function loadWarnOnClose() {
+  try {
+    return localStorage.getItem(WARN_KEY) !== 'off';
+  } catch {
+    return true;
+  }
+}
+
+let warnOnClose = loadWarnOnClose();
+
+function setWarnOnClose(next) {
+  warnOnClose = next;
+  try {
+    localStorage.setItem(WARN_KEY, next ? 'on' : 'off');
+  } catch {
+    /* the setting simply will not persist */
+  }
+}
+
+/*
+ * The browser's own dialog is the only one available here: a window being torn
+ * down cannot be drawn over, so anything of ours would go unseen. Chrome writes
+ * the wording; all this decides is whether it appears at all.
+ *
+ * Nothing to ask about with no tabs left — closing the last one is what closes
+ * the window — nor when this window has already been disowned and its shells
+ * belong to somebody else.
+ */
+window.addEventListener('beforeunload', (event) => {
+  if (!warnOnClose || disowned || !sessions.size) return;
+  event.preventDefault();
+  event.returnValue = ''; // older browsers want a value, not just a cancelled event
+});
+
 function updateFontButtons() {
   const shown = Number.isInteger(fontSize) ? fontSize : fontSize.toFixed(1);
   el.fontUp.disabled = fontSize >= FONT_MAX;
@@ -128,6 +177,15 @@ const termTitles = new Map();
 
 let activeId = null;
 let order = [];
+/**
+ * Which container — which window's worth of tabs — this page is showing.
+ *
+ * The daemon owns containers; a window is only ever a view of one. Holding the
+ * id here, in the URL, and nowhere else is what lets this window be closed and
+ * come back with the same tabs, and what stops it from ever showing another
+ * window's shells.
+ */
+let containerId = new URLSearchParams(location.search).get('c') || '';
 let ws = null;
 let reconnectDelay = 250;
 let HOME = '';
@@ -142,13 +200,20 @@ let renaming = false;
 // The token arrives in the URL, is exchanged for an HttpOnly cookie by the
 // server, and is then scrubbed from the address bar. From here on the cookie
 // authenticates us — including across reloads, which the URL could not do.
-if (new URLSearchParams(location.search).has('token')) {
-  history.replaceState(null, '', location.pathname);
+//
+// The container id stays: it is this window's identity, and a reload that lost
+// it would come back showing somebody else's tabs.
+function rememberContainer() {
+  const query = containerId ? `?c=${encodeURIComponent(containerId)}` : '';
+  history.replaceState(null, '', `${location.pathname}${query}`);
 }
+
+if (new URLSearchParams(location.search).has('token')) rememberContainer();
 
 function connect() {
   if (disowned) return;
-  ws = new WebSocket(`ws://${location.host}/`);
+  const query = containerId ? `?c=${encodeURIComponent(containerId)}` : '';
+  ws = new WebSocket(`ws://${location.host}/${query}`);
 
   ws.onopen = () => {
     reconnectDelay = 250;
@@ -224,7 +289,19 @@ function send(msg) {
 function handle(msg) {
   switch (msg.t) {
     case 'sessions':
+      // The daemon has the last word on which container this is: it names one
+      // when we arrive without an id, and again if the one we asked for is gone.
+      if (msg.container && msg.container !== containerId) {
+        containerId = msg.container;
+        rememberContainer();
+      }
       syncSessions(msg.sessions, msg.home);
+      break;
+
+    // Only ever sent when opening a window failed; a window that appeared
+    // speaks for itself.
+    case 'window':
+      if (!msg.ok) showStatus(`Could not open a new window — ${msg.error}`, 6000);
       break;
 
     case 'created':
@@ -308,6 +385,22 @@ function newTab() {
   const cwd = activeId ? sessions.get(activeId)?.cwd : null;
   const size = measure();
   send({ t: 'create', cwd, cols: size.cols, rows: size.rows });
+}
+
+/**
+ * Open a second window, with its own tabs and its own shell.
+ *
+ * It starts where this tab is, the way any terminal's "open terminal here"
+ * does — a new window is nearly always the same work carried on somewhere
+ * beside it, not a trip back to the home directory.
+ *
+ * The daemon does the opening — a page cannot spawn a browser — and gives it a
+ * container of its own, so the two windows are separate from the moment the
+ * new one exists rather than from whenever it gets around to connecting.
+ */
+function newWindow() {
+  const cwd = activeId ? sessions.get(activeId)?.cwd : null;
+  send({ t: 'newwindow', cwd });
 }
 
 function attach(id) {
@@ -703,6 +796,15 @@ function buildMenu(id) {
       disabled: !others,
       run: () => confirmCloseOthers(id, others),
     },
+    { sep: true },
+    // Where the "and don't ask me again" of the close warning lives. A dialog
+    // the browser draws cannot carry a checkbox of ours, so the checkbox is
+    // here, one right-click from the window it is about.
+    {
+      label: 'Ask before closing a window',
+      checked: warnOnClose,
+      run: () => setWarnOnClose(!warnOnClose),
+    },
   );
 
   return entries;
@@ -751,7 +853,16 @@ function renderMenu(entries) {
       'item' + (entry.disabled ? ' disabled' : '') + (entry.danger ? ' danger' : '');
 
     const label = document.createElement('span');
-    label.textContent = entry.label;
+    // A tick in a fixed-width gutter rather than a checkbox: an empty box in a
+    // menu reads as something to fill in, and the space has to be held whether
+    // the tick is there or not or the label shifts as it is toggled.
+    if ('checked' in entry) {
+      const tick = document.createElement('span');
+      tick.className = 'tick';
+      tick.textContent = entry.checked ? '✓' : '';
+      label.append(tick);
+    }
+    label.append(entry.label);
     item.append(label);
 
     if (entry.key) {
@@ -919,6 +1030,10 @@ function hideStatus() {
 // ---------------------------------------------------------------------- boot
 
 el.newtab.onclick = newTab;
+el.newwindow.onclick = () => {
+  newWindow();
+  panes.get(activeId)?.term.focus();
+};
 // Hand focus straight back, so adjusting the size does not leave you typing
 // into a button instead of your shell.
 el.fontUp.onclick = () => {

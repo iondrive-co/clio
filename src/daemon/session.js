@@ -8,12 +8,14 @@ const SCROLLBACK_BYTES = 512 * 1024;
 let nextOrder = 0;
 
 export class Session {
-  constructor({ id, title = null, order = null, cwd = null }) {
+  constructor({ id, title = null, order = null, cwd = null, container = null }) {
     this.id = id;
     this.title = title;
     this.order = order ?? nextOrder++;
     this.cwd = cwd || process.env.HOME;
     this.command = null;
+    /** Which window's tab strip this session belongs to. */
+    this.container = container;
 
     this.pty = null;
     this.status = 'restorable'; // 'live' | 'exited' | 'restorable'
@@ -166,6 +168,7 @@ export class Session {
   toJSON() {
     return {
       id: this.id,
+      container: this.container,
       title: this.title,
       order: this.order,
       cwd: this.cwd,
@@ -183,6 +186,7 @@ export class Session {
   toState() {
     return {
       id: this.id,
+      container: this.container,
       title: this.title,
       order: this.order,
       cwd: this.cwd,
