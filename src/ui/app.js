@@ -892,9 +892,30 @@ function isShellDefaultTitle(title) {
   return /^[^@\s]+@[^:\s]+:/.test(title.trim());
 }
 
+/*
+ * What a tab is called, in the order the answers are worth having:
+ *
+ *   1. the name somebody typed for it, which nothing overrules
+ *   2. what its extension says it is holding — the host, for an ssh session
+ *   3. what a program running in it says it is doing
+ *   4. the command that is running
+ *   5. the directory it is in
+ *
+ * The extension goes above the announced title, and it has to. A title arrives
+ * from whatever last set one, and once a tab has ssh'd away that is usually the
+ * shell you left behind on this machine — a prompt that announced `~/core` on
+ * the way past and has said nothing since. It is not "user@host:" shaped, so
+ * the rule above does not catch it, and it goes on describing a directory on
+ * the wrong computer for as long as the session lasts. The far end mostly
+ * announces nothing at all, and when it does it is its own `user@host:` form,
+ * which is thrown away here anyway. So: a tab that is on a host is named after
+ * the host, and stays named after it.
+ */
 function tabLabel(meta) {
   if (!meta) return 'shell';
   if (meta.title) return meta.title;
+
+  if (meta.ext?.title) return meta.ext.title;
 
   const announced = termTitles.get(meta.id);
   if (announced && !isShellDefaultTitle(announced)) return announced;

@@ -100,28 +100,50 @@ function resumeArgument(argv) {
   return null;
 }
 
+/**
+ * Claude, and not the several other things called claude on a desktop.
+ *
+ * A -p run is somebody's script piping a question through, not a conversation
+ * anyone is sitting in front of: it would have exited on its own, and bringing
+ * it back after a reboot would re-ask the question.
+ *
+ * One function rather than two because it is asked twice about the same tab —
+ * once of a live process, once of the command line left behind by a dead one —
+ * and the two answers disagreeing is a bug that only shows up on the worst
+ * morning. It did, in a version of this file that lasted an hour: an
+ * npm-installed claude appears as `node …/claude`, which the live check knew
+ * about and the other did not.
+ */
+function isClaude(argv = [], exe = null) {
+  if (argv.some((arg) => arg === '-p' || arg === '--print')) return false;
+
+  const first = base(argv[0]);
+  if (first === 'claude' || base(exe) === 'claude') return true;
+
+  // An npm install runs it through node: `node .../claude-code/cli.js`.
+  if (first.startsWith('node') || base(exe).startsWith('node')) {
+    return argv.slice(1).some((arg) => /claude[^/]*\/cli\.js$/.test(arg) || base(arg) === 'claude');
+  }
+  return false;
+}
+
 export default {
   id: 'claude',
   name: 'Claude Code',
 
-  /**
-   * Claude, and not the several other things called claude on a desktop.
-   *
-   * A -p run is somebody's script piping a question through, not a conversation
-   * anyone is sitting in front of: it would have exited on its own, and bringing
-   * it back after a reboot would re-ask the question.
-   */
   matches({ argv = [], exe = null }) {
-    if (argv.some((arg) => arg === '-p' || arg === '--print')) return false;
+    return isClaude(argv, exe);
+  },
 
-    const first = base(argv[0]);
-    if (first === 'claude' || base(exe) === 'claude') return true;
-
-    // An npm install runs it through node: `node .../claude-code/cli.js`.
-    if (first.startsWith('node') || base(exe).startsWith('node')) {
-      return argv.slice(1).some((arg) => /claude[^/]*\/cli\.js$/.test(arg) || base(arg) === 'claude');
-    }
-    return false;
+  /**
+   * The conversation this tab has claimed.
+   *
+   * A conversation belongs to one tab. Two claudes open in the same directory
+   * would otherwise both be recorded as whichever transcript was written last,
+   * and a restore would put the same conversation into both tabs.
+   */
+  identify(state) {
+    return state?.sessionId || null;
   },
 
   capture({ argv = [], cwd = null, startedAt = 0, env = null, previous = null, taken = new Set() }) {
@@ -144,6 +166,32 @@ export default {
     if (asked) return { v: 1, sessionId: asked, cwd, at: null };
 
     return previous || { v: 1, sessionId: null, cwd, at: null };
+  },
+
+  /**
+   * Which conversation was in a tab that has no record of one.
+   *
+   * Reached when a shell has to be rebuilt and nothing was written down — the
+   * daemon that was holding it predated this adapter, or was told not to
+   * remember. All that survives is the command line the tab was running and the
+   * directory it was in, and the id is not in the command line: `--resume` on
+   * its own is how somebody picks a conversation from claude's own list.
+   *
+   * So it comes off the filesystem, newest first, with no process to bound it
+   * by — which is the part that makes this a guess rather than an answer. Two
+   * conversations in one directory and this names the one touched last. Good
+   * enough to put in front of somebody; not good enough to run at them.
+   */
+  recover({ command = '', cwd = null }) {
+    const words = String(command).trim().split(/\s+/);
+    if (!isClaude(words)) return null;
+
+    const asked = resumeArgument(words);
+    if (asked) return { v: 1, sessionId: asked, cwd, at: null };
+
+    const dir = projectDir(cwd, null);
+    const [newest] = dir ? transcripts(dir, 0) : [];
+    return newest ? { v: 1, sessionId: newest.id, cwd, at: Math.round(newest.mtimeMs) } : null;
   },
 
   resume(state, { cwd }) {

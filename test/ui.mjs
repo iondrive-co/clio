@@ -6,14 +6,16 @@
  * screenshots that get looked at. The earlier tests drove the app by calling
  * its own functions, which passed happily while the actual window was unusable.
  *
- * Run with the daemon up:  node test/ui.mjs
+ * It starts a daemon of its own, on its own state, and takes it down again:
+ *
+ *   node test/ui.mjs
  */
 import { chromium } from 'playwright';
-import { readFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, mkdirSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { execSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { tmpdir } from 'node:os';
 import WebSocket from 'ws';
 
 // Most of this file is headless, but one section asks the daemon for a real
@@ -27,11 +29,30 @@ import WebSocket from 'ws';
 delete process.env.DISPLAY;
 delete process.env.WAYLAND_DISPLAY;
 
-const HANDSHAKE = join(
-  process.env.XDG_RUNTIME_DIR || join(homedir(), '.cache'),
-  'clio',
-  'daemon.json',
-);
+// And a clio of this run's own, from the first line to the last.
+//
+// Section 16 SIGKILLs the daemon and starts it again through the launcher —
+// which is the whole point of that section, and is fatal to whoever's shells
+// the daemon happens to be holding: their processes die with it, and their tabs
+// come back around new ones with the work in them gone. Which daemon that is
+// was, until this line existed, whichever one the caller's environment pointed
+// at. Inheriting a real XDG_RUNTIME_DIR meant a test run reaching into somebody
+// working two windows away, and no amount of care further down this file could
+// have stopped it.
+//
+// So the sandbox is made here, before HANDSHAKE below is worked out from it,
+// and every `bin/clio` this file runs inherits it. Do not make these
+// conditional, and do not add a way to point this at a daemon it did not start.
+const SANDBOX = mkdtempSync(join(tmpdir(), 'clio-ui-'));
+process.env.XDG_RUNTIME_DIR = join(SANDBOX, 'run');
+process.env.XDG_STATE_HOME = join(SANDBOX, 'state');
+mkdirSync(process.env.XDG_RUNTIME_DIR, { recursive: true });
+mkdirSync(process.env.XDG_STATE_HOME, { recursive: true });
+// Says "sandbox" in the window title, and is what the daemon reads to know it
+// is one — the dev badge, the UI watcher, and section 17 below all hang off it.
+process.env.CLIO_DEV = '1';
+
+const HANDSHAKE = join(process.env.XDG_RUNTIME_DIR, 'clio', 'daemon.json');
 const SHOTS = join(process.cwd(), 'test', 'screenshots');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -62,8 +83,22 @@ function stopDisplay() {
 }
 
 // However this run ends — a passing exit, a failed assertion, a throw — the
-// display goes with it rather than being left on the machine.
-process.on('exit', stopDisplay);
+// display goes with it rather than being left on the machine, and so do the
+// daemon and the shells this run started. Both are synchronous on purpose: an
+// exit handler is the last moment anything runs.
+process.on('exit', () => {
+  stopDisplay();
+  try {
+    execSync('./bin/clio stop', { stdio: 'ignore' });
+  } catch {
+    /* it never started, or it is already down */
+  }
+  try {
+    rmSync(SANDBOX, { recursive: true, force: true });
+  } catch {
+    /* leave it, it is in /tmp */
+  }
+});
 
 /**
  * A display of this test's own making, or null if the machine cannot provide
@@ -213,6 +248,10 @@ async function sweepContrast(page, label) {
 
 async function main() {
   mkdirSync(SHOTS, { recursive: true });
+  console.log(`sandbox at ${SANDBOX}\n`);
+  // The sandbox has no daemon in it yet; this is the first thing that ever
+  // runs there. Through the launcher, because that is what section 16 does too.
+  execSync('./bin/clio start', { stdio: 'ignore' });
   const info = JSON.parse(readFileSync(HANDSHAKE, 'utf8'));
   const origin = `http://127.0.0.1:${info.port}`;
 
@@ -807,6 +846,42 @@ async function main() {
   const afterShellTitle = await page.locator('.tab.active .tab-title').innerText();
   check('a bare user@host:path title is ignored', !afterShellTitle.includes('@'),
     afterShellTitle);
+
+  // ---- but an ssh tab is named after the host, over the top of that --------
+  //
+  // The case this is really about: a prompt that announces a bare directory —
+  // no user@host: in it, so the rule above does not catch it — and then an ssh
+  // away to somewhere else. The title left behind describes a directory on the
+  // machine you just left, and it would sit in the tab for the whole session.
+  // Which is what it did, until the extension was moved above it.
+  //
+  // The ssh is real and never reaches the network: ProxyCommand hands it a pipe
+  // nothing will ever say hello down, so it waits in the foreground the way a
+  // session does. .invalid is nobody's, by RFC 2606.
+  console.log('\n14b. an ssh tab is named after its host');
+  const SSH_HOST = 'p-fsn-095.test.invalid';
+  await page.locator('#newtab').click();
+  await page.waitForTimeout(1400);
+  await page.locator('.pane.active .xterm-screen').click();
+  await page.keyboard.type(
+    String.raw`printf '\033]0;~/somewhere\007'; ssh -o "ProxyCommand=sleep 900" -o ControlMaster=no safe@` +
+      SSH_HOST,
+  );
+  await page.keyboard.press('Enter');
+
+  let sshLabel = '';
+  for (let i = 0; i < 20 && sshLabel !== SSH_HOST; i++) {
+    await page.waitForTimeout(500);
+    sshLabel = await page.locator('.tab.active .tab-title').innerText();
+  }
+  check('the tab shows the host it is on', sshLabel === SSH_HOST, sshLabel);
+  check('and not the directory the shell announced on the way past',
+    !sshLabel.includes('somewhere'), sshLabel);
+
+  await page.keyboard.press('Control+C');
+  await page.waitForTimeout(2500);
+  const afterSsh = await page.locator('.tab.active .tab-title').innerText();
+  check('leaving the host gives the tab its ordinary name back', afterSsh !== SSH_HOST, afterSsh);
 
   // ---- activity highlighting ---------------------------------------------
   console.log('\n15. activity in a background tab');

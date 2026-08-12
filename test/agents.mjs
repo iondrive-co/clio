@@ -1,5 +1,6 @@
 /*
- * The one thing clio starts for you.
+ * The conversation clio starts for you. (The other thing it starts is an ssh
+ * session; that is test/ssh.mjs.)
  *
  * A tab with an agent in it is a tab with a conversation in it, and a reboot
  * must not be the end of that conversation. This drives the whole path: notice
@@ -14,7 +15,16 @@
  *
  *   node test/agents.mjs
  */
-import { mkdirSync, mkdtempSync, readFileSync, existsSync, rmSync, copyFileSync, chmodSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  rmSync,
+  copyFileSync,
+  chmodSync,
+} from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
@@ -205,19 +215,19 @@ async function main() {
 
   console.log('\n2. the daemon writes down what it found, before it needs it');
   const seen = client.tab(agentTab.id);
-  check('the tab is marked as holding an agent', seen?.agent === 'claude', JSON.stringify(seen?.agent));
-  check('the ordinary tab is not', client.tab(plainTab.id)?.agent === null);
+  check('the tab is marked as holding an agent', seen?.ext?.kind === 'claude', JSON.stringify(seen?.ext));
+  check('the ordinary tab is not', client.tab(plainTab.id)?.ext === null);
 
   const saved = savedState();
-  const savedAgent = saved.sessions.find((s) => s.id === agentTab.id)?.agent;
-  check('the agent record is on disk', !!savedAgent, JSON.stringify(saved.sessions.map((s) => s.agent)));
+  const savedAgent = saved.sessions.find((s) => s.id === agentTab.id)?.ext;
+  check('the agent record is on disk', !!savedAgent, JSON.stringify(saved.sessions.map((s) => s.ext)));
   check('under the adapter that found it', savedAgent?.kind === 'claude');
   check(
     'naming the conversation that was open',
     savedAgent?.state?.sessionId === conversation,
     `${savedAgent?.state?.sessionId} vs ${conversation}`,
   );
-  check('and the state file says which shape that is in', saved.version === 4, `v${saved.version}`);
+  check('and the state file says which shape that is in', saved.version === 5, `v${saved.version}`);
 
   // ---- the part that matters ---------------------------------------------
   console.log('\n3. the daemon is killed outright, and started again');
@@ -279,18 +289,75 @@ async function main() {
   back.send({ t: 'input', id: agentTab.id, data: '' }); // Ctrl-C
   await sleep(5000);
   const afterQuit = back.tab(agentTab.id);
-  check('the tab stops claiming an agent once it has gone', afterQuit?.agent === null,
-    JSON.stringify(afterQuit?.agent));
+  check('the tab stops claiming an agent once it has gone', afterQuit?.ext === null,
+    JSON.stringify(afterQuit?.ext));
   check(
     'and the record is off the disk too',
-    !savedState().sessions.find((s) => s.id === agentTab.id)?.agent,
-    JSON.stringify(savedState().sessions.map((s) => s.agent)),
+    !savedState().sessions.find((s) => s.id === agentTab.id)?.ext,
+    JSON.stringify(savedState().sessions.map((s) => s.ext)),
   );
 
-  back.send({ t: 'close', id: agentTab.id });
-  back.send({ t: 'close', id: plainTab.id });
-  await sleep(600);
+  // ---- the morning this was written for ----------------------------------
+  console.log('\n6. a conversation whose record did not survive is still named');
+  /*
+   * The failure this is really about. A daemon that has been up since before
+   * the agents extension existed has never written a record for anything, so a
+   * crash gives every tab back with `claude … was running here and was not
+   * restarted` — true, and no use at all, because the one thing needed to get
+   * the conversation back is its id.
+   *
+   * Simulated by taking the record off the disk while the daemon is down,
+   * which is exactly the state such a daemon leaves behind: a tab that knows
+   * the command it was running and nothing else.
+   */
+  back.send({ t: 'input', id: agentTab.id, data: 'claude\n' });
+  await sleep(5000);
+  const second = /STARTED ([0-9a-f-]{36})/.exec(back.output.get(agentTab.id) || '');
+  const conversation2 = second?.[1] || conversation;
+  check('a second conversation to lose', !!second, JSON.stringify(conversation2));
+
   back.close();
+  daemon.kill('SIGKILL');
+  await sleep(700);
+
+  const stripped = savedState();
+  for (const tab of stripped.sessions) delete tab.ext;
+  writeFileSync(join(STATE, 'clio', 'state.json'), JSON.stringify(stripped, null, 2));
+  check('the record is off the disk, as it would never have been on it',
+    !savedState().sessions.some((s) => s.ext));
+
+  const info3 = await startDaemon();
+  check('the daemon came back a second time', !!info3.pid);
+
+  const last = new Client(info3, win);
+  await last.connect();
+  await last.await((m) => m.t === 'sessions');
+  last.send({ t: 'attach', id: agentTab.id, cols: 80, rows: 24 });
+  const seam = (await last.await((m) => m.t === 'attached' && m.id === agentTab.id))?.scrollback || '';
+
+  check(
+    'the tab says the command was not restarted, as before',
+    seam.includes('was not restarted'),
+    JSON.stringify(seam.slice(-300)),
+  );
+  check(
+    'but now it also says how to pick the conversation up',
+    seam.includes('to pick that up again:') && seam.includes(`claude --resume ${conversation2}`),
+    JSON.stringify(seam.slice(-300)),
+  );
+  // Printed, not run: without a record this is the newest transcript in the
+  // directory, which is a guess, and a guess must not be executed at anybody.
+  await sleep(3000);
+  check(
+    'and did not run it',
+    !last.tab(agentTab.id)?.command,
+    JSON.stringify(last.tab(agentTab.id)?.command),
+  );
+
+  last.send({ t: 'close', id: agentTab.id });
+  last.send({ t: 'close', id: plainTab.id });
+  await sleep(600);
+  last.close();
 
   report();
 }

@@ -1,4 +1,4 @@
-import { readlinkSync, readFileSync } from 'node:fs';
+import { readlinkSync, readFileSync, readdirSync } from 'node:fs';
 import { uptime } from 'node:os';
 
 // Everything here is best-effort inspection of /proc. A session whose process
@@ -129,6 +129,57 @@ export function foregroundCommand(shellPid) {
     queue.push(...childrenOf(pid));
   }
   return null;
+}
+
+/**
+ * Everything still running under a tab that is about to be rebuilt.
+ *
+ * A shell should die with the daemon that was holding its pty: the master
+ * closes, the terminal hangs up, and the kernel sends SIGHUP. That is not what
+ * happens. A pty master is an ordinary file descriptor and every child of a
+ * shell inherits it, so anything long-lived that a tab ever started — an MCP
+ * server behind an agent, another agent's daemon, a `nohup`ed job — goes on
+ * holding the master of the tab it was born in, and of every tab opened before
+ * it. Nothing hangs up. The shell survives with its whole tree, unreachable:
+ * no terminal on it, nobody able to read or write it, and still holding the
+ * port forward the tab is about to ask for again.
+ *
+ * So a daemon rebuilding tabs from disk clears out the ones from the last life
+ * first. Every shell clio starts carries CLIO_SESSION, children inherit it, and
+ * that mark plus a tab id this daemon is restoring is enough to be sure: the
+ * shell it belonged to is gone, whatever answers to it is debris.
+ *
+ * Only ever called on the restore path. A handover keeps its shells and must
+ * never come near this.
+ */
+export function markedProcesses(sessionIds) {
+  const wanted = sessionIds instanceof Set ? sessionIds : new Set(sessionIds);
+  if (!wanted.size) return [];
+
+  let entries;
+  try {
+    entries = readdirSync('/proc');
+  } catch {
+    return [];
+  }
+
+  const found = [];
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    const pid = Number(entry);
+    if (pid === process.pid) continue;
+    let raw;
+    try {
+      raw = readFileSync(`/proc/${pid}/environ`, 'utf8');
+    } catch {
+      continue; // somebody else's, or it exited while we looked
+    }
+    const at = raw.indexOf('CLIO_SESSION=');
+    if (at === -1) continue;
+    const id = raw.slice(at + 'CLIO_SESSION='.length).split('\0')[0];
+    if (wanted.has(id)) found.push({ pid, session: id });
+  }
+  return found;
 }
 
 export function isAlive(pid) {

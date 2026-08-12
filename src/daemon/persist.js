@@ -12,8 +12,12 @@ import { STATE_FILE, SCROLLBACK_DIR, scrollbackFile } from './paths.js';
 //   under whose adapter, so it can be opened again when the shells have to be
 //   rebuilt. Older files simply have tabs that were holding nothing, and the
 //   record is the adapter's own shape, versioned inside itself.
-const STATE_VERSION = 4;
-const READABLE_VERSIONS = new Set([1, 2, 3, 4]);
+// 5 renamed that record to `ext`, because an agent stopped being the only kind
+//   of thing a tab can be holding: an ssh session is one too, under an
+//   extension of its own. Same shape, and a version 4 file's `agent` is still
+//   read as one — see SessionManager.restoreFromDisk.
+const STATE_VERSION = 5;
+const READABLE_VERSIONS = new Set([1, 2, 3, 4, 5]);
 
 // Write-then-rename so a crash mid-write can never leave a half-parsed state
 // file — the restore path is exactly the code that runs after a crash, so it
@@ -33,7 +37,13 @@ export function writeState(containers, sessions) {
     savedAt: Date.now(),
     containers: containers
       .filter((c) => occupied.has(c.id))
-      .map((c) => ({ id: c.id, order: c.order, name: c.name ?? null, closedAt: c.closedAt ?? null })),
+      .map((c) => ({
+        id: c.id,
+        order: c.order,
+        name: c.name ?? null,
+        named: !!c.named,
+        closedAt: c.closedAt ?? null,
+      })),
     sessions: sessions.map((s) => s.toState()),
   };
   try {

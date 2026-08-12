@@ -2,8 +2,16 @@ import { EventEmitter } from 'node:events';
 import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { Session } from './session.js';
-import { cwdOf, environOf, startedAt } from './procinfo.js';
-import { observeAgent, resumeAgent, agentFromState, describeAgent } from '../agents/index.js';
+import { cwdOf, environOf, startedAt, markedProcesses } from './procinfo.js';
+import {
+  observeExtension,
+  resumeExtension,
+  recoverExtension,
+  extensionFromState,
+  extensionIdentity,
+  extensionTitle,
+  describeExtension,
+} from '../extensions/index.js';
 import {
   writeState,
   readState,
@@ -16,15 +24,16 @@ import {
 const PROC_POLL_MS = 2000;
 
 /*
- * Whether a tab that was holding an agent gets it back when its shell has to be
- * rebuilt. On, because a terminal that comes back after a reboot without the
- * conversation that was in it has not really come back.
+ * Whether a tab that was holding something an extension knows about gets it
+ * back when its shell has to be rebuilt. On, because a terminal that comes back
+ * after a reboot without the conversation that was in it, or pointing at
+ * nowhere instead of at the host it was on, has not really come back.
  *
  * The escape hatch is for the person debugging clio, or for whoever decides
  * they would rather type it themselves — it is read from the daemon's own
- * environment, so `CLIO_AGENT_RESUME=off bin/clio start` is how it is used.
+ * environment, so `CLIO_RESUME=off bin/clio start` is how it is used.
  */
-const RESUME_AGENTS = process.env.CLIO_AGENT_RESUME !== 'off';
+const RESUME_EXTENSIONS = process.env.CLIO_RESUME !== 'off';
 const SCROLLBACK_FLUSH_MS = 3000;
 const STATE_DEBOUNCE_MS = 400;
 
@@ -142,6 +151,9 @@ export class SessionManager extends EventEmitter {
       id: wanted,
       order: this.nextContainerOrder++,
       name: null,
+      // Whether that name is one somebody typed. A name clio worked out for
+      // itself is worked out again next time; see parkContainer.
+      named: false,
       closedAt: null,
     };
     this.containers.set(wanted, container);
@@ -157,6 +169,11 @@ export class SessionManager extends EventEmitter {
       id: saved.id,
       order,
       name: typeof saved.name === 'string' && saved.name.trim() ? saved.name.trim() : null,
+      // Files written before names could be told apart hold only ones clio
+      // suggested — renaming by hand is newer than they are — so they are
+      // free to be suggested again, which is how a window full of `core`
+      // becomes the host its first tab is on.
+      named: !!saved.named,
       closedAt: Number.isFinite(saved.closedAt) ? saved.closedAt : null,
     };
     this.containers.set(container.id, container);
@@ -186,7 +203,12 @@ export class SessionManager extends EventEmitter {
       return 0;
     }
 
-    if (!container.name) container.name = this.suggestName(sessions);
+    // A name clio chose is chosen again, because what is in the window has
+    // moved on since: the tab that was in /home/me/core when it was last put
+    // away may be on a host in Falkenstein now, and a picker that still calls
+    // it `core` is describing yesterday. A name somebody typed is never
+    // touched — that is the whole difference `named` records.
+    if (!container.name || !container.named) container.name = this.suggestName(sessions, container.id);
     container.closedAt = Date.now();
     this.scheduleSave();
     this.emit('containers');
@@ -206,8 +228,30 @@ export class SessionManager extends EventEmitter {
     const container = this.containers.get(containerId);
     if (!container) return;
     container.name = name && name.trim() ? name.trim().slice(0, 80) : null;
+    // Typed by a person, so it is theirs now and nothing suggests over it —
+    // until they clear it again, which hands it back.
+    container.named = !!container.name;
     this.scheduleSave();
     this.emit('containers');
+  }
+
+  /**
+   * What to call a tab that is being listed rather than shown — in the window
+   * picker, in `clio status`, or as the name a closed window is put away under.
+   *
+   * The window on screen has one more answer available to it than this does: a
+   * title the running program announced, which only ever reaches the client.
+   * The rest of the order is the same, and an extension gets its say — a window
+   * full of ssh tabs is listed by its hosts rather than four times as `ssh`.
+   */
+  labelFor(session, fallback = '~') {
+    return (
+      session?.title ||
+      extensionTitle(session?.ext) ||
+      (session?.command ? basename(session.command.split(/\s+/)[0]) : '') ||
+      basename(session?.cwd || '') ||
+      fallback
+    );
   }
 
   /**
@@ -216,15 +260,14 @@ export class SessionManager extends EventEmitter {
    * was just looking at. Duplicates are numbered rather than merged: two
    * windows both full of `core` are still two windows.
    */
-  suggestName(sessions) {
-    const first = sessions[0];
-    const base =
-      first?.title ||
-      (first?.command ? basename(first.command.split(/\s+/)[0]) : '') ||
-      basename(first?.cwd || '') ||
-      'shell';
+  suggestName(sessions, self = null) {
+    const base = this.labelFor(sessions[0], 'shell');
 
-    const taken = new Set([...this.containers.values()].map((c) => c.name).filter(Boolean));
+    // A window being renamed is not competing with itself: without this, one
+    // put away twice on the same host comes back as `pf2 (2)`.
+    const taken = new Set(
+      [...this.containers.values()].filter((c) => c.id !== self).map((c) => c.name).filter(Boolean),
+    );
     if (!taken.has(base)) return base;
     for (let n = 2; ; n++) {
       const candidate = `${base} (${n})`;
@@ -241,7 +284,7 @@ export class SessionManager extends EventEmitter {
       closedAt: container.closedAt,
       tabs: sessions.map((s) => ({
         id: s.id,
-        label: s.title || (s.command ? basename(s.command.split(/\s+/)[0]) : '') || basename(s.cwd) || '~',
+        label: this.labelFor(s),
         cwd: s.cwd,
       })),
     };
@@ -283,6 +326,12 @@ export class SessionManager extends EventEmitter {
   restoreFromDisk() {
     const { containers, sessions } = readState();
 
+    // Before anything is rebuilt: end what is left of the last life. See
+    // markedProcesses — these shells outlived the daemon holding their ptys and
+    // are unreachable, but still running, and the tab is about to ask for the
+    // port forward one of them is holding.
+    this.clearStrays(sessions.map((s) => s?.id).filter(Boolean));
+
     for (const saved of containers) this.absorbContainer(saved);
 
     // Tabs saved before windows were first-class do not name one. They were all
@@ -307,8 +356,9 @@ export class SessionManager extends EventEmitter {
       });
       session.command = saved.command || null;
       // The process is long dead, so the record comes back without a pid. What
-      // it is for is the reopen below.
-      session.agent = agentFromState(saved.agent);
+      // it is for is the reopen below. `agent` is where version 4 kept this,
+      // when an agent was the only thing a tab could be holding.
+      session.ext = extensionFromState(saved.ext ?? saved.agent);
       session.seedScrollback(readScrollback(saved.id));
       this.wire(session);
       this.sessions.set(session.id, session);
@@ -318,6 +368,32 @@ export class SessionManager extends EventEmitter {
     }
     pruneScrollback(new Set(this.sessions.keys()));
     return this.list().length;
+  }
+
+  /**
+   * End whatever is still running under tabs this daemon is about to rebuild.
+   *
+   * SIGHUP rather than SIGKILL, because it is the signal these processes should
+   * have had when their terminal went and every one of them knows what it
+   * means: a shell ends its jobs, an agent closes its transcript, ssh takes its
+   * forwards down. Anything that deliberately ignores it — a `nohup`ed job —
+   * carries on, which is what its author asked for.
+   */
+  clearStrays(sessionIds) {
+    const strays = markedProcesses(sessionIds);
+    if (!strays.length) return 0;
+
+    // Deepest first: a shell that is HUPed while its children are still there
+    // will scatter them, and the ones it scatters are the ones holding ports.
+    for (const { pid } of strays.slice().reverse()) {
+      try {
+        process.kill(pid, 'SIGHUP');
+      } catch {
+        /* already gone, or not ours to signal */
+      }
+    }
+    console.log(`[clio] ended ${strays.length} process(es) left over from the last run`);
+    return strays.length;
   }
 
   /**
@@ -343,9 +419,12 @@ export class SessionManager extends EventEmitter {
       });
       session.command = saved.command || null;
       session.unseenOutput = !!saved.unseenOutput;
-      // The agent is still running — a handover does not disturb the shells —
-      // so its pid comes across with it and nothing has to be found again.
-      session.agent = agentFromState(saved.agent, { pid: saved.agentPid ?? null });
+      // Whatever it was holding is still running — a handover does not disturb
+      // the shells — so its pid comes across with it and nothing has to be
+      // found again.
+      session.ext = extensionFromState(saved.ext ?? saved.agent, {
+        pid: saved.extPid ?? saved.agentPid ?? null,
+      });
       session.seedScrollback(readScrollback(saved.id));
       this.wire(session);
       this.sessions.set(session.id, session);
@@ -410,17 +489,39 @@ export class SessionManager extends EventEmitter {
   /**
    * Give a restored tab a fresh shell in the directory it was last in.
    *
-   * What was running is *not* re-run: replaying a build, a deploy or an ssh
-   * session without being asked is not a decision to make on the user's behalf.
-   * It is named in the seam instead, so it can be started again if it is wanted.
+   * What was running is *not* re-run: replaying a build or a deploy without
+   * being asked is not a decision to make on the user's behalf. It is named in
+   * the seam instead, so it can be started again if it is wanted.
    *
-   * An agent is the exception, and the only one — see src/agents for why it
-   * earns itself. The tab had a conversation in it, the conversation is on disk
-   * where the shell that was showing it cannot take it, and reopening it runs
-   * nothing that was not already run. The seam says so before it happens.
+   * The exceptions are whatever an extension has argued for — see
+   * src/extensions, and the two that ship: a conversation, which is on disk
+   * where the shell showing it cannot take it, and a connection, which is only
+   * a connection. Both run nothing that was not already run. The seam says what
+   * is about to happen before it happens, and an extension that is not sure
+   * enough can ask for its command to be left at the prompt unrun instead.
    */
   reopen(session, { cols, rows } = {}) {
-    const plan = RESUME_AGENTS ? resumeAgent(session.agent, { cwd: session.cwd }) : null;
+    const known = resumeExtension(session.ext, { cwd: session.cwd });
+    const plan = RESUME_EXTENSIONS ? known : null;
+
+    /*
+     * If nothing is being brought back, work out what would have brought it
+     * back and say so.
+     *
+     * Three things can be true here, in descending order of how much clio
+     * knows. There is a record and it is being resumed — the usual case, and
+     * `plan` covers it. There is a record and it is not being resumed, because
+     * somebody turned that off. Or there is no record at all: the daemon that
+     * was holding this tab predated the extension that would have written one,
+     * which is not a hypothetical — it is how five conversations came back as
+     * `claude … was not restarted` one morning, a message that is true and
+     * leaves you no better off than a blank tab.
+     *
+     * In both of the last two the answer is on disk, so the tab says it. It is
+     * printed rather than run: without a record this is a guess, and a guess is
+     * something to put in front of somebody, not something to execute at them.
+     */
+    const lost = plan ? null : known || recoverExtension({ command: session.command, cwd: session.cwd });
 
     // Recovered output sits above the new shell, so mark the seam. Without it
     // the dead prompt from before the crash reads as if it were still live.
@@ -431,6 +532,11 @@ export class SessionManager extends EventEmitter {
         ? `──── new shell ${when} — ${session.command} was running here and was not restarted ────`
         : `──── new shell ${when} ────`;
     session.append(`${RESET_MODES}\r\n\x1b[38;5;244m${note}\x1b[0m\r\n`);
+    if (lost) {
+      // Brighter than the seam: this is the one line in the tab somebody
+      // actually has to read, and they are reading it after a crash.
+      session.append(`\x1b[38;5;180m     to pick that up again:  ${lost.command}\x1b[0m\r\n`);
+    }
 
     try {
       session.spawn({ cwd: this.validCwd(session.cwd), cols, rows, env: this.launchEnv });
@@ -442,16 +548,18 @@ export class SessionManager extends EventEmitter {
     }
 
     if (plan) {
-      console.log(`[clio] ${session.id}: ${describeAgent(session.agent)} — ${plan.command}`);
-      session.typeWhenReady(plan.command);
-      // The record is kept, pointing at no process yet: the agent is on its way
-      // and the poll will pick it up. Keeping it is also what makes a second
-      // crash, before that happens, resume the same conversation again.
-      session.agent = { ...session.agent, pid: null, resumedAt: Date.now() };
+      console.log(`[clio] ${session.id}: ${describeExtension(session.ext)} — ${plan.command}`);
+      session.typeWhenReady(plan.command, { run: plan.run });
+      // The record is kept, pointing at no process yet: whatever it names is on
+      // its way and the poll will pick it up. Keeping it is also what makes a
+      // second crash, before that happens, bring the same thing back again —
+      // and what makes a command left unrun at the prompt stop being claimed
+      // once nobody has pressed Enter on it for long enough.
+      session.ext = { ...session.ext, pid: null, resumedAt: Date.now() };
     } else {
       // Nothing was brought back, so nothing is being held. Saying otherwise
       // would leave the tab offering to resume something that is not there.
-      session.agent = null;
+      session.ext = null;
     }
 
     session.command = null;
@@ -516,7 +624,7 @@ export class SessionManager extends EventEmitter {
     for (const session of this.sessions.values()) {
       if (session.refreshProcInfo()) changed = true;
     }
-    if (this.pollAgents()) changed = true;
+    if (this.pollExtensions()) changed = true;
     if (changed) {
       this.scheduleSave();
       this.emit('update');
@@ -524,7 +632,7 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
-   * Notice which tabs are holding an agent, and what would bring it back.
+   * Notice what each tab is holding, and what would bring it back.
    *
    * Rides on the proc poll rather than watching for anything of its own: the
    * foreground process has just been worked out for every tab, and this is the
@@ -532,24 +640,21 @@ export class SessionManager extends EventEmitter {
    * it is found, because after a reboot /proc is gone and whatever was not
    * saved beforehand never existed.
    */
-  pollAgents() {
+  pollExtensions() {
     const sessions = [...this.sessions.values()];
-    // Which conversations are already somebody's, so that two agents open in
-    // one directory are not both recorded as the same one.
-    const claimed = new Set(
-      sessions.map((s) => s.agent?.state?.sessionId).filter(Boolean),
-    );
+    // What every tab has claimed, as strings this has no business reading —
+    // it is for the extension host to know that two agents open in one
+    // directory must not be recorded as the same conversation.
+    const claimed = new Set(sessions.map((s) => extensionIdentity(s.ext)).filter(Boolean));
 
     let changed = false;
     for (const session of sessions) {
       const fg = session.foreground;
-      const taken = new Set(claimed);
-      if (session.agent?.state?.sessionId) taken.delete(session.agent.state.sessionId);
 
-      const { record, changed: moved } = observeAgent(session.agent, {
+      const { record, changed: moved } = observeExtension(session.ext, {
         // Read lazily: everything but argv and exe costs a trip to /proc, and
-        // most tabs are not agents. Nothing below is touched until an adapter
-        // has said the process is one of its own.
+        // most tabs are holding nothing. Nothing below is touched until an
+        // adapter has said the process is one of its own.
         foreground: fg && {
           pid: fg.pid,
           argv: fg.argv,
@@ -564,10 +669,10 @@ export class SessionManager extends EventEmitter {
             return environOf(fg.pid);
           },
         },
-        taken,
+        taken: claimed,
       });
 
-      session.agent = record;
+      session.ext = record;
       if (moved) changed = true;
     }
     return changed;

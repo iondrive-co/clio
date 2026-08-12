@@ -726,7 +726,7 @@ async function main() {
         // Only meaningful to a successor that starts while the process is still
         // running, which is exactly what a handover is; it is not written to
         // disk, where a reboot would make it somebody else's pid.
-        agentPid: session.agent?.pid ?? null,
+        extPid: session.ext?.pid ?? null,
         unseenOutput: session.unseenOutput,
         fd: null,
       };

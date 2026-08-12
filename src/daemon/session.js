@@ -1,6 +1,6 @@
 import { spawnPty, adoptPty } from './pty.js';
 import { cwdOf, foregroundCommand } from './procinfo.js';
-import { agentToState } from '../agents/index.js';
+import { extensionToState, extensionTitle } from '../extensions/index.js';
 
 // How much raw output we keep per session. This is what gets replayed on
 // reattach and written to disk for the post-reboot fallback.
@@ -34,10 +34,11 @@ export class Session {
     /** The process that owns the terminal right now, or null at the prompt. */
     this.foreground = null;
     /**
-     * The agent this tab is holding, if it is holding one — see src/agents.
-     * Owned by the registry; the daemon only carries it about and writes it down.
+     * What this tab is holding, if it is holding anything — a conversation, a
+     * host — and which extension knows about it. See src/extensions. Owned by
+     * the host there; the daemon only carries it about and writes it down.
      */
-    this.agent = null;
+    this.ext = null;
     /** A line waiting for the shell to be ready for it; see typeWhenReady. */
     this.pending = null;
 
@@ -304,7 +305,9 @@ export class Session {
       pid: this.shellPid,
       cols: this.cols,
       rows: this.rows,
-      agent: this.agent?.kind || null,
+      // What the tab is holding, and what its extension would like it called —
+      // an ssh tab wants to be named after its host rather than after `ssh`.
+      ext: this.ext ? { kind: this.ext.kind, title: extensionTitle(this.ext) } : null,
     };
   }
 
@@ -319,9 +322,9 @@ export class Session {
       command: this.command,
       cols: this.cols,
       rows: this.rows,
-      // What was in this tab, rather than what it was doing: the one thing
+      // What was in this tab, rather than what it was doing: the only thing
       // clio will start again by itself when the shells have to be rebuilt.
-      agent: agentToState(this.agent),
+      ext: extensionToState(this.ext),
     };
   }
 }
