@@ -1,0 +1,34 @@
+#!/usr/bin/env node
+/*
+ * A stand-in for Claude Code, for the agent tests.
+ *
+ * It does the two things the adapter reads: it writes a transcript into
+ * $CLAUDE_CONFIG_DIR/projects/<slug>/<session id>.jsonl, and it sits there in
+ * the foreground of the tab the way an agent does. It says what it did on
+ * stdout, so the test can tell a conversation resumed from one started fresh
+ * by reading the scrollback, which is what a person would be doing too.
+ *
+ * Started through a node shebang on purpose: that is how an npm-installed
+ * claude appears in /proc — `node .../claude` rather than a program of its own
+ * — so the adapter's match is being tested and not just a filename.
+ */
+import { mkdirSync, appendFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+
+const argv = process.argv.slice(2);
+const at = argv.indexOf('--resume');
+const resuming = at !== -1 ? argv[at + 1] : null;
+const sessionId = resuming || randomUUID();
+
+const dir = join(process.env.CLAUDE_CONFIG_DIR, 'projects', process.cwd().replace(/[^a-zA-Z0-9]/g, '-'));
+mkdirSync(dir, { recursive: true });
+appendFileSync(
+  join(dir, `${sessionId}.jsonl`),
+  `${JSON.stringify({ type: 'turn', sessionId, timestamp: new Date().toISOString() })}\n`,
+);
+
+process.stdout.write(resuming ? `RESUMED ${sessionId}\r\n` : `STARTED ${sessionId}\r\n`);
+
+// Hold the terminal, as an agent waiting for you would.
+setInterval(() => {}, 1 << 30);

@@ -1,9 +1,23 @@
 import { spawnPty, adoptPty } from './pty.js';
 import { cwdOf, foregroundCommand } from './procinfo.js';
+import { agentToState } from '../agents/index.js';
 
 // How much raw output we keep per session. This is what gets replayed on
 // reattach and written to disk for the post-reboot fallback.
 const SCROLLBACK_BYTES = 512 * 1024;
+
+/*
+ * How long to wait for a new shell to be ready for a line typed into it.
+ *
+ * A prompt is the shell saying it is listening, so the first byte out of the pty
+ * is the signal — plus a moment for whatever profile is still running to finish
+ * arriving. The ceiling is for the shell that prints nothing at all: a bare PS1,
+ * or a profile that takes its time. Writing early would not lose the line, since
+ * the terminal's own buffer holds it either way, but it would be read by
+ * whatever the profile happened to be running at the time.
+ */
+const SHELL_SETTLE_MS = 250;
+const SHELL_READY_MS = 4000;
 
 let nextOrder = 0;
 
@@ -16,6 +30,16 @@ export class Session {
     this.command = null;
     /** Which window's tab strip this session belongs to. */
     this.container = container;
+
+    /** The process that owns the terminal right now, or null at the prompt. */
+    this.foreground = null;
+    /**
+     * The agent this tab is holding, if it is holding one — see src/agents.
+     * Owned by the registry; the daemon only carries it about and writes it down.
+     */
+    this.agent = null;
+    /** A line waiting for the shell to be ready for it; see typeWhenReady. */
+    this.pending = null;
 
     this.pty = null;
     this.status = 'restorable'; // 'live' | 'exited' | 'restorable'
@@ -95,6 +119,9 @@ export class Session {
     this.exitCode = null;
 
     handle.onData((data) => {
+      // Output means the shell has got as far as drawing something, which is
+      // the only sign it gives that it is ready to be typed at.
+      if (this.pending && !this.pending.settle) this.settlePending();
       this.append(data);
       if (this.onData) this.onData(data);
     });
@@ -104,8 +131,52 @@ export class Session {
       this.exitCode = exitCode;
       this.pty = null;
       this.command = null;
+      this.foreground = null;
+      this.cancelPending();
       if (this.onExit) this.onExit(exitCode);
     });
+  }
+
+  /**
+   * Type a line into a shell that is still starting up.
+   *
+   * Used to put an agent's tab back the way it was after the daemon died. It is
+   * typed rather than exec'd on purpose: the shell is an ordinary login shell,
+   * the command lands in its history, the terminal echoes it so the scrollback
+   * shows what happened, and when the agent exits there is a normal prompt
+   * underneath instead of a tab that has run out of shell.
+   *
+   * With `run` the newline goes too and it starts by itself; without, it waits
+   * at the prompt for somebody to press Enter.
+   */
+  typeWhenReady(command, { run = true } = {}) {
+    if (!this.pty || !command) return;
+    this.cancelPending();
+
+    // Carriage return, which is what a terminal sends for Enter; the line
+    // discipline turns it into a newline on the way in.
+    this.pending = { text: run ? `${command}\r` : command, settle: null, deadline: null };
+    this.pending.deadline = setTimeout(() => this.flushPending(), SHELL_READY_MS);
+    this.pending.deadline.unref?.();
+  }
+
+  settlePending() {
+    this.pending.settle = setTimeout(() => this.flushPending(), SHELL_SETTLE_MS);
+    this.pending.settle.unref?.();
+  }
+
+  flushPending() {
+    const waiting = this.pending;
+    if (!waiting) return;
+    this.cancelPending();
+    this.write(waiting.text);
+  }
+
+  cancelPending() {
+    if (!this.pending) return;
+    clearTimeout(this.pending.settle);
+    clearTimeout(this.pending.deadline);
+    this.pending = null;
   }
 
   append(data) {
@@ -195,7 +266,10 @@ export class Session {
 
   /** Refresh cwd + running command from /proc. Cheap enough to poll. */
   refreshProcInfo() {
-    if (!this.pty) return false;
+    if (!this.pty) {
+      this.foreground = null;
+      return false;
+    }
     let changed = false;
 
     const cwd = cwdOf(this.pty.pid);
@@ -205,6 +279,7 @@ export class Session {
     }
 
     const fg = foregroundCommand(this.pty.pid);
+    this.foreground = fg;
     const command = fg ? fg.argv.join(' ') : null;
     if (command !== this.command) {
       this.command = command;
@@ -229,6 +304,7 @@ export class Session {
       pid: this.shellPid,
       cols: this.cols,
       rows: this.rows,
+      agent: this.agent?.kind || null,
     };
   }
 
@@ -243,6 +319,9 @@ export class Session {
       command: this.command,
       cols: this.cols,
       rows: this.rows,
+      // What was in this tab, rather than what it was doing: the one thing
+      // clio will start again by itself when the shells have to be rebuilt.
+      agent: agentToState(this.agent),
     };
   }
 }

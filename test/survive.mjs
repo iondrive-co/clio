@@ -167,8 +167,9 @@ async function onlyAgainstASandbox(info) {
   console.error('This test kills the daemon and the shells in it, so it only runs');
   console.error('against a sandbox. Start one, and point this at it:');
   console.error('');
-  console.error('  bin/clio dev start        # `bin/clio dev status` says where it lives');
-  console.error('  XDG_RUNTIME_DIR=<that>/run XDG_STATE_HOME=<that>/state node test/survive.mjs');
+  console.error('  export CLIO_SANDBOX="$(mktemp -d)"');
+  console.error('  export XDG_RUNTIME_DIR="$CLIO_SANDBOX/run" XDG_STATE_HOME="$CLIO_SANDBOX/state" CLIO_DEV=1');
+  console.error('  bin/clio start && node test/survive.mjs');
   console.error('');
   console.error('Set CLIO_TEST_LIVE=1 to override, if the daemon really is disposable.');
   if (process.env.CLIO_TEST_LIVE !== '1') process.exit(2);

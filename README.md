@@ -1,6 +1,6 @@
 # clio
 
-Terminal persistence daemon. Shells run in a background daemon, so tabs and their containing 
+Extendable terminal persistence daemon. Shells run in a background daemon, so tabs and their containing 
 windows can be closed and reattached without losing state. When the daemon crashes tabs come 
 back remembering their name, directory and the command that was running, and offer to pick up 
 where they left off. Built on Node + [xterm.js](https://xtermjs.org) + node-pty, displayed in 
@@ -40,3 +40,7 @@ bin/clio install
 Text size can be increased and decreased via arrows at the right end 
 of the tab row, and changes will be saved. New windows are opened
 with the plus button after the arrows.
+
+## Extension: agents
+
+Clio ships with a claude code extension that resumes sessions

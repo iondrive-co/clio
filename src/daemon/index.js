@@ -67,8 +67,10 @@ const UI_WATCH_DEBOUNCE_MS = 300;
 // not eventually.
 const BIND_ATTEMPTS = 25;
 
-// Set by `clio dev`: a sandbox instance, on its own port, state and browser
-// profile. Windows say so, because typing into the wrong one is the whole risk.
+// A sandbox instance: started with XDG_RUNTIME_DIR and XDG_STATE_HOME pointed
+// somewhere disposable, so it has its own port, state and browser profile and
+// shares nothing with the clio holding real shells. Set it by hand or from a
+// test. Windows say so, because typing into the wrong one is the whole risk.
 const DEV = process.env.CLIO_DEV === '1';
 
 // How long a window has to come back before its tabs are put away.
@@ -721,6 +723,10 @@ async function main() {
       const carried = {
         ...session.toState(),
         pid: session.shellPid,
+        // Only meaningful to a successor that starts while the process is still
+        // running, which is exactly what a handover is; it is not written to
+        // disk, where a reboot would make it somebody else's pid.
+        agentPid: session.agent?.pid ?? null,
         unseenOutput: session.unseenOutput,
         fd: null,
       };
@@ -801,9 +807,9 @@ async function main() {
    * — yanks every window on the desktop out from under them, mid-command,
    * running whatever half-finished code happened to be on disk at that instant.
    *
-   * So: `clio dev` watches, the clio you work in does not. CLIO_UI_WATCH=1
-   * turns it on anyway for someone who wants it and knows which one they are
-   * running.
+   * So: a sandbox (CLIO_DEV=1) watches, the clio you work in does not.
+   * CLIO_UI_WATCH=1 turns it on anyway for someone who wants it and knows
+   * which one they are running, and CLIO_UI_WATCH=0 turns it off in a sandbox.
    */
   function watchUi() {
     const wanted = process.env.CLIO_UI_WATCH === '1' || (DEV && process.env.CLIO_UI_WATCH !== '0');

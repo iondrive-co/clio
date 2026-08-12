@@ -893,10 +893,13 @@ async function main() {
   await page.keyboard.press('Enter');
   await page.waitForTimeout(3000);
 
-  // Drive the documented command rather than a hand-rolled kill+start. The
-  // README tells people to run `clio crash`, so that is the thing that has to
-  // work — an equivalent-looking substitute hid a launcher bug once already.
-  execSync('./bin/clio crash', { stdio: 'ignore' });
+  // SIGKILL, so the daemon saves nothing on the way out: the same path as a
+  // power cut rather than a clean stop. The restart goes through the launcher
+  // rather than by hand, because that is the part that has to work and a
+  // substitute for it hid a launcher bug once already.
+  process.kill((await daemonStatus()).pid, 'SIGKILL');
+  await sleep(1000);
+  execSync('./bin/clio start', { stdio: 'ignore' });
   await page.waitForTimeout(9000); // reconnect backoff
 
   check('window reconnected by itself', await page.locator('#deadscreen').isHidden());
@@ -948,7 +951,7 @@ async function main() {
   // are in, from a test, is not this file's business.
   const { dev, pid: pidBefore } = await daemonStatus();
   if (!dev) {
-    console.log('\n17. reload refreshes the window — skipped (needs a `clio dev` sandbox)');
+    console.log('\n17. reload refreshes the window — skipped (needs a CLIO_DEV=1 sandbox)');
   } else {
     console.log('\n17. reloading the daemon refreshes the window');
     await page.evaluate(() => {

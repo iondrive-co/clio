@@ -331,44 +331,13 @@ case "${1:-run}" in
     fi
     ;;
 
-  dev)
-    # A whole second clio: its own daemon, port, token, state, browser profile
-    # and windows, sharing nothing with the one running your real shells. New
-    # code gets pointed at this until it is worth pointing at the other.
-    #
-    # Everything after `dev` is an ordinary clio command against that instance:
-    # `clio dev`, `clio dev status`, `clio dev stop`, `clio dev log`.
-    shift
-    DEV_HOME="${CLIO_DEV_HOME:-${XDG_RUNTIME_DIR:-$HOME/.cache}/clio-dev}"
-    mkdir -p "$DEV_HOME/run" "$DEV_HOME/state"
-    export XDG_RUNTIME_DIR="$DEV_HOME/run"
-    export XDG_STATE_HOME="$DEV_HOME/state"
-    export CLIO_DEV=1
-    exec "$SELF" "${@:-run}"
-    ;;
-
-  crash)
-    # Deliberately ungraceful: SIGKILL gives the daemon no chance to save on the
-    # way out, so this exercises the same path as a power cut, not a clean stop.
-    if pid="$(daemon_pid)"; then
-      echo "Killing clio daemon (pid $pid) with SIGKILL — no clean shutdown."
-      kill -9 "$pid"
-      sleep 1
-      echo "Restarting…"
-      start_daemon
-      echo
-      echo "Your open window should reconnect on its own within ~10 seconds and"
-      echo "offer to restore each tab. If no window is open, run: $0"
-    else
-      echo "clio daemon is not running."
-    fi
-    ;;
-
   status)
-    # Which clio this is, when there are two. Only the sandbox says so: the one
-    # holding your real shells is the one that needs no explanation.
+    # Which clio this is, when there are two. Only a sandbox says so — one
+    # started with XDG_RUNTIME_DIR, XDG_STATE_HOME and CLIO_DEV=1 pointed
+    # somewhere disposable, the way the tests do it. The one holding your real
+    # shells is the one that needs no explanation.
     if [ "${CLIO_DEV:-}" = "1" ]; then
-      echo "instance: dev sandbox under $XDG_STATE_HOME"
+      echo "instance: sandbox under $STATE_DIR"
     fi
     if pid="$(daemon_pid)"; then
       echo "daemon:   running (pid $pid)"
@@ -446,9 +415,7 @@ clio — the immortal terminal
   clio install    add to the applications menu, panel icon and PATH
   clio start      start the daemon only
   clio reload     run the code that is on disk now, keeping every shell running
-  clio dev [cmd]  a sandbox clio, sharing nothing with the shells you work in
   clio stop       stop the daemon (state is saved for restore)
-  clio crash      SIGKILL the daemon and restart it, to test session restore
   clio status     show the daemon, its windows and their tabs
   clio log [n]    tail the daemon log
 USAGE

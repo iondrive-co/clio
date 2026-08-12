@@ -289,9 +289,10 @@ function send(msg) {
 /**
  * Say out loud when this window belongs to a sandbox.
  *
- * `clio dev` runs a second daemon with its own state, port and shells, and its
- * windows are pixel-identical to the real ones. The badge and the title are
- * what stop a command meant for a throwaway shell from landing in a real one.
+ * A daemon started with CLIO_DEV=1 and its own XDG dirs has its own state, port
+ * and shells, and its windows are pixel-identical to the real ones. The badge
+ * and the title are what stop a command meant for a throwaway shell from
+ * landing in a real one.
  */
 function setDev(dev) {
   if (el.devbadge) el.devbadge.toggleAttribute('hidden', !dev);

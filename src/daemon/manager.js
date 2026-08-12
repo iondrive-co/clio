@@ -2,6 +2,8 @@ import { EventEmitter } from 'node:events';
 import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { Session } from './session.js';
+import { cwdOf, environOf, startedAt } from './procinfo.js';
+import { observeAgent, resumeAgent, agentFromState, describeAgent } from '../agents/index.js';
 import {
   writeState,
   readState,
@@ -12,6 +14,17 @@ import {
 } from './persist.js';
 
 const PROC_POLL_MS = 2000;
+
+/*
+ * Whether a tab that was holding an agent gets it back when its shell has to be
+ * rebuilt. On, because a terminal that comes back after a reboot without the
+ * conversation that was in it has not really come back.
+ *
+ * The escape hatch is for the person debugging clio, or for whoever decides
+ * they would rather type it themselves — it is read from the daemon's own
+ * environment, so `CLIO_AGENT_RESUME=off bin/clio start` is how it is used.
+ */
+const RESUME_AGENTS = process.env.CLIO_AGENT_RESUME !== 'off';
 const SCROLLBACK_FLUSH_MS = 3000;
 const STATE_DEBOUNCE_MS = 400;
 
@@ -293,6 +306,9 @@ export class SessionManager extends EventEmitter {
         container: containerFor(saved),
       });
       session.command = saved.command || null;
+      // The process is long dead, so the record comes back without a pid. What
+      // it is for is the reopen below.
+      session.agent = agentFromState(saved.agent);
       session.seedScrollback(readScrollback(saved.id));
       this.wire(session);
       this.sessions.set(session.id, session);
@@ -327,6 +343,9 @@ export class SessionManager extends EventEmitter {
       });
       session.command = saved.command || null;
       session.unseenOutput = !!saved.unseenOutput;
+      // The agent is still running — a handover does not disturb the shells —
+      // so its pid comes across with it and nothing has to be found again.
+      session.agent = agentFromState(saved.agent, { pid: saved.agentPid ?? null });
       session.seedScrollback(readScrollback(saved.id));
       this.wire(session);
       this.sessions.set(session.id, session);
@@ -394,14 +413,23 @@ export class SessionManager extends EventEmitter {
    * What was running is *not* re-run: replaying a build, a deploy or an ssh
    * session without being asked is not a decision to make on the user's behalf.
    * It is named in the seam instead, so it can be started again if it is wanted.
+   *
+   * An agent is the exception, and the only one — see src/agents for why it
+   * earns itself. The tab had a conversation in it, the conversation is on disk
+   * where the shell that was showing it cannot take it, and reopening it runs
+   * nothing that was not already run. The seam says so before it happens.
    */
   reopen(session, { cols, rows } = {}) {
+    const plan = RESUME_AGENTS ? resumeAgent(session.agent, { cwd: session.cwd }) : null;
+
     // Recovered output sits above the new shell, so mark the seam. Without it
     // the dead prompt from before the crash reads as if it were still live.
     const when = new Date().toLocaleString();
-    const note = session.command
-      ? `──── new shell ${when} — ${session.command} was running here and was not restarted ────`
-      : `──── new shell ${when} ────`;
+    const note = plan
+      ? `──── new shell ${when} — ${plan.why} ────`
+      : session.command
+        ? `──── new shell ${when} — ${session.command} was running here and was not restarted ────`
+        : `──── new shell ${when} ────`;
     session.append(`${RESET_MODES}\r\n\x1b[38;5;244m${note}\x1b[0m\r\n`);
 
     try {
@@ -411,6 +439,19 @@ export class SessionManager extends EventEmitter {
       // swallows everything typed into it.
       session.append(`\x1b[38;5;203m──── no shell could be started: ${err.message} ────\x1b[0m\r\n`);
       return session;
+    }
+
+    if (plan) {
+      console.log(`[clio] ${session.id}: ${describeAgent(session.agent)} — ${plan.command}`);
+      session.typeWhenReady(plan.command);
+      // The record is kept, pointing at no process yet: the agent is on its way
+      // and the poll will pick it up. Keeping it is also what makes a second
+      // crash, before that happens, resume the same conversation again.
+      session.agent = { ...session.agent, pid: null, resumedAt: Date.now() };
+    } else {
+      // Nothing was brought back, so nothing is being held. Saying otherwise
+      // would leave the tab offering to resume something that is not there.
+      session.agent = null;
     }
 
     session.command = null;
@@ -475,10 +516,61 @@ export class SessionManager extends EventEmitter {
     for (const session of this.sessions.values()) {
       if (session.refreshProcInfo()) changed = true;
     }
+    if (this.pollAgents()) changed = true;
     if (changed) {
       this.scheduleSave();
       this.emit('update');
     }
+  }
+
+  /**
+   * Notice which tabs are holding an agent, and what would bring it back.
+   *
+   * Rides on the proc poll rather than watching for anything of its own: the
+   * foreground process has just been worked out for every tab, and this is the
+   * same question asked of the same answer. What comes back is written down as
+   * it is found, because after a reboot /proc is gone and whatever was not
+   * saved beforehand never existed.
+   */
+  pollAgents() {
+    const sessions = [...this.sessions.values()];
+    // Which conversations are already somebody's, so that two agents open in
+    // one directory are not both recorded as the same one.
+    const claimed = new Set(
+      sessions.map((s) => s.agent?.state?.sessionId).filter(Boolean),
+    );
+
+    let changed = false;
+    for (const session of sessions) {
+      const fg = session.foreground;
+      const taken = new Set(claimed);
+      if (session.agent?.state?.sessionId) taken.delete(session.agent.state.sessionId);
+
+      const { record, changed: moved } = observeAgent(session.agent, {
+        // Read lazily: everything but argv and exe costs a trip to /proc, and
+        // most tabs are not agents. Nothing below is touched until an adapter
+        // has said the process is one of its own.
+        foreground: fg && {
+          pid: fg.pid,
+          argv: fg.argv,
+          exe: fg.exe,
+          get cwd() {
+            return cwdOf(fg.pid);
+          },
+          get startedAt() {
+            return startedAt(fg.pid);
+          },
+          get env() {
+            return environOf(fg.pid);
+          },
+        },
+        taken,
+      });
+
+      session.agent = record;
+      if (moved) changed = true;
+    }
+    return changed;
   }
 
   flushScrollback() {

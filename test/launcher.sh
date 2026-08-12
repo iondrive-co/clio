@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Launcher tests.
 #
-# These exist because `clio crash` was broken for anyone who followed the
-# README and symlinked clio onto their PATH: the script worked out its own
+# These exist because starting the daemon was broken for anyone who followed
+# the README and symlinked clio onto their PATH: the script worked out its own
 # location without resolving the link, looked for the daemon one directory
-# above ~/.local/bin, and silently failed to restart it. Every command that
+# above ~/.local/bin, and silently failed to start it. Every command that
 # found the daemon already running masked the bug.
 set -uo pipefail
 
@@ -24,10 +24,10 @@ TMP="$(mktemp -d)"
 
 # A clio of this test's own, from the first line to the last.
 #
-# Everything below drives the launcher for real — `clio stop`, and `clio crash`,
-# which SIGKILLs the daemon it finds and starts another. The daemon it finds is
-# whichever one these two variables point at, so inheriting them means a test
-# run reaching into the shells somebody is working in: their processes killed,
+# Everything below drives the launcher for real — `clio stop`, and `clio start`
+# after a SIGKILL. The daemon those act on is whichever one these two variables
+# point at, so inheriting them means a test run reaching into the shells
+# somebody is working in: their processes killed,
 # their tabs rebuilt around new ones, and their daemon left running out of this
 # checkout. That is not a thing a test may do, however carefully the sections
 # further down isolate themselves.
@@ -122,7 +122,13 @@ echo "2. crash and restart, through the symlink"
 before_pid="$(pid_now)"
 before_port="$(port_now)"
 
-"$LINKED" crash >/dev/null 2>&1
+# SIGKILL, so the daemon gets no chance to save on the way out: this is the
+# power-cut path, not a clean stop. The restart still goes through the
+# symlinked launcher, because finding the daemon entry point from a link on
+# PATH is the thing that was broken and the thing under test here.
+kill -9 "$before_pid" 2>/dev/null
+sleep 1
+"$LINKED" start >/dev/null 2>&1
 sleep 2
 after_pid="$(pid_now)"
 after_port="$(port_now)"

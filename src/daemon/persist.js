@@ -8,8 +8,12 @@ import { STATE_FILE, SCROLLBACK_DIR, scrollbackFile } from './paths.js';
 //   screen when the daemon went down. Older files are still read — their
 //   windows simply come back as ones that were open, which for a version 2 file
 //   is true by definition, since closing a window used to end it.
-const STATE_VERSION = 3;
-const READABLE_VERSIONS = new Set([1, 2, 3]);
+// 4 added an agent record to a tab — which conversation was open in it, and
+//   under whose adapter, so it can be opened again when the shells have to be
+//   rebuilt. Older files simply have tabs that were holding nothing, and the
+//   record is the adapter's own shape, versioned inside itself.
+const STATE_VERSION = 4;
+const READABLE_VERSIONS = new Set([1, 2, 3, 4]);
 
 // Write-then-rename so a crash mid-write can never leave a half-parsed state
 // file — the restore path is exactly the code that runs after a crash, so it
