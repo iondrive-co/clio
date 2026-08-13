@@ -922,6 +922,11 @@ async function main() {
       // called once it has been put away, and showing it in an open window's
       // title would be a name nobody picked following them around.
       name: container?.name || null,
+      // Where this window was the last time it was on screen. The page puts
+      // itself there, because the browser cannot be relied on to have done it —
+      // see openBrowserWindow — and because a window that arrives at the picker
+      // and then takes on somebody else's tabs should go where *they* were.
+      geometry: container?.geometry || null,
       sessions: manager.sessionsIn(containerId).map((s) => s.toJSON()),
       home: process.env.HOME || '',
       // A sandbox window says so in the tab row. Two clios on screen look
@@ -1003,7 +1008,12 @@ async function main() {
 
     for (let attempt = 1; attempt <= WINDOW_ATTEMPTS; attempt++) {
       try {
-        await openBrowserWindow(url, { ...process.env, ...launchOverrides });
+        // Where this window was last time, if it has been on screen before. The
+        // browser is only half-reliable about honouring it; the page it loads
+        // finishes the job. See openBrowserWindow.
+        await openBrowserWindow(url, { ...process.env, ...launchOverrides }, {
+          geometry: manager.getContainer(containerId)?.geometry || null,
+        });
       } catch (err) {
         return { ok: false, fatal: true, error: err.message, url };
       }
@@ -1300,6 +1310,13 @@ async function main() {
           } catch (err) {
             send({ t: 'link', ok: false, error: err.message });
           }
+          break;
+
+        // This window has been moved or resized. Only the window knows — the
+        // daemon has no connection to the desktop at all — and it is worth
+        // knowing because it is what the next launch opens onto.
+        case 'geometry':
+          manager.setGeometry(client.container, msg);
           break;
 
         case 'focus':

@@ -227,7 +227,7 @@ async function main() {
     savedAgent?.state?.sessionId === conversation,
     `${savedAgent?.state?.sessionId} vs ${conversation}`,
   );
-  check('and the state file says which shape that is in', saved.version === 5, `v${saved.version}`);
+  check('and the state file says which shape that is in', saved.version === 6, `v${saved.version}`);
 
   // ---- the part that matters ---------------------------------------------
   console.log('\n3. the daemon is killed outright, and started again');

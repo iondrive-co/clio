@@ -41,6 +41,49 @@ const STATE_DEBOUNCE_MS = 400;
 // for, so keep the shape narrow rather than trusting the string.
 const CONTAINER_ID = /^[a-f0-9]{4,32}$/;
 
+/*
+ * Where a window was, and how big.
+ *
+ * Reported by the window itself, because a page is the only thing on this side
+ * that knows: the daemon does not talk to the desktop, and the browser it asks
+ * for a window puts every window after the first wherever it likes regardless of
+ * the size it was given. It is kept against the container rather than left to
+ * the browser profile so that it belongs to the tabs — the window that comes
+ * back with your shells in it comes back the size it was, on the monitor it was
+ * on, which for a desktop with three of them is most of what "as it was" means.
+ *
+ * A maximised window is remembered as its maximised size and comes back as an
+ * ordinary window of that size, which looks the same and is not the same. The
+ * page has no way to ask whether it is maximised, so this is as close as the
+ * information allows.
+ */
+const WINDOW_MIN = 120;
+const WINDOW_MAX = 32000;
+// Room for monitors left of and above the primary one, which have negative
+// coordinates, without accepting a number that could only be a mistake.
+const DESKTOP_REACH = 32000;
+
+function windowGeometry(reported) {
+  if (!reported) return null;
+  const { x, y, width, height } = reported;
+  const within = (n, min, max) => Number.isFinite(n) && n >= min && n <= max;
+  if (!within(width, WINDOW_MIN, WINDOW_MAX) || !within(height, WINDOW_MIN, WINDOW_MAX)) return null;
+  if (!within(x, -DESKTOP_REACH, DESKTOP_REACH) || !within(y, -DESKTOP_REACH, DESKTOP_REACH)) {
+    return null;
+  }
+  return {
+    x: Math.round(x),
+    y: Math.round(y),
+    width: Math.round(width),
+    height: Math.round(height),
+  };
+}
+
+function sameGeometry(a, b) {
+  if (!a || !b) return a === b;
+  return a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
+}
+
 function newId() {
   return randomBytes(6).toString('hex');
 }
@@ -155,6 +198,8 @@ export class SessionManager extends EventEmitter {
       // itself is worked out again next time; see parkContainer.
       named: false,
       closedAt: null,
+      // Nothing until a window has told us where it is; see setGeometry.
+      geometry: null,
     };
     this.containers.set(wanted, container);
     this.scheduleSave();
@@ -175,6 +220,11 @@ export class SessionManager extends EventEmitter {
       // becomes the host its first tab is on.
       named: !!saved.named,
       closedAt: Number.isFinite(saved.closedAt) ? saved.closedAt : null,
+      // Checked rather than trusted: it has been on disk since before the last
+      // reboot, and the desktop it describes may have had a monitor unplugged
+      // since. Files written before windows had a size remembered have none,
+      // which is a window that opens where the browser puts it, as before.
+      geometry: windowGeometry(saved.geometry),
     };
     this.containers.set(container.id, container);
     this.nextContainerOrder = Math.max(this.nextContainerOrder, order + 1);
@@ -224,6 +274,24 @@ export class SessionManager extends EventEmitter {
     this.emit('containers');
   }
 
+  /**
+   * Where the window showing this container is on the desktop, as the window
+   * itself reports it.
+   *
+   * Nobody is told: no other window has any use for it, and the only reader is
+   * the next time this container is put on screen. The save is the debounced one,
+   * so dragging a window from one monitor to another costs one write of the state
+   * file rather than one per frame.
+   */
+  setGeometry(containerId, reported) {
+    const container = this.containers.get(containerId);
+    if (!container) return;
+    const geometry = windowGeometry(reported);
+    if (!geometry || sameGeometry(container.geometry, geometry)) return;
+    container.geometry = geometry;
+    this.scheduleSave();
+  }
+
   renameContainer(containerId, name) {
     const container = this.containers.get(containerId);
     if (!container) return;
@@ -239,8 +307,13 @@ export class SessionManager extends EventEmitter {
    * What to call a tab that is being listed rather than shown — in the window
    * picker, in `clio status`, or as the name a closed window is put away under.
    *
-   * The window on screen has one more answer available to it than this does: a
-   * title the running program announced, which only ever reaches the client.
+   * Deliberately one answer short of what a tab on screen is called: the title
+   * the program announced is not consulted here, even though the daemon now
+   * knows it. A tab is named after the job an agent is on, and that is right for
+   * a label that is redrawn every couple of seconds and wrong for a name a
+   * window is put away under — `Fixing the parser` was true for a minute in
+   * February and is not what anybody will look for it under in March.
+   *
    * The rest of the order is the same, and an extension gets its say — a window
    * full of ssh tabs is listed by its hosts rather than four times as `ssh`.
    */
@@ -621,14 +694,16 @@ export class SessionManager extends EventEmitter {
 
   pollProcInfo() {
     let changed = false;
+    let moved = false;
     for (const session of this.sessions.values()) {
       if (session.refreshProcInfo()) changed = true;
+      // A title belongs to a running process and is never written down, so it is
+      // worth telling the windows about and not worth a trip to the disk.
+      if (session.takeTitleChange()) moved = true;
     }
     if (this.pollExtensions()) changed = true;
-    if (changed) {
-      this.scheduleSave();
-      this.emit('update');
-    }
+    if (changed) this.scheduleSave();
+    if (changed || moved) this.emit('update');
   }
 
   /**

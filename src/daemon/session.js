@@ -1,5 +1,6 @@
 import { spawnPty, adoptPty } from './pty.js';
 import { cwdOf, foregroundCommand } from './procinfo.js';
+import { TitleReader, lastTitleIn } from './termtitle.js';
 import { extensionToState, extensionTitle } from '../extensions/index.js';
 
 // How much raw output we keep per session. This is what gets replayed on
@@ -42,6 +43,20 @@ export class Session {
     /** A line waiting for the shell to be ready for it; see typeWhenReady. */
     this.pending = null;
 
+    /**
+     * What the program in this tab last said it was doing — the terminal title
+     * it announced, exactly as it announced it. Read out of the output on its
+     * way past; see ./termtitle.js for why the daemon reads these at all.
+     *
+     * Not persisted. It describes a running process, and after a reboot the
+     * process is gone; what comes back instead is read out of the scrollback,
+     * which is persisted. See seedScrollback.
+     */
+    this.termTitle = null;
+    this.titles = new TitleReader();
+    /** A title nobody has been told about yet; see takeTitleChange. */
+    this.titleMoved = false;
+
     this.pty = null;
     this.status = 'restorable'; // 'live' | 'exited' | 'restorable'
     this.exitCode = null;
@@ -79,6 +94,10 @@ export class Session {
     this.cols = cols;
     this.rows = rows;
     this.cwd = cwd;
+    // A shell of its own: whatever the last program in this tab called it was
+    // not about this one. The new shell announces its own soon enough.
+    this.termTitle = null;
+    this.titles = new TitleReader();
 
     this.take(
       spawnPty({
@@ -123,6 +142,7 @@ export class Session {
       // Output means the shell has got as far as drawing something, which is
       // the only sign it gives that it is ready to be typed at.
       if (this.pending && !this.pending.settle) this.settlePending();
+      this.noteTitle(data);
       this.append(data);
       if (this.onData) this.onData(data);
     });
@@ -180,6 +200,28 @@ export class Session {
     this.pending = null;
   }
 
+  /** Watch the output go past for a title the program set for itself. */
+  noteTitle(data) {
+    const announced = this.titles.read(data);
+    if (announced === null || announced === this.termTitle) return;
+    this.termTitle = announced;
+    this.titleMoved = true;
+  }
+
+  /**
+   * Has the title moved since this was last asked?
+   *
+   * Asked on the proc poll rather than pushed the moment it happens: a program
+   * that rewrites its title on every keystroke — which is most of them — would
+   * otherwise cost one broadcast to every window per keystroke, and two seconds
+   * late is not late for a tab label.
+   */
+  takeTitleChange() {
+    const moved = this.titleMoved;
+    this.titleMoved = false;
+    return moved;
+  }
+
   append(data) {
     this.chunks.push(data);
     this.bytes += Buffer.byteLength(data);
@@ -199,6 +241,12 @@ export class Session {
   seedScrollback(text) {
     this.chunks = text ? [text] : [];
     this.bytes = text ? Buffer.byteLength(text) : 0;
+    // The buffer is a recording of everything the program wrote, the titles it
+    // set included, so the last one it announced is in there to be found. That
+    // is what keeps a tab's name across a reload and a restart, instead of it
+    // falling back to `claude` until whatever is in it happens to say something
+    // about itself again.
+    if (text) this.termTitle = lastTitleIn(text) ?? this.termTitle;
   }
 
   write(data) {
@@ -296,6 +344,11 @@ export class Session {
       id: this.id,
       container: this.container,
       title: this.title,
+      // What the program in here says it is doing, which for an agent is the job
+      // it is on. The window has a live version of this for the tab it is
+      // showing — xterm.js parses the same sequences — but only for that one, so
+      // this is what every other tab in the row is named after.
+      termTitle: this.termTitle,
       order: this.order,
       cwd: this.cwd,
       command: this.command,

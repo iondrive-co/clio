@@ -16,8 +16,12 @@ import { STATE_FILE, SCROLLBACK_DIR, scrollbackFile } from './paths.js';
 //   of thing a tab can be holding: an ssh session is one too, under an
 //   extension of its own. Same shape, and a version 4 file's `agent` is still
 //   read as one — see SessionManager.restoreFromDisk.
-const STATE_VERSION = 5;
-const READABLE_VERSIONS = new Set([1, 2, 3, 4, 5]);
+// 6 added a window's geometry to each container — where it was on the desktop
+//   and how big, so that a window comes back the size it was on the monitor it
+//   was on. An older file has none, and its windows open where the browser puts
+//   them, which is what every version before this one did.
+const STATE_VERSION = 6;
+const READABLE_VERSIONS = new Set([1, 2, 3, 4, 5, 6]);
 
 // Write-then-rename so a crash mid-write can never leave a half-parsed state
 // file — the restore path is exactly the code that runs after a crash, so it
@@ -43,6 +47,7 @@ export function writeState(containers, sessions) {
         name: c.name ?? null,
         named: !!c.named,
         closedAt: c.closedAt ?? null,
+        geometry: c.geometry ?? null,
       })),
     sessions: sessions.map((s) => s.toState()),
   };

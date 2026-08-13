@@ -98,7 +98,18 @@ export function openUrl(raw, env = process.env) {
  * Errors are flagged `fatal` when there is nothing to retry — no browser on the
  * machine is not a race, and pretending otherwise only delays the message.
  */
-export function openBrowserWindow(url, env = process.env) {
+/*
+ * The size a window opens at when nothing is known about where it was.
+ * Chrome-family browsers only honour this — and --window-position — for the
+ * first window of a profile's browser process; every one after that is placed
+ * wherever the browser feels like, which is why the page moves itself into place
+ * once it is up. See applyGeometry in ../ui/app.js. Passing them anyway is worth
+ * it for the first window of the day, which is the one that would otherwise be
+ * seen jumping.
+ */
+const DEFAULT_WINDOW_SIZE = '1100,700';
+
+export function openBrowserWindow(url, env = process.env, { geometry = null } = {}) {
   const browser = findBrowser(env);
   if (!browser) {
     const err = new Error(`no Chrome-family browser found (tried ${BROWSERS.join(', ')})`);
@@ -115,7 +126,8 @@ export function openBrowserWindow(url, env = process.env) {
         `--app=${url}`,
         `--user-data-dir=${BROWSER_PROFILE_DIR}`,
         '--class=clio',
-        '--window-size=1100,700',
+        `--window-size=${geometry ? `${geometry.width},${geometry.height}` : DEFAULT_WINDOW_SIZE}`,
+        ...(geometry ? [`--window-position=${geometry.x},${geometry.y}`] : []),
         '--no-first-run',
         '--no-default-browser-check',
         '--disable-features=Translate,MediaRouter',

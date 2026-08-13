@@ -313,6 +313,12 @@ function handle(msg) {
       }
       windowName = msg.name || null;
       setDev(msg.dev);
+      // Where this window belongs on the desktop — once for the tabs it opened
+      // onto, and again if it takes on another window's from the picker.
+      if (!picking && placedFor !== containerId) {
+        placedFor = containerId;
+        applyGeometry(msg.geometry);
+      }
       syncSessions(msg.sessions, msg.home);
       refreshTitle();
       break;
@@ -917,7 +923,13 @@ function tabLabel(meta) {
 
   if (meta.ext?.title) return meta.ext.title;
 
-  const announced = termTitles.get(meta.id);
+  // The pane's own copy of the announced title is the live one — xterm parses
+  // the sequence as it arrives — but only a tab somebody has opened has a pane
+  // to parse it, and after a restore that is one tab out of thirteen. The daemon
+  // reads the same titles out of the same stream for every tab, a couple of
+  // seconds behind, and that is what the rest of the row is named after.
+  const pane = panes.get(meta.id);
+  const announced = (pane?.attached && termTitles.get(meta.id)) || meta.termTitle;
   if (announced && !isShellDefaultTitle(announced)) return announced;
 
   if (meta.command) return basename(meta.command.split(/\s+/)[0]);
@@ -1373,6 +1385,86 @@ window.addEventListener(
   true,
 );
 
+// ------------------------------------------------------------------ geometry
+
+/*
+ * A window comes back the size it was, on the monitor it was on.
+ *
+ * The daemon cannot do this from the outside. Chrome honours --window-size and
+ * --window-position for the first window of its browser process and ignores them
+ * for every one after it, so a morning that opens four windows gets one where it
+ * asked and three stacked wherever the browser last had one. It is also the
+ * wrong place to ask from: a monitor unplugged overnight, a window somebody
+ * dragged — the page is the only thing that can read where it actually is.
+ *
+ * So the window places itself when it learns which tabs it is showing, and keeps
+ * the daemon told from then on. On a poll, because a browser fires no event for a
+ * window being moved, and 'resize' says nothing about which monitor you are on.
+ */
+const GEOMETRY_POLL_MS = 1000;
+/** Differences smaller than this are not moves; a window manager may round. */
+const GEOMETRY_SLACK = 2;
+
+/** Which container this page has already put itself in place for. */
+let placedFor = null;
+/** The last position reported, so a still window is silent. */
+let lastGeometry = null;
+
+/**
+ * Where this window is, in the coordinates that span every monitor — which is
+ * what makes remembering the monitor come for free.
+ */
+function currentGeometry() {
+  const now = {
+    x: window.screenX,
+    y: window.screenY,
+    width: window.outerWidth,
+    height: window.outerHeight,
+  };
+  if (!Object.values(now).every(Number.isFinite)) return null;
+  return now.width > 0 && now.height > 0 ? now : null;
+}
+
+function moved(a, b) {
+  return ['x', 'y', 'width', 'height'].some((key) => Math.abs(a[key] - b[key]) > GEOMETRY_SLACK);
+}
+
+/**
+ * Put this window where its tabs were last seen.
+ *
+ * Only on the way in, and only when it is somewhere else already: a window that
+ * the browser happened to place correctly is left alone rather than nudged.
+ *
+ * A maximised window was remembered as its maximised size and comes back as an
+ * ordinary window of that size. It looks the same and is not the same, and there
+ * is no way for a page to ask whether it was maximised — so that is as close as
+ * this gets.
+ */
+function applyGeometry(saved) {
+  const now = currentGeometry();
+  if (!saved || !now || !moved(now, saved)) return;
+  // A window on Wayland can neither move itself nor read where it is; both calls
+  // are simply ignored there, which is the same as having nothing saved.
+  window.moveTo(saved.x, saved.y);
+  window.resizeTo(saved.width, saved.height);
+}
+
+/** Tell the daemon where we are, when that changes. */
+function reportGeometry() {
+  // A window still on the picker has not become anything yet, and where an empty
+  // frame happens to be is not worth remembering against the tabs it may adopt.
+  if (picking) return;
+  const now = currentGeometry();
+  if (!now || (lastGeometry && !moved(lastGeometry, now))) return;
+  lastGeometry = now;
+  // Deliberately not through send(): this is chatter rather than something
+  // somebody clicked, and a window whose daemon is down has been told so by
+  // everything else already. It must not raise a banner of its own.
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ t: 'geometry', ...now }));
+  }
+}
+
 // -------------------------------------------------------------------- status
 
 /** Terminal state: this window will never work again, so say so plainly. */
@@ -1437,5 +1529,6 @@ updateFontButtons();
 
 window.addEventListener('resize', resizeActive);
 window.addEventListener('focus', () => panes.get(activeId)?.term.focus());
+setInterval(reportGeometry, GEOMETRY_POLL_MS);
 
 connect();
