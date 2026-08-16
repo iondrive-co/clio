@@ -11,18 +11,49 @@
  * newest transcript in this directory that was written while this process has
  * been running.
  *
- * That is a guess, and it is wrong in exactly one situation: two conversations
- * open in the same directory, one of them outside clio. The registry narrows it
- * by telling us which ids other tabs have already claimed, and an explicit
- * --resume on the command line beats the guess outright.
+ * That is a guess, and what it can be wrong about is another conversation open
+ * in the same directory. Three things narrow it. The registry says which ids
+ * other tabs have already claimed. Each transcript says which Claude Code wrote
+ * it, so the desktop app's and a script's are not mistaken for a tab's — see
+ * TERMINAL. And an explicit --resume on the command line beats the guess
+ * outright.
  */
 
-import { readdirSync, statSync, existsSync } from 'node:fs';
+import { readdirSync, statSync, existsSync, openSync, readSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
 /** Filenames are the session id, and nothing else in the directory is. */
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/*
+ * The entrypoint of a conversation that was held in a terminal.
+ *
+ * Claude Code in a terminal is not the only Claude Code writing into
+ * ~/.claude/projects. The desktop app puts its conversations in the same tree,
+ * and so does every `-p` run, every SDK script and every subagent — they share
+ * the directory because the directory is named after the working directory,
+ * which is the one thing they have in common. Each entry says which of them
+ * wrote it, and `cli` is the terminal.
+ *
+ * That field is the whole of the fix for a real morning: on 15 August a tab in
+ * ~/proteus came back as `claude --resume 646626df`, a conversation that had
+ * been held in the desktop app and had never been in that tab or in any tab. It
+ * was simply the newest file in the directory, and the newest file in the
+ * directory was all this adapter looked at.
+ */
+const TERMINAL = 'cli';
+
+/*
+ * How much of a transcript to read to find out who is writing it.
+ *
+ * The answer is in the first entry that carries one, and the few lines above it
+ * are session settings — a couple of hundred bytes. Transcripts run to
+ * megabytes, and this is asked on a poll, so reading one whole to learn a field
+ * near the top of it is the sort of cost that gets noticed on a desktop with
+ * thirty tabs open.
+ */
+const HEAD_BYTES = 64 * 1024;
 
 /*
  * A transcript written before the process started belongs to an earlier
@@ -84,6 +115,56 @@ function transcripts(dir, since) {
     }
   }
   return found.sort((a, b) => b.mtimeMs - a.mtimeMs);
+}
+
+/**
+ * Which Claude Code wrote this transcript, or null if it has not said yet.
+ *
+ * The field is on the first entry that carries one; the handful of lines above
+ * it set the session's mode and have none. Parsed a line at a time rather than
+ * searched for as text, because everything in a transcript that a person or a
+ * tool typed is in there as text too, and one of them saying `"entrypoint"` is
+ * not the transcript saying it.
+ */
+function writtenBy(file) {
+  let fd = null;
+  try {
+    fd = openSync(file, 'r');
+    const buffer = Buffer.allocUnsafe(HEAD_BYTES);
+    const read = readSync(fd, buffer, 0, HEAD_BYTES, 0);
+    const lines = buffer.toString('utf8', 0, read).split('\n');
+    // The last line is cut in half whenever the file is longer than the read.
+    if (read === HEAD_BYTES) lines.pop();
+    for (const line of lines) {
+      if (!line.includes('"entrypoint"')) continue;
+      try {
+        const entry = JSON.parse(line);
+        if (typeof entry?.entrypoint === 'string') return entry.entrypoint;
+      } catch {
+        /* not an entry, or not a whole one: the next line will do */
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+/**
+ * Could this conversation have been the one in a tab?
+ *
+ * A transcript that names an entrypoint which is not the terminal belongs to
+ * something a terminal cannot bring back, and saying nothing is not the same
+ * answer: a conversation opened a moment ago has not written a turn yet, and
+ * refusing it would lose the tab that has just started one. So the question is
+ * asked the cautious way round — the only ones ruled out are the ones that have
+ * said, in as many words, that they are somebody else's.
+ */
+function inATerminal(dir, id) {
+  const by = writtenBy(join(dir, `${id}.jsonl`));
+  return by === null || by === TERMINAL;
 }
 
 /** The id Claude was told to resume, if it was told one. */
@@ -155,8 +236,10 @@ export default {
       const seen = transcripts(dir, since);
       // Newest wins — starting a fresh conversation in a tab that had one is a
       // change of subject, not a second tab — except that another tab's
-      // conversation is never stolen.
-      const pick = seen.find((t) => t.id === mine || !taken.has(t.id));
+      // conversation is never stolen, and neither is one that was never in a
+      // tab at all. What this one already has is taken at its word without a
+      // file being opened: it is the answer on almost every poll.
+      const pick = seen.find((t) => t.id === mine || (!taken.has(t.id) && inATerminal(dir, t.id)));
       if (pick) return { v: 1, sessionId: pick.id, cwd, at: Math.round(pick.mtimeMs) };
     }
 
@@ -190,7 +273,7 @@ export default {
     if (asked) return { v: 1, sessionId: asked, cwd, at: null };
 
     const dir = projectDir(cwd, null);
-    const [newest] = dir ? transcripts(dir, 0) : [];
+    const newest = dir ? transcripts(dir, 0).find((t) => inATerminal(dir, t.id)) : null;
     return newest ? { v: 1, sessionId: newest.id, cwd, at: Math.round(newest.mtimeMs) } : null;
   },
 

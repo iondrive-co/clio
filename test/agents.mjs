@@ -175,6 +175,17 @@ function savedState() {
   return JSON.parse(readFileSync(join(STATE, 'clio', 'state.json'), 'utf8'));
 }
 
+/**
+ * Which conversation a tab is holding, read off the disk.
+ *
+ * A window is told that a tab has an agent in it and never which conversation
+ * — the state is the adapter's and stays in the daemon — so the state file is
+ * where it can be seen, which is also where it has to be right for a restore.
+ */
+function heldBy(id) {
+  return savedState().sessions.find((s) => s.id === id)?.ext?.state?.sessionId ?? null;
+}
+
 /* ------------------------------------------------------------------- the test */
 
 async function main() {
@@ -357,9 +368,133 @@ async function main() {
   last.send({ t: 'close', id: agentTab.id });
   last.send({ t: 'close', id: plainTab.id });
   await sleep(600);
+
+  // ---- the other morning this was written for ----------------------------
+  console.log('\n7. a conversation that was never in a terminal is left where it is');
+  /*
+   * ~/.claude/projects is not the terminal's. The desktop app writes its
+   * conversations into the same directory, and so does every -p run and every
+   * SDK script, because the directory is named after the working directory and
+   * that is the one thing they all share. The adapter took the newest file in
+   * it, so on 15 August a tab in ~/proteus came back running `claude --resume
+   * 646626df` — a conversation held in the desktop app, which had never been in
+   * that tab and could not be continued from one.
+   */
+  const seven = await agentIn(last);
+  check('a tab with a conversation of its own', !!seven.conversation, seven.detail);
+
+  writeTranscript(newId(), 'claude-desktop');
+  await sleep(RECAPTURE_MS);
+  check(
+    'the desktop app writing next door does not move the tab',
+    heldBy(seven.id) === seven.conversation,
+    `${heldBy(seven.id)} vs ${seven.conversation}`,
+  );
+
+  console.log('\n8. two tabs never end up on one conversation');
+  /*
+   * The same restore put `claude --resume f7147610` into two tabs in ~/ops, and
+   * a conversation resumed twice is one of them typing over the other. Every
+   * tab's claim is meant to be off the table for the rest, and it was — but the
+   * table was laid once at the top of a poll and not touched again, so two tabs
+   * that both changed their minds in the same pass could change them to the
+   * same thing.
+   *
+   * Which is this: a third conversation, newer than either tab's own, that both
+   * of them can see and neither of them wrote — and two tabs started together,
+   * so that they are asked about it in the same pass, which is the only moment
+   * the two of them were ever able to collide.
+   */
+  const one = await newTab(last);
+  const two = await newTab(last);
+  check('two more tabs', !!one && !!two);
+  if (!one || !two) return report();
+
+  await sleep(800);
+  last.send({ t: 'input', id: one, data: 'claude\n' });
+  last.send({ t: 'input', id: two, data: 'claude\n' });
+  await sleep(6000);
+
+  const oneConv = heldBy(one);
+  const twoConv = heldBy(two);
+  check('each on a conversation of its own', !!oneConv && !!twoConv, `${oneConv} vs ${twoConv}`);
+  check('and not on each other\'s', oneConv !== twoConv, `${oneConv} vs ${twoConv}`);
+
+  writeTranscript(newId(), 'cli');
+  await sleep(RECAPTURE_MS);
+  const oneNow = heldBy(one);
+  const twoNow = heldBy(two);
+  check(
+    'a conversation loose in the directory is taken by at most one of them',
+    !!oneNow && !!twoNow && oneNow !== twoNow,
+    `${oneNow} vs ${twoNow}`,
+  );
+
+  last.send({ t: 'close', id: seven.id });
+  last.send({ t: 'close', id: one });
+  last.send({ t: 'close', id: two });
+  await sleep(600);
   last.close();
 
   report();
+}
+
+/*
+ * Long enough for an adapter to be asked to look again — CAPTURE_INTERVAL_MS in
+ * src/extensions, plus a proc poll to carry the question, plus room to spare.
+ */
+const RECAPTURE_MS = 12000;
+
+const newId = () =>
+  'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = Math.floor(Math.random() * 16);
+    return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+  });
+
+/**
+ * A conversation in the sandbox's project directory that no tab is holding —
+ * the desktop app's, or a script's, or one from a terminal that has since gone.
+ *
+ * Written with the same shape a real one has: settings first, then entries, and
+ * `entrypoint` on the entries. Which entrypoint is the whole point of it.
+ */
+function writeTranscript(id, entrypoint) {
+  const dir = join(CLAUDE_CONFIG, 'projects', WORK.replace(/[^a-zA-Z0-9]/g, '-'));
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, `${id}.jsonl`),
+    [
+      JSON.stringify({ type: 'mode', mode: 'normal', sessionId: id }),
+      JSON.stringify({ type: 'user', sessionId: id, entrypoint, cwd: WORK, timestamp: new Date().toISOString() }),
+      '',
+    ].join('\n'),
+  );
+  return id;
+}
+
+/** Another tab in the sandbox's working directory, or null. */
+async function newTab(client) {
+  // Every `created` this client has ever been sent is still in its log, so the
+  // new one is the one that is not among them.
+  const before = new Set(client.messages.filter((m) => m.t === 'created').map((m) => m.id));
+  client.send({ t: 'create', cwd: WORK, cols: 80, rows: 24 });
+  const tab = await client.await((m) => m.t === 'created' && !before.has(m.id));
+  return tab?.id || null;
+}
+
+/** A new tab with an agent running in it, and the conversation it opened. */
+async function agentIn(client) {
+  const id = await newTab(client);
+  if (!id) return { id: null, conversation: null, detail: 'no tab' };
+
+  await sleep(800);
+  const quiet = (client.output.get(id) || '').length;
+  client.send({ t: 'input', id, data: 'claude\n' });
+  await sleep(6000);
+
+  const said = (client.output.get(id) || '').slice(quiet);
+  const started = /STARTED ([0-9a-f-]{36})/.exec(said);
+  return { id, conversation: started?.[1] || null, detail: JSON.stringify(said.slice(-200)) };
 }
 
 function report() {

@@ -10,15 +10,37 @@ const SCROLLBACK_BYTES = 512 * 1024;
 /*
  * How long to wait for a new shell to be ready for a line typed into it.
  *
- * A prompt is the shell saying it is listening, so the first byte out of the pty
- * is the signal — plus a moment for whatever profile is still running to finish
- * arriving. The ceiling is for the shell that prints nothing at all: a bare PS1,
- * or a profile that takes its time. Writing early would not lose the line, since
- * the terminal's own buffer holds it either way, but it would be read by
- * whatever the profile happened to be running at the time.
+ * Two questions, and for a long time this asked only the easy one. Output means
+ * the shell has drawn something, and a quarter of a second of quiet after it
+ * means whatever was being drawn has stopped — so `SHELL_SETTLE_MS` is measured
+ * from the *last* byte, not the first, because a login profile arrives in
+ * pieces and the first of them is not the prompt.
+ *
+ * The hard question is whether anything still owns the terminal. On 15 August a
+ * restore rebuilt 24 tabs at once, every one of them ran a profile with
+ * `keychain` in it, and the resume commands were typed 250ms after the first
+ * thing keychain printed — into a shell that was still in its .bashrc. Nothing
+ * was lost that day: keychain had already given up, and the line waited in the
+ * kernel's buffer for bash to read. But the thing it was typed at was one that
+ * asks for a passphrase, and a resume command typed into a passphrase prompt is
+ * an ssh key's passphrase attempt made of somebody's session id. So the shell is
+ * asked directly, through tpgid, whether it is at its own prompt; see
+ * ./procinfo.js.
+ *
+ * The ceiling is long because the thing it is waiting through can be a person
+ * answering a dialog. When it runs out and the shell is *still* busy, the line
+ * is not typed at all — it is named in the tab instead, which is the same
+ * bargain the seam makes for everything clio will not run by itself.
  */
 const SHELL_SETTLE_MS = 250;
-const SHELL_READY_MS = 4000;
+const SHELL_READY_MS = 30000;
+
+/*
+ * How much of what somebody typed at a tab with no shell in it is kept. See
+ * write — a line or two, which is all anybody gets in before the shell arrives,
+ * and a bound so that a tab whose shell never comes cannot grow one.
+ */
+const UNTYPED_BYTES = 4096;
 
 let nextOrder = 0;
 
@@ -40,8 +62,10 @@ export class Session {
      * the host there; the daemon only carries it about and writes it down.
      */
     this.ext = null;
-    /** A line waiting for the shell to be ready for it; see typeWhenReady. */
+    /** Somebody waiting for this shell to reach its own prompt; see whenReady. */
     this.pending = null;
+    /** Typed at this tab before it had a shell to type into; see write. */
+    this.typed = '';
 
     /**
      * What the program in this tab last said it was doing — the terminal title
@@ -138,10 +162,20 @@ export class Session {
     this.status = 'live';
     this.exitCode = null;
 
+    // Whatever was typed at this tab while it was waiting for a shell, before
+    // anything the daemon has to say to it. It goes into the pty's buffer and
+    // is read at the prompt, which is what would have happened to it had the
+    // shell been there and busy — the same bargain, not a new one.
+    if (this.typed) {
+      const waiting = this.typed;
+      this.typed = '';
+      handle.write(waiting);
+    }
+
     handle.onData((data) => {
-      // Output means the shell has got as far as drawing something, which is
-      // the only sign it gives that it is ready to be typed at.
-      if (this.pending && !this.pending.settle) this.settlePending();
+      // Still drawing, so still not finished. The wait is measured from here,
+      // which means from the last thing the shell said rather than the first.
+      if (this.pending) this.settlePending();
       this.noteTitle(data);
       this.append(data);
       if (this.onData) this.onData(data);
@@ -153,51 +187,109 @@ export class Session {
       this.pty = null;
       this.command = null;
       this.foreground = null;
-      this.cancelPending();
+      this.cancelPending(false);
       if (this.onExit) this.onExit(exitCode);
     });
   }
 
   /**
+   * Call back when this shell has finished starting up and is at its own
+   * prompt — `done(true)` — or when `cap` runs out with it still busy, which is
+   * `done(false)` and means somebody else has the terminal.
+   *
+   * Only one of these at a time per session; a second replaces the first, which
+   * is told it lost. Everything that has to wait for a shell goes through here:
+   * typing into it, and holding the next tab's restore back until this one has
+   * got through its profile. See SHELL_SETTLE_MS.
+   *
+   * `idle` is what "ready" means. On, it is the shell's own prompt, which is
+   * what you need before typing. Off, it is only that the output has stopped —
+   * which is as far as a thing that has just been started gets on its own, and
+   * all the answer there is when the question is "has that ssh finished doing
+   * whatever it was going to do".
+   */
+  whenReady(done, { cap = SHELL_READY_MS, idle = true } = {}) {
+    if (!this.pty) {
+      done(false);
+      return;
+    }
+    this.cancelPending(false);
+    this.pending = { done, idle, settle: null, deadline: null };
+    this.pending.deadline = setTimeout(() => this.cancelPending(false), cap);
+    this.pending.deadline.unref?.();
+    // A shell that prints nothing at all — a bare PS1 — still has to be waited
+    // for. Start the clock now rather than on output that may never come.
+    this.settlePending();
+  }
+
+  settlePending() {
+    clearTimeout(this.pending.settle);
+    this.pending.settle = setTimeout(() => {
+      // Quiet, but is it *our* quiet? Something in the foreground here is the
+      // profile still running, and the one that matters is the one that is
+      // about to ask for a passphrase. Wait it out — the cap is the backstop.
+      if (this.pending.idle && this.pty && foregroundCommand(this.pty.pid)) {
+        this.settlePending();
+        return;
+      }
+      this.cancelPending(true);
+    }, SHELL_SETTLE_MS);
+    this.pending.settle.unref?.();
+  }
+
+  /**
+   * Stop waiting, and tell whoever was waiting how it ended. Exactly once:
+   * a caller that is never told is a restore that stops halfway through.
+   */
+  cancelPending(ready) {
+    const waiting = this.pending;
+    if (!waiting) return null;
+    clearTimeout(waiting.settle);
+    clearTimeout(waiting.deadline);
+    this.pending = null;
+    waiting.done(ready);
+    return waiting;
+  }
+
+  /**
    * Type a line into a shell that is still starting up.
    *
-   * Used to put an agent's tab back the way it was after the daemon died. It is
-   * typed rather than exec'd on purpose: the shell is an ordinary login shell,
-   * the command lands in its history, the terminal echoes it so the scrollback
-   * shows what happened, and when the agent exits there is a normal prompt
+   * Used to put a tab back the way it was after the daemon died. It is typed
+   * rather than exec'd on purpose: the shell is an ordinary login shell, the
+   * command lands in its history, the terminal echoes it so the scrollback shows
+   * what happened, and when the command exits there is a normal prompt
    * underneath instead of a tab that has run out of shell.
    *
    * With `run` the newline goes too and it starts by itself; without, it waits
    * at the prompt for somebody to press Enter.
+   *
+   * If the shell never comes free the line is *not* typed. Writing it anyway is
+   * the tempting thing and is the bug this exists to prevent: whatever is
+   * holding a terminal that long is holding it because it is waiting to be told
+   * something, and it must not be told this. It is named in the tab instead.
+   *
+   * `onSettled` is told which of the two happened; the restore queue waits on it
+   * before starting the next tab. See SessionManager.queueResume.
    */
-  typeWhenReady(command, { run = true } = {}) {
-    if (!this.pty || !command) return;
-    this.cancelPending();
-
+  typeWhenReady(command, { run = true, onSettled = null } = {}) {
+    if (!command) {
+      onSettled?.(false);
+      return;
+    }
     // Carriage return, which is what a terminal sends for Enter; the line
     // discipline turns it into a newline on the way in.
-    this.pending = { text: run ? `${command}\r` : command, settle: null, deadline: null };
-    this.pending.deadline = setTimeout(() => this.flushPending(), SHELL_READY_MS);
-    this.pending.deadline.unref?.();
-  }
+    const text = run ? `${command}\r` : command;
 
-  settlePending() {
-    this.pending.settle = setTimeout(() => this.flushPending(), SHELL_SETTLE_MS);
-    this.pending.settle.unref?.();
-  }
-
-  flushPending() {
-    const waiting = this.pending;
-    if (!waiting) return;
-    this.cancelPending();
-    this.write(waiting.text);
-  }
-
-  cancelPending() {
-    if (!this.pending) return;
-    clearTimeout(this.pending.settle);
-    clearTimeout(this.pending.deadline);
-    this.pending = null;
+    this.whenReady((ready) => {
+      if (ready) {
+        this.write(text);
+      } else if (this.pty) {
+        this.append(
+          `\x1b[38;5;180m     something else is holding this terminal, so this was left for you:  ${command}\x1b[0m\r\n`,
+        );
+      }
+      onSettled?.(ready);
+    });
   }
 
   /** Watch the output go past for a title the program set for itself. */
@@ -249,8 +341,28 @@ export class Session {
     if (text) this.termTitle = lastTitleIn(text) ?? this.termTitle;
   }
 
+  /**
+   * Type into this tab.
+   *
+   * A tab without a shell keeps what is typed at it rather than dropping it. It
+   * only happens for a moment and only during a restore, where the tabs behind
+   * the first one wait for its profile before they get shells of their own (see
+   * SessionManager.restoreFromDisk) — but a terminal that silently eats what you
+   * typed while it was busy is the thing clio exists not to be, and a moment is
+   * exactly long enough to catch somebody who came back to a rebuilt window and
+   * started typing into the tab they had left focused.
+   *
+   * Held to a couple of lines' worth: this is somebody typing, and a buffer
+   * growing without a bound is a buffer waiting for the tab whose shell never
+   * arrives.
+   */
   write(data) {
-    if (this.pty) this.pty.write(data);
+    if (this.pty) {
+      this.pty.write(data);
+      return;
+    }
+    if (this.status === 'exited') return;
+    this.typed = (this.typed + data).slice(-UNTYPED_BYTES);
   }
 
   resize(cols, rows) {

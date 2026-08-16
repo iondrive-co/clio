@@ -188,6 +188,21 @@ const ssh = {
    *
    * Unless there was a command on the end of it, in which case the tab gets it
    * back at the prompt and somebody else can decide whether it runs again.
+   *
+   * `alone` is the one thing here that is about the restore rather than about
+   * this tab, and it is the difference between one question and six. Almost
+   * every ssh config on a desktop has `ControlMaster auto` in it: the first
+   * connection to a host builds a socket and every later one rides it for free,
+   * bastion included, so a jump host that wants a verification code wants it
+   * once. Six connections dialled in the same millisecond all find no socket,
+   * all become masters, and all ask — which is what happened on 15 August, when
+   * six tabs came back and every one of them stopped on a passphrase or a code,
+   * and two of them then lost the race for the socket outright and printed
+   * `Connection closed by UNKNOWN port 65535`. Dialled one at a time, only the
+   * first is asked anything.
+   *
+   * Not on the other branch: that one types the command and leaves it, so it
+   * dials nothing and there is nothing for it to be in the way of.
    */
   resume(state) {
     if (!state?.argv?.length || !state.host) return null;
@@ -200,7 +215,7 @@ const ssh = {
         run: false,
       };
     }
-    return { argv: state.argv, why: `reconnecting to ${where}`, run: true };
+    return { argv: state.argv, why: `reconnecting to ${where}`, run: true, alone: true };
   },
 
   /** The tab is on a host, so the tab is called after the host. */

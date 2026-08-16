@@ -27,6 +27,7 @@
 
 import agents from '../agents/index.js';
 import ssh from '../ssh/index.js';
+import scripts from '../scripts/index.js';
 
 /*
  * Every extension clio ships with, in the order they are asked. A plugin
@@ -35,10 +36,11 @@ import ssh from '../ssh/index.js';
  * through this list.
  *
  * Order is the tie-break when two adapters would both take a process, so the
- * specific go before the general. Nothing collides today: an agent is matched
- * by the program's own name, and ssh only ever answers to ssh.
+ * specific go before the general. It matters now that ../scripts is here: an
+ * npm-installed agent is `node …/cli.js` and a script is `node …/anything.js`,
+ * so the general one is asked last and gets what the others did not want.
  */
-const ADAPTERS = [...agents, ...ssh];
+const ADAPTERS = [...agents, ...ssh, ...scripts];
 
 /*
  * How often an adapter is asked to look again at something it has already
@@ -159,9 +161,14 @@ export function extensionIdentity(record) {
  * Look at what is running in a tab and decide what to remember about it.
  *
  * `foreground` is the process that owns the terminal, or null when the shell is
- * sitting at its prompt. `taken` are the identities every tab has claimed, this
- * one included — its own is subtracted here, so that a tab is never held to be
- * stealing from itself.
+ * sitting at its prompt. `taken` are the identities *other* tabs have claimed.
+ * Working out which of them are other tabs is the daemon's job and cannot be
+ * done from here: this tab's own claim and the same claim held by the tab next
+ * to it are the same string, and only the caller holding both records can tell
+ * the difference. Subtracting it here instead — which is what this did until a
+ * morning when two tabs came back on the same conversation — means a tab whose
+ * claim has already been taken by another one is free to take it straight back,
+ * and the pair of them never come apart again.
  *
  * The rule for forgetting is deliberately about the process rather than about
  * the foreground: something that has been suspended, or that has a pager open
@@ -181,7 +188,7 @@ export function observeExtension(record, { foreground = null, taken = new Set(),
         adapter.capture({
           ...foreground,
           previous: known ? record.state : null,
-          taken: claims(adapter, record, taken),
+          taken: claims(adapter, taken),
         }),
       known ? record.state : null,
     );
@@ -210,15 +217,17 @@ export function observeExtension(record, { foreground = null, taken = new Set(),
 }
 
 /**
- * What this adapter's other tabs have claimed, in its own terms — its prefix
- * stripped back off, and this tab's own claim removed.
+ * What this adapter's other tabs have claimed, in its own terms — nothing but
+ * its prefix stripped back off.
+ *
+ * The set arriving here is already everybody else's; see observeExtension for
+ * why that subtraction belongs to the caller and not to this.
  */
-function claims(adapter, record, taken) {
+function claims(adapter, taken) {
   const prefix = `${adapter.id}${SEP}`;
-  const mine = extensionIdentity(record?.kind === adapter.id ? record : null);
   const claimed = new Set();
   for (const entry of taken) {
-    if (entry !== mine && entry.startsWith(prefix)) claimed.add(entry.slice(prefix.length));
+    if (entry.startsWith(prefix)) claimed.add(entry.slice(prefix.length));
   }
   return claimed;
 }
@@ -233,6 +242,11 @@ function claims(adapter, record, taken) {
  * at the prompt for somebody to press Enter on, which is how an adapter says
  * "this is what was here, and I am not the one who should decide it happens
  * again".
+ *
+ * `alone` is the other thing only an adapter can know: that two of these
+ * starting at the same moment get in each other's way. It is the daemon that
+ * acts on it — this module starts nothing — and all it promises is that no two
+ * resumes of the same kind overlap. See src/ssh, which is the reason it exists.
  */
 export function resumeExtension(record, { cwd = null } = {}) {
   const adapter = adapterFor(record);
@@ -246,6 +260,7 @@ export function resumeExtension(record, { cwd = null } = {}) {
     command: shellQuote(plan.argv),
     why: plan.why || `resuming ${adapter.name}`,
     run: plan.run !== false,
+    alone: plan.alone === true,
   };
 }
 

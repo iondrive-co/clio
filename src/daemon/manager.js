@@ -37,6 +37,39 @@ const RESUME_EXTENSIONS = process.env.CLIO_RESUME !== 'off';
 const SCROLLBACK_FLUSH_MS = 3000;
 const STATE_DEBOUNCE_MS = 400;
 
+/*
+ * How long the first rebuilt shell gets to itself before the rest follow. The
+ * argument for the lead is in restoreFromDisk; this is only the number.
+ *
+ * It ends the moment that shell reaches its own prompt, so on a machine whose
+ * profile has nothing to do it is a few hundred milliseconds and nobody sees
+ * it. What it is sized for is the other case — the profile that stops to ask
+ * for a passphrase — because it is the answer and not the elapsed time that
+ * lets every other tab skip the same work. Twenty seconds is about as long as
+ * a person who is watching the restore takes to notice a prompt and type into
+ * it, and about as long as a screen full of tabs with no shells in them can be
+ * left before it looks broken instead of busy.
+ */
+const RESTORE_LEAD_MS = 20000;
+
+/*
+ * How long one tab's resume is given before the next one starts.
+ *
+ * Resumes of a kind that asked to go one at a time — see queueResume — and the
+ * kind that asks is ssh, for a specific reason: `ControlMaster auto` means the
+ * first connection to a host builds a socket the rest ride for free, including
+ * through a bastion that would otherwise ask each of them for its own 2FA code.
+ * Six dialled at once all miss that socket and all ask.
+ *
+ * So the gap is a guess about a person, not about a connection: long enough to
+ * read a code off a phone and type it, short enough that six hosts are all back
+ * inside a minute. A resume still going when it runs out is not cancelled; the
+ * queue simply stops waiting for it, because the connection sitting at a prompt
+ * nobody is at the desk to answer must not hold the rest of a restore behind it
+ * for the night.
+ */
+const RESUME_GAP_MS = 12000;
+
 // Container ids travel in window URLs and come back from whatever a window asks
 // for, so keep the shape narrow rather than trusting the string.
 const CONTAINER_ID = /^[a-f0-9]{4,32}$/;
@@ -141,6 +174,13 @@ export class SessionManager extends EventEmitter {
      * reach the session bus, is a terminal that quietly does not work.
      */
     this.launchEnv = {};
+
+    /**
+     * Tabs waiting their turn to bring something back, one queue per kind of
+     * thing. See queueResume — the queues are empty except in the half-minute
+     * after a restore.
+     */
+    this.resumeQueues = new Map();
 
     this.procTimer = setInterval(() => this.pollProcInfo(), PROC_POLL_MS);
     this.flushTimer = setInterval(() => this.flushScrollback(), SCROLLBACK_FLUSH_MS);
@@ -418,6 +458,7 @@ export class SessionManager extends EventEmitter {
       return legacy.id;
     };
 
+    const rebuilt = [];
     for (const saved of sessions) {
       if (!saved?.id) continue;
       const session = new Session({
@@ -437,9 +478,46 @@ export class SessionManager extends EventEmitter {
       this.sessions.set(session.id, session);
       // Saved from the window that was showing it, so the first prompt is drawn
       // at roughly the right width instead of 80 columns.
-      this.reopen(session, { cols: saved.cols, rows: saved.rows });
+      rebuilt.push({ session, cols: saved.cols, rows: saved.rows });
     }
     pruneScrollback(new Set(this.sessions.keys()));
+
+    /*
+     * One shell first, and the rest behind it.
+     *
+     * Rebuilding them all in the same millisecond is a thing no terminal has
+     * ever done to a login profile. A person opens tabs one at a time, and a
+     * profile that has something to do once — unlock a keyring, put an ssh key
+     * into an agent — is written for that and is idempotent afterwards rather
+     * than concurrent during. On 15 August 24 tabs came back at 22:48:13, 24
+     * copies of `keychain` went for an agent that had just been started empty,
+     * 18 of them printed `Problem adding; giving up`, and the key never got in
+     * — so the six tabs that then reconnected to hosts had to ask for the
+     * passphrase one at a time, on their own, in tabs nobody was looking at.
+     *
+     * One is enough to fix that, because the profile's own idempotence does the
+     * rest: the second keychain finds the key already there and says nothing.
+     * So this is a lead and not a queue — the first shell, then everybody.
+     *
+     * What the lead is really waiting for is a person, which is why the cap is
+     * as long as it is: the first profile is where the one passphrase prompt
+     * now appears, and a cap that runs out before it can be answered buys
+     * nothing, because it is the answer and not the elapsed time that lets the
+     * other 23 skip the work. Against that, every one of those tabs is without
+     * a shell until it is over, so it cannot be much longer either. When it
+     * does run out the old behaviour is what returns, which is survivable, and
+     * anything typed into a tab in the meantime is kept — see Session.write.
+     */
+    const [first, ...rest] = rebuilt;
+    if (!first) return this.list().length;
+
+    const follow = rest.length
+      ? () => {
+          for (const { session, cols, rows } of rest) this.reopen(session, { cols, rows });
+        }
+      : null;
+    this.reopen(first.session, { cols: first.cols, rows: first.rows, then: follow });
+
     return this.list().length;
   }
 
@@ -572,8 +650,15 @@ export class SessionManager extends EventEmitter {
    * a connection. Both run nothing that was not already run. The seam says what
    * is about to happen before it happens, and an extension that is not sure
    * enough can ask for its command to be left at the prompt unrun instead.
+   *
+   * `then` is called once this tab has got through its profile — and, if it was
+   * holding something, once that has been typed into it. It is how the restore
+   * holds the rest of the tabs back behind the first; see restoreFromDisk. It
+   * runs whatever happens, including when no shell could be started at all,
+   * because a restore that stops halfway through is worse than any of the
+   * things waiting for it.
    */
-  reopen(session, { cols, rows } = {}) {
+  reopen(session, { cols, rows, then = null } = {}) {
     const known = resumeExtension(session.ext, { cwd: session.cwd });
     const plan = RESUME_EXTENSIONS ? known : null;
 
@@ -617,12 +702,13 @@ export class SessionManager extends EventEmitter {
       // Say so in the tab itself. The alternative is a pane that silently
       // swallows everything typed into it.
       session.append(`\x1b[38;5;203m──── no shell could be started: ${err.message} ────\x1b[0m\r\n`);
+      then?.();
       return session;
     }
 
     if (plan) {
       console.log(`[clio] ${session.id}: ${describeExtension(session.ext)} — ${plan.command}`);
-      session.typeWhenReady(plan.command, { run: plan.run });
+      this.queueResume(session, plan, then);
       // The record is kept, pointing at no process yet: whatever it names is on
       // its way and the poll will pick it up. Keeping it is also what makes a
       // second crash, before that happens, bring the same thing back again —
@@ -630,6 +716,8 @@ export class SessionManager extends EventEmitter {
       // once nobody has pressed Enter on it for long enough.
       session.ext = { ...session.ext, pid: null, resumedAt: Date.now() };
     } else {
+      // Nothing to type, so the only thing left to wait for is the profile.
+      if (then) session.whenReady(() => then(), { cap: RESTORE_LEAD_MS });
       // Nothing was brought back, so nothing is being held. Saying otherwise
       // would leave the tab offering to resume something that is not there.
       session.ext = null;
@@ -639,6 +727,80 @@ export class SessionManager extends EventEmitter {
     this.scheduleSave();
     this.emit('update');
     return session;
+  }
+
+  /**
+   * Bring back what a tab was holding — now, or when it is this tab's turn.
+   *
+   * Most things have no turn to wait for. Nine conversations reopening together
+   * do not notice each other, so they are typed the moment their shells are
+   * ready and that is the whole of it.
+   *
+   * An adapter that asked for `alone` is saying the opposite: that two of these
+   * starting at once get in each other's way, and the daemon is the only one
+   * that can see the other tabs and do anything about it. ssh is the one that
+   * asks, and the reason is in src/ssh — a shared connection to a bastion that
+   * six simultaneous dials all miss and all have to authenticate around.
+   *
+   * One queue per kind rather than one queue: waiting is a promise made between
+   * things of the same sort, and there is no reason for an agent to be behind a
+   * connection or the other way about.
+   */
+  queueResume(session, plan, then = null) {
+    if (!plan.alone) {
+      session.typeWhenReady(plan.command, { run: plan.run, onSettled: () => then?.() });
+      return;
+    }
+
+    const queue = this.resumeQueues.get(plan.kind) || [];
+    queue.push({ session, plan, then });
+    this.resumeQueues.set(plan.kind, queue);
+    if (queue.length === 1) this.nextResume(plan.kind);
+  }
+
+  /**
+   * Type the resume at the head of a queue, and set the clock running on the
+   * one after it.
+   *
+   * The gap is a guess about a person, because what the first one is buying for
+   * the rest is an answer — a passphrase, a verification code — and only a
+   * person has that. It is not a promise that the first has finished: a resume
+   * still going when the gap runs out is not cancelled, and the queue simply
+   * stops waiting for it. That is deliberate. The connection sitting at a code
+   * prompt nobody is at the desk to answer must not hold the rest of a restore
+   * behind it for the night.
+   */
+  nextResume(kind) {
+    const queue = this.resumeQueues.get(kind);
+    const head = queue?.[0];
+    if (!head) {
+      this.resumeQueues.delete(kind);
+      return;
+    }
+
+    // Once: the gap and the shell can both get here, and shifting twice would
+    // step over a tab's resume without ever typing it.
+    let moved = false;
+    const advance = () => {
+      if (moved) return;
+      moved = true;
+      clearTimeout(gap);
+      queue.shift();
+      this.nextResume(kind);
+    };
+
+    const gap = setTimeout(advance, RESUME_GAP_MS);
+    gap.unref?.();
+
+    head.session.typeWhenReady(head.plan.command, {
+      run: head.plan.run,
+      onSettled: (typed) => {
+        head.then?.();
+        // Never typed, because something else had the terminal for the whole of
+        // its wait. Nothing was dialled, so there is nothing to give room to.
+        if (!typed) advance();
+      },
+    });
   }
 
   close(id) {
@@ -717,14 +879,40 @@ export class SessionManager extends EventEmitter {
    */
   pollExtensions() {
     const sessions = [...this.sessions.values()];
-    // What every tab has claimed, as strings this has no business reading —
-    // it is for the extension host to know that two agents open in one
-    // directory must not be recorded as the same conversation.
-    const claimed = new Set(sessions.map((s) => extensionIdentity(s.ext)).filter(Boolean));
+
+    /*
+     * What every tab has claimed, as strings this has no business reading — it
+     * is for the extension host to know that two agents open in one directory
+     * must not be recorded as the same conversation.
+     *
+     * Counted rather than collected, and kept up to date as the loop goes, and
+     * both of those are the same bug seen from two sides. It was built once
+     * from the records this pass started with and then never touched again, so
+     * two tabs that both changed their minds in one pass could change them to
+     * the same thing — which on 15 August is how two tabs in ~/ops came back
+     * running `claude --resume f7147610`, the same conversation, twice. And the
+     * count is what lets a tab find its own claim already taken: one entry with
+     * two holders survives the subtraction below, so the tab is asked to pick
+     * again instead of quietly keeping the collision.
+     */
+    const holders = new Map();
+    const hold = (id, by) => {
+      if (!id) return;
+      const now = (holders.get(id) || 0) + by;
+      if (now > 0) holders.set(id, now);
+      else holders.delete(id);
+    };
+    for (const session of sessions) hold(extensionIdentity(session.ext), 1);
 
     let changed = false;
     for (const session of sessions) {
       const fg = session.foreground;
+
+      // Everything anybody *else* is holding, which is this tab's own claim put
+      // down for the length of the question and picked back up after it.
+      const was = extensionIdentity(session.ext);
+      hold(was, -1);
+      const claimed = new Set(holders.keys());
 
       const { record, changed: moved } = observeExtension(session.ext, {
         // Read lazily: everything but argv and exe costs a trip to /proc, and
@@ -748,6 +936,7 @@ export class SessionManager extends EventEmitter {
       });
 
       session.ext = record;
+      hold(extensionIdentity(record), 1);
       if (moved) changed = true;
     }
     return changed;

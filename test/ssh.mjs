@@ -153,6 +153,11 @@ const HOST = 'p-fsn-095.test.invalid';
 const DIALLED = `ssh -o "ProxyCommand=sleep 900" -o ControlMaster=no -L :9999:localhost:8500 safe@${HOST}`;
 const WITH_COMMAND = `ssh -o "ProxyCommand=sleep 900" build-01.test.invalid make deploy`;
 
+// A second host, for the one thing that cannot be seen with only one: that two
+// connections coming back do not come back together. See section 4b.
+const HOST2 = 'i-hel-009.test.invalid';
+const DIALLED2 = `ssh -o "ProxyCommand=sleep 900" ops@${HOST2}`;
+
 let daemon = null;
 
 /**
@@ -302,6 +307,49 @@ async function savedOnce(pred, timeout = 5000) {
   return last ?? { sessions: [] };
 }
 
+/**
+ * Note when each of these tabs first says the thing it is watched for.
+ *
+ * Times are milliseconds from the moment this was set up, which is as close to
+ * the restore as a test can get, and they are only ever compared with each
+ * other. `settled` waits until every tab has been seen or the wait runs out,
+ * and gives back what it has either way — a tab that never says its piece is an
+ * Infinity, which fails the check that asked rather than hanging it.
+ */
+function watchFor(client, wanted) {
+  const started = Date.now();
+  const at = {};
+  for (const id of Object.keys(wanted)) at[id] = Infinity;
+
+  const look = () => {
+    for (const [id, text] of Object.entries(wanted)) {
+      if (Number.isFinite(at[id])) continue;
+      // Only what this tab has said since it was given a new shell, and only
+      // below the seam rather than including it. Everything it said on the
+      // same subject before the crash is still in its scrollback, and the seam
+      // itself names the host it is about to dial — either would otherwise read
+      // as a connection made instantly.
+      const seen = client.output.get(id) || '';
+      const seam = seen.lastIndexOf('──── new shell');
+      const below = seam === -1 ? -1 : seen.indexOf('\n', seam);
+      if (below !== -1 && seen.slice(below).includes(text)) at[id] = Date.now() - started;
+    }
+    return Object.values(at).every(Number.isFinite);
+  };
+
+  const timer = setInterval(look, 100);
+  timer.unref?.();
+
+  return {
+    async settled(timeout) {
+      const deadline = Date.now() + timeout;
+      while (Date.now() < deadline && !look()) await sleep(100);
+      clearInterval(timer);
+      return at;
+    },
+  };
+}
+
 /* ------------------------------------------------------------------- the test */
 
 async function main() {
@@ -330,9 +378,17 @@ async function main() {
   const workTab = await client.await((m) => m.t === 'created' && m.id !== sshTab.id);
   check('and one to run something over ssh', !!workTab);
 
+  client.send({ t: 'create', cwd: WORK, cols: 80, rows: 24 });
+  const otherTab = await client.await(
+    (m) => m.t === 'created' && m.id !== sshTab.id && m.id !== workTab.id,
+  );
+  check('and one on a second host', !!otherTab);
+  if (!otherTab) return report();
+
   await sleep(800);
   client.send({ t: 'input', id: sshTab.id, data: `${DIALLED}\n` });
   client.send({ t: 'input', id: workTab.id, data: `${WITH_COMMAND}\n` });
+  client.send({ t: 'input', id: otherTab.id, data: `${DIALLED2}\n` });
 
   const named = await client.until(sshTab.id, (t) => t?.ext?.title === HOST);
   check('the tab calls itself by the host', named, JSON.stringify(client.tab(sshTab.id)?.ext));
@@ -392,7 +448,18 @@ async function main() {
   await back.connect();
   await back.await((m) => m.t === 'sessions');
 
+  // Both tabs before anything else is asked, because a window is only sent the
+  // output of the tabs it is showing, and what section 4b is about is *when*
+  // each of these two was dialled — there is no second chance to have been
+  // watching.
   back.send({ t: 'attach', id: sshTab.id, cols: 80, rows: 24 });
+  back.send({ t: 'attach', id: otherTab.id, cols: 80, rows: 24 });
+  await back.await((m) => m.t === 'attached' && m.id === otherTab.id);
+  const dialledAt = watchFor(back, {
+    [sshTab.id]: `safe@${HOST}`,
+    [otherTab.id]: `ops@${HOST2}`,
+  });
+
   const replayed = (await back.await((m) => m.t === 'attached' && m.id === sshTab.id))?.scrollback || '';
   check(
     'the seam says which host is being dialled again',
@@ -428,6 +495,29 @@ async function main() {
   );
   check('and ssh is running in the tab again, on the same host', running,
     JSON.stringify(back.tab(sshTab.id)));
+
+  console.log('\n4b. two connections are not dialled at once');
+  /*
+   * The restore this is written for put six tabs back on six hosts in the same
+   * millisecond. Every one of them missed the ControlMaster socket the first
+   * would have built, so every one of them asked the bastion for its own
+   * verification code, in six tabs at once — and two lost the race for the
+   * socket outright and came back `Connection closed by UNKNOWN port 65535`.
+   * The adapter now says these go one at a time (`alone`), and the daemon holds
+   * the second one back; see queueResume.
+   *
+   * The gap is a wait for a person and the assertion is deliberately loose
+   * about its length. What must be true is only that the second connection was
+   * not dialled while the first was still being answered.
+   */
+  const spacing = await dialledAt.settled(40000);
+  check('the first host was dialled', Number.isFinite(spacing[sshTab.id]), JSON.stringify(spacing));
+  check('and so was the second', Number.isFinite(spacing[otherTab.id]), JSON.stringify(spacing));
+  check(
+    'but not until the first had had the terminal to itself',
+    spacing[otherTab.id] - spacing[sshTab.id] > 5000,
+    `${Math.round((spacing[otherTab.id] - spacing[sshTab.id]) / 100) / 10}s apart`,
+  );
 
   console.log('\n5. the one that was running a command is not run');
   back.send({ t: 'attach', id: workTab.id, cols: 80, rows: 24 });
@@ -491,6 +581,7 @@ async function main() {
   await final.await((m) => m.t === 'sessions');
   final.send({ t: 'close', id: sshTab.id });
   final.send({ t: 'close', id: workTab.id });
+  final.send({ t: 'close', id: otherTab.id });
   await sleep(600);
   final.close();
 
