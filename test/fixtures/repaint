@@ -1,0 +1,31 @@
+#!/usr/bin/env node
+/*
+ * A stand-in for a full-screen program, for the activity tests.
+ *
+ * It does the one thing that makes a tab lie about having news in it: it asks
+ * to hear about focus (DECSET 1004) the way Claude Code does, and it paints
+ * something whenever the terminal tells it anything — a focus report, or a
+ * SIGWINCH. Both of those are clio talking rather than the user, so neither
+ * may turn the tab red.
+ *
+ * Every repaint is numbered, so a test can say which one it is looking at.
+ */
+let painted = 0;
+const paint = (why) => process.stdout.write(`\r\n[repaint ${++painted}: ${why}]`);
+
+process.stdout.write('\x1b[?1004h');
+process.stdout.on('resize', () => paint('winch'));
+
+if (process.stdin.isTTY) process.stdin.setRawMode(true);
+process.stdin.on('data', (data) => {
+  const seen = data.toString();
+  // Anything else is somebody typing, and what a program draws in answer to
+  // that is news: a tab nobody is looking at should go red for it.
+  if (seen.includes('\x1b[I')) paint('focus in');
+  else if (seen.includes('\x1b[O')) paint('focus out');
+  else paint('typed');
+});
+
+paint('start');
+// Hold the terminal, as the program it stands in for would.
+setInterval(() => {}, 1 << 30);

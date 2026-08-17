@@ -909,8 +909,75 @@ async function main() {
   check('looking at it clears the flag',
     !(await bgTab.evaluate((e) => e.classList.contains('activity'))));
 
+  // ---- a repaint clio asked for is not activity ---------------------------
+  //
+  // A full-screen program draws its whole screen again when the terminal tells
+  // it something: the pane lost the keyboard, the pane got it back, the size
+  // moved. All three are clio talking to it — nobody typed, nothing happened
+  // in that tab — and for a row of agents that is the difference between a red
+  // tab meaning "your turn" and meaning nothing at all.
+  console.log('\n15b. repaints clio caused itself');
+  await page.locator('#newtab').click();
+  await page.waitForTimeout(1200);
+  const agentTab = await page.evaluate(() => activeId);
+  await page.evaluate(
+    (fixture) => send({ t: 'input', id: activeId, data: `node ${fixture}\r` }),
+    join(process.cwd(), 'test', 'fixtures', 'repaint'),
+  );
+  await page.waitForTimeout(1500);
+
+  const agentFlagged = () =>
+    page.locator(`.tab[data-id="${agentTab}"]`).evaluate((e) => e.classList.contains('activity'));
+  check('the tab it is running in starts clean', !(await agentFlagged()));
+
+  // Leaving a tab blurs its pane, and the program answers with a repaint.
+  await page.locator(`.tab[data-id="${watched}"]`).click();
+  await page.waitForTimeout(1500);
+  check('moving to another tab does not flag the one just left', !(await agentFlagged()));
+
+  // A window whose socket dropped — a daemon that crashed, a machine that
+  // slept, a screen that locked — comes back to the same tabs and has to say
+  // again which one it is showing. If it does not, the daemon counts every tab
+  // in the window as unwatched, and the redraw that reattaching provokes lands
+  // as unseen activity on the tab the user is looking at.
+  await page.locator(`.tab[data-id="${agentTab}"]`).click();
+  await page.waitForTimeout(1200);
+  await page.evaluate(() => ws.close());
+  await page.waitForTimeout(3000);
+  check('the tab on screen is not flagged after a reconnect', !(await agentFlagged()));
+  check(
+    'and the window is working again',
+    await page.evaluate(() => ws.readyState === WebSocket.OPEN),
+  );
+
+  // The same again as a window that was already open when this was fixed: its
+  // page is the old one, it will not say `focus` on the way back, and it
+  // cannot be made to without being reloaded out from under whoever is using
+  // it. All the daemon gets is the attach, which is only ever sent for the tab
+  // going on screen — so that has to be enough on its own.
+  await page.evaluate(() => {
+    window.beforeTheFix = window.send;
+    window.send = (msg) => {
+      if (msg.t !== 'focus') window.beforeTheFix(msg);
+    };
+  });
+  await page.evaluate(() => ws.close());
+  await page.waitForTimeout(3000);
+  check('a window that says nothing but attach is still counted as watching',
+    !(await agentFlagged()));
+  await page.evaluate(() => {
+    window.send = window.beforeTheFix;
+  });
+
+  // What must still get through: the program itself saying something.
+  await page.locator(`.tab[data-id="${watched}"]`).click();
+  await page.waitForTimeout(1200);
+  await page.evaluate((id) => send({ t: 'input', id, data: '\r' }), agentTab);
+  await page.waitForTimeout(2000);
+  check('real output in a background tab is still flagged', await agentFlagged());
+
   // ---- closing every tab but one -----------------------------------------
-  console.log('\n15b. close other tabs');
+  console.log('\n15c. close other tabs');
   while ((await page.locator('.tab').count()) < 3) {
     await page.locator('#newtab').click();
     await page.waitForTimeout(1200);

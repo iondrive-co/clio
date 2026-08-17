@@ -42,6 +42,17 @@ const SHELL_READY_MS = 30000;
  */
 const UNTYPED_BYTES = 4096;
 
+/*
+ * How long a program has to answer clio before the answer stops being clio's.
+ *
+ * A repaint starts as soon as the program reads the byte that asked for it, so
+ * this only has to cover the first chunk of the answer — the rest arrives
+ * behind it, and by then the tab has already been counted one way or the
+ * other. Half a second is generous for that, and short enough that a command
+ * somebody started in this tab and left running still reads as activity.
+ */
+const REDRAW_MS = 500;
+
 let nextOrder = 0;
 
 export class Session {
@@ -93,6 +104,18 @@ export class Session {
     this.dirty = false;
     /** Output has arrived since anyone last looked at this session. */
     this.unseenOutput = false;
+    /**
+     * When clio last asked the program in here to draw itself again.
+     *
+     * A focus report and a SIGWINCH are clio talking, not the user: the window
+     * lost the keyboard, the tab beside this one was clicked, the socket came
+     * back. A full-screen program answers by painting its screen over again,
+     * and that answer is not news — nothing happened in this tab, and a tab
+     * that goes red for it is telling the row something untrue. Noted here so
+     * that the output which follows can be recognised for what it is; see
+     * unseen activity in ./index.js.
+     */
+    this.redrawAskedAt = 0;
 
     this.onData = null; // set by the manager to fan out to attached clients
     this.onExit = null;
@@ -412,10 +435,13 @@ export class Session {
     const { cols, rows } = this;
     if (cols <= 1) return;
     try {
+      this.redrawAskedAt = Date.now();
       this.pty.resize(cols - 1, rows);
       setTimeout(() => {
         try {
-          if (this.pty) this.pty.resize(cols, rows);
+          if (!this.pty) return;
+          this.redrawAskedAt = Date.now();
+          this.pty.resize(cols, rows);
         } catch {
           /* ignore */
         }
@@ -423,6 +449,11 @@ export class Session {
     } catch {
       /* ignore */
     }
+  }
+
+  /** Is the output arriving now the answer to something clio asked for? */
+  redrawingForClio() {
+    return Date.now() - this.redrawAskedAt < REDRAW_MS;
   }
 
   /** Refresh cwd + running command from /proc. Cheap enough to poll. */

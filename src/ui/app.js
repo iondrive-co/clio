@@ -218,7 +218,17 @@ function connect() {
       pane.attached = false;
       pane.term.reset();
     }
-    if (activeId) attach(activeId);
+    if (activeId) {
+      attach(activeId);
+      // Say again which tab is on screen. The daemon forgot when the socket
+      // went — a reconnect is a new client, and a client that has not said
+      // what it is watching has every tab in its window counted as unwatched.
+      // Nothing here has changed for the user, so nothing should look as
+      // though it has: the repaint that attaching provokes in a full-screen
+      // program would otherwise land as unseen activity on the very tab they
+      // are looking at, and stay red until they clicked on it.
+      send({ t: 'focus', id: activeId });
+    }
   };
 
   ws.onmessage = (event) => handle(JSON.parse(event.data));

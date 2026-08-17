@@ -67,6 +67,10 @@ const UI_WATCH_DEBOUNCE_MS = 300;
 // not eventually.
 const BIND_ATTEMPTS = 25;
 
+// What a pane sends a program that asked to hear about focus (DECSET 1004):
+// \e[I when it has the keyboard, \e[O when it loses it. Nobody types these.
+const FOCUS_REPORT = /^(?:\x1b\[[IO])+$/;
+
 // A sandbox instance: started with XDG_RUNTIME_DIR and XDG_STATE_HOME pointed
 // somewhere disposable, so it has its own port, state and browser profile and
 // shares nothing with the clio holding real shells. Set it by hand or from a
@@ -1128,8 +1132,11 @@ async function main() {
 
     // Flag activity in tabs nobody is looking at. Only the false->true edge
     // broadcasts, so a chatty build does not spam every window with updates.
+    //
+    // A screen a program drew again because clio asked it to is not activity:
+    // see redrawingForClio, and FOCUS_REPORT below for what does the asking.
     const session = manager.get(id);
-    if (session && !session.unseenOutput && !watchedByAnyone(id)) {
+    if (session && !session.unseenOutput && !watchedByAnyone(id) && !session.redrawingForClio()) {
       session.unseenOutput = true;
       broadcastSessions();
     }
@@ -1330,6 +1337,14 @@ async function main() {
             break;
           }
           client.attached.add(session.id);
+          // A window only ever attaches the tab it is about to put on screen,
+          // so attaching is also the answer to which one it is showing. Taken
+          // as one here because it is the only answer some windows give: a
+          // page from before the focus was re-sent on reconnect says nothing
+          // else for as long as it stays open, and its tabs would go on being
+          // counted as watched by nobody — red for a redraw, and staying red
+          // while the user looked straight at them.
+          focus(session.id);
           if (msg.cols && msg.rows) manager.resize(session.id, msg.cols, msg.rows);
           send({
             t: 'attached',
@@ -1347,7 +1362,18 @@ async function main() {
           break;
 
         case 'input':
-          if (mine(msg.id)) manager.write(msg.id, msg.data);
+          if (mine(msg.id)) {
+            // Everything else in here is somebody typing. A focus report is
+            // the window itself, sent by xterm whenever a pane gains or loses
+            // the keyboard — which happens when the tab beside it is clicked,
+            // and to every window on the desktop when the screen locks. The
+            // repaint that comes back must not turn the tab red.
+            if (FOCUS_REPORT.test(msg.data)) {
+              const session = manager.get(msg.id);
+              if (session) session.redrawAskedAt = Date.now();
+            }
+            manager.write(msg.id, msg.data);
+          }
           break;
 
         case 'resize':
