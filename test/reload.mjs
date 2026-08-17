@@ -238,6 +238,39 @@ async function main() {
   );
 
   win.send({ t: 'rename', id, title: 'work-in-progress' });
+
+  // A second tab that names itself the way an agent does, and then says a
+  // great deal more. The title goes past the end of the scrollback that is
+  // kept, which is where the name of any tab that has been quiet for an hour
+  // ends up — and reading the name back out of the buffer is the only thing
+  // the successor could do about it if it were not handed over.
+  win.send({ t: 'create', cwd: '/tmp', cols: 80, rows: 24 });
+  const quietTab = await win.await((m) => m.t === 'created' && m.id !== id);
+  check('a second tab to be quiet in', !!quietTab);
+  const quiet = quietTab?.id;
+  await sleep(600);
+
+  // All one line, and it ends by holding the terminal: bash writes the title
+  // itself from its prompt, so a tab that gets its prompt back is a tab named
+  // after its directory again — which is not what an agent sitting in the
+  // foreground of one looks like. The output after the title is past the 512K
+  // the daemon keeps, so the line that named it is gone from the buffer and
+  // only the daemon's own memory of it is left.
+  win.send({
+    t: 'input',
+    id: quiet,
+    data:
+      'printf "\\033]0;a-job-with-a-name\\007"; ' +
+      'head -c 700000 /dev/zero | tr "\\0" x; echo; sleep 987654\n',
+  });
+  const named = await win.await(
+    (m) =>
+      m.t === 'sessions' &&
+      m.sessions.find((s) => s.id === quiet)?.termTitle === 'a-job-with-a-name',
+    10000,
+  );
+  check('the tab is named after what it says it is doing', !!named);
+
   // Past the scrollback flush, so nothing here depends on lucky timing.
   await sleep(3500);
 
@@ -273,6 +306,17 @@ async function main() {
   check('the tab is still there', !!tab);
   check('with the same shell behind it', tab?.pid === shellPid, `${shellPid} -> ${tab?.pid}`);
   check('still named what it was named', tab?.title === 'work-in-progress');
+
+  // The name a program gave itself, for a tab that has since talked its own
+  // title out of the scrollback. Read back out of the buffer it would be gone,
+  // and the tab would come back called `bash` — or, on a desktop full of
+  // agents, `claude`.
+  const quietAfter = listed?.sessions.find((s) => s.id === quiet);
+  check(
+    'and a quiet tab still called what it called itself',
+    quietAfter?.termTitle === 'a-job-with-a-name',
+    JSON.stringify(quietAfter?.termTitle),
+  );
   check('still in the directory it was in', tab?.cwd === '/tmp', tab?.cwd);
 
   win2.send({ t: 'attach', id, cols: 80, rows: 24 });

@@ -130,6 +130,13 @@ body {
   box-shadow: inset -2px 0 0 var(--accent);
 }
 
+/* A file held over the tab bar. The tab it would land in says so, the same way
+   the pane does below — a drop that goes into the tab you were not looking at
+   is the one thing this has to be clear about. */
+.tab.dropping {
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
 .tab-title {
   flex: 1;
   overflow: hidden;
@@ -281,6 +288,17 @@ body {
 
 .pane.active {
   display: flex;
+}
+
+/* Drawn over the terminal rather than around it: a border on the pane itself
+   would take two columns off the grid the moment a file crossed the window. */
+.pane.dropping::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  border: 2px dashed var(--accent);
+  border-radius: 3px;
 }
 
 .term {

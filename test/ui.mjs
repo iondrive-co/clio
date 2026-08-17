@@ -969,9 +969,20 @@ async function main() {
     window.send = window.beforeTheFix;
   });
 
-  // What must still get through: the program itself saying something.
+  // And the housekeeping an agent does on its own, with nobody near it: modes
+  // put back, a charset reset, its own tab renamed. Bytes out of the pty, and
+  // nothing on the screen to show for any of it.
   await page.locator(`.tab[data-id="${watched}"]`).click();
   await page.waitForTimeout(1200);
+  await page.evaluate((id) => send({ t: 'input', id, data: 'q' }), agentTab);
+  await page.waitForTimeout(2000);
+  check('output that draws nothing does not flag a tab', !(await agentFlagged()));
+
+  await page.evaluate((id) => send({ t: 'input', id, data: 't' }), agentTab);
+  await page.waitForTimeout(2000);
+  check('nor does a tab renaming itself', !(await agentFlagged()));
+
+  // What must still get through: the program itself saying something.
   await page.evaluate((id) => send({ t: 'input', id, data: '\r' }), agentTab);
   await page.waitForTimeout(2000);
   check('real output in a background tab is still flagged', await agentFlagged());

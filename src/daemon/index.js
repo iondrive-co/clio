@@ -7,8 +7,10 @@ import { join, dirname, extname } from 'node:path';
 import { WebSocketServer } from 'ws';
 
 import { ensureDirs, HANDSHAKE_FILE, HANDOVER_FILE, IDENTITY_FILE } from './paths.js';
-import { isAlive } from './procinfo.js';
+import { isAlive, cwdOf } from './procinfo.js';
+import { locate, spool, quote, searchBudget, MAX_SPOOL_BYTES } from './drops.js';
 import { SessionManager } from './manager.js';
+import { drawsSomething } from './output.js';
 import { openBrowserWindow, openUrl } from './window.js';
 
 const ENTRY = fileURLToPath(import.meta.url);
@@ -70,6 +72,15 @@ const BIND_ATTEMPTS = 25;
 // What a pane sends a program that asked to hear about focus (DECSET 1004):
 // \e[I when it has the keyboard, \e[O when it loses it. Nobody types these.
 const FOCUS_REPORT = /^(?:\x1b\[[IO])+$/;
+
+// Dropping a directory of holiday photos on a terminal is a mistake, and one
+// path per file is not what the person meant. Enough for a handful of files.
+const MAX_DROP_FILES = 20;
+
+// A window that asked for a drop and then never sent the bytes — closed
+// mid-drag, or a file that went away under it. The drop finishes with whatever
+// did arrive rather than being left half-done for the life of the daemon.
+const DROP_WAIT_MS = 30000;
 
 // A sandbox instance: started with XDG_RUNTIME_DIR and XDG_STATE_HOME pointed
 // somewhere disposable, so it has its own port, state and browser profile and
@@ -732,6 +743,14 @@ async function main() {
         // disk, where a reboot would make it somebody else's pid.
         extPid: session.ext?.pid ?? null,
         unseenOutput: session.unseenOutput,
+        // What the program in the tab last called itself. The successor can
+        // read titles out of the scrollback and does, but only the ones still
+        // in it: a tab that has said nothing since it named itself has that
+        // line a long way back, and often past the end of what is kept. The
+        // name is in memory here and costs nothing to hand over, and a
+        // handover that renames half the row to `claude` is the least
+        // invisible thing this could possibly do.
+        termTitle: session.termTitle,
         fd: null,
       };
       // A tab whose shell has already died has nothing to pass on. The
@@ -1135,8 +1154,15 @@ async function main() {
     //
     // A screen a program drew again because clio asked it to is not activity:
     // see redrawingForClio, and FOCUS_REPORT below for what does the asking.
+    // Neither is output that puts nothing on the screen; see ./output.js.
     const session = manager.get(id);
-    if (session && !session.unseenOutput && !watchedByAnyone(id) && !session.redrawingForClio()) {
+    if (
+      session &&
+      !session.unseenOutput &&
+      !watchedByAnyone(id) &&
+      !session.redrawingForClio() &&
+      drawsSomething(data)
+    ) {
       session.unseenOutput = true;
       broadcastSessions();
     }
@@ -1198,6 +1224,105 @@ async function main() {
      * close, a shell belonging to a window somewhere else on the desktop.
      */
     const mine = (id) => manager.get(id)?.container === client.container;
+
+    /*
+     * Files dragged onto this window, waiting on their bytes.
+     *
+     * A drop is two exchanges rather than one. The window says what was
+     * dropped — name, size, modification time — and the daemon answers with
+     * the ones it could not find on disk, which are the only ones it needs the
+     * contents of. That is what keeps a folder, or the 700MB video already
+     * sitting in ~/Downloads, from being read into a page and pushed through a
+     * socket to arrive at the path it had all along.
+     *
+     * They live and die with the socket: a window that goes away takes its
+     * half-finished drops with it.
+     */
+    const drops = new Map();
+
+    const forgetDrop = (token) => {
+      const pending = drops.get(token);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      drops.delete(token);
+    };
+
+    /** Hand the window the line to type, and say what could not be worked out. */
+    const finishDrop = (token) => {
+      const pending = drops.get(token);
+      if (!pending) return;
+      forgetDrop(token);
+
+      const paths = pending.paths.filter(Boolean);
+      // A trailing space, so a second file dropped after the first does not
+      // arrive stuck to it, and so a path is a finished word either way.
+      const text = paths.length ? `${paths.map(quote).join(' ')} ` : '';
+      send({
+        t: 'droptext',
+        drop: token,
+        id: pending.id,
+        text,
+        note: pending.notes.join(' ') || null,
+      });
+
+      if (paths.length) {
+        console.log(`[clio] dropped into ${pending.id}: ${paths.join(', ')}`);
+      }
+    };
+
+    /**
+     * Work out a path for everything in a drop, and ask for what is missing.
+     *
+     * Nothing here is trusted: the window is only reporting what a drag handed
+     * it. Names go through drops.js before they are used as names, sizes decide
+     * only whether a copy is worth making, and a file the daemon cannot place
+     * and cannot copy costs the drop that one path and nothing else.
+     */
+    const beginDrop = (token, id, items) => {
+      const session = manager.get(id);
+      // Straight from /proc rather than the session's copy, which is refreshed
+      // on a poll: somebody who has just cd'd into the directory the file is in
+      // and dropped it there is exactly the case this has to get right.
+      const cwd = (session && cwdOf(session.shellPid)) || session?.cwd || null;
+      // One budget for the whole drop: see searchBudget.
+      const budget = searchBudget();
+
+      const paths = [];
+      const notes = [];
+      const need = [];
+
+      items.forEach((raw, index) => {
+        const item = {
+          name: String(raw?.name ?? ''),
+          size: Number(raw?.size),
+          mtime: Number(raw?.mtime),
+          dir: !!raw?.dir,
+        };
+        paths[index] = locate(item, { cwd, home: process.env.HOME, budget });
+        if (paths[index]) return;
+
+        const named = item.name ? `“${item.name}”` : 'that';
+        if (item.dir) {
+          // A folder has no bytes to copy: either it is on this disk or there
+          // is nothing to type.
+          notes.push(`clio could not find the folder ${named} — dropping one only works for a folder on this machine.`);
+        } else if (!(item.size >= 0) || item.size > MAX_SPOOL_BYTES) {
+          notes.push(`${named} is not on this disk and is too big for clio to keep a copy of.`);
+        } else {
+          need.push(index);
+        }
+      });
+
+      const timer = setTimeout(() => {
+        notes.push('The rest of that drop never arrived.');
+        finishDrop(token);
+      }, DROP_WAIT_MS);
+      timer.unref?.();
+
+      drops.set(token, { id, items, paths, notes, need: new Set(need), timer });
+      if (need.length) send({ t: 'dropneed', drop: token, need });
+      else finishDrop(token);
+    };
 
     send(sessionsPayload(client.container));
     if (client.picking) send(groupsPayload(client.container));
@@ -1376,6 +1501,48 @@ async function main() {
           }
           break;
 
+        /*
+         * Files were dragged onto a tab. What the window has is the drag's idea
+         * of them and not a path — src/daemon/drops.js says why, and works one
+         * out. Nothing is typed until every file in the drop has an answer.
+         */
+        case 'drop': {
+          const token = String(msg.drop || '');
+          const items = Array.isArray(msg.files) ? msg.files.slice(0, MAX_DROP_FILES) : [];
+          if (!token || !items.length || drops.has(token) || !mine(msg.id)) break;
+          beginDrop(token, msg.id, items);
+          break;
+        }
+
+        // The contents of one file from a drop, because it was nowhere on disk
+        // to point at.
+        case 'dropdata': {
+          const token = String(msg.drop || '');
+          const pending = drops.get(token);
+          const index = Number(msg.index);
+          if (!pending || !pending.need.has(index)) break;
+          pending.need.delete(index);
+
+          const name = pending.items[index]?.name;
+          const named = name ? `“${String(name).slice(0, 60)}”` : 'that file';
+          const data = typeof msg.data === 'string' ? msg.data : '';
+
+          if (msg.error || !data) {
+            pending.notes.push(`clio could not read ${named}.`);
+          } else if (data.length > MAX_SPOOL_BYTES * 1.4) {
+            pending.notes.push(`${named} is too big for clio to keep a copy of.`);
+          } else {
+            try {
+              pending.paths[index] = spool(name, Buffer.from(data, 'base64'));
+            } catch (err) {
+              pending.notes.push(`clio could not keep a copy of ${named} — ${err.message}`);
+            }
+          }
+
+          if (!pending.need.size) finishDrop(token);
+          break;
+        }
+
         case 'resize':
           if (mine(msg.id)) manager.resize(msg.id, msg.cols, msg.rows);
           break;
@@ -1402,6 +1569,8 @@ async function main() {
     // scheduleContainerClose.
     const left = () => {
       clients.delete(client);
+      // Half-finished drops belong to the window that started them.
+      for (const token of [...drops.keys()]) forgetDrop(token);
       // A socket the daemon closed on its way out of the way of a replacement.
       // The page is already coming back to whoever is listening now.
       if (client.replaced) return;

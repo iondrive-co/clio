@@ -234,6 +234,9 @@ function connect() {
   ws.onmessage = (event) => handle(JSON.parse(event.data));
 
   ws.onclose = (event) => {
+    // Drops the daemon was working on died with the socket, and each one is
+    // holding a file the browser cannot let go of until we do.
+    dropsInFlight.clear();
     // 1012 is the daemon saying it is being replaced, not that it has gone: a
     // successor is already coming up with these shells still running. Backing
     // off would leave the window dark for seconds after it could have returned.
@@ -389,6 +392,22 @@ function handle(msg) {
       if (pane) pane.term.write(msg.data);
       break;
     }
+
+    // Something dropped was not on the daemon's disk anywhere: it wants the
+    // bytes so it can keep a copy to point at.
+    case 'dropneed':
+      sendDropBytes(msg.drop, Array.isArray(msg.need) ? msg.need : []);
+      break;
+
+    // What a drop came to, ready to go into the tab it landed on.
+    case 'droptext':
+      dropsInFlight.delete(msg.drop);
+      if (msg.text) {
+        hideStatus();
+        pasteInto(msg.id, msg.text);
+      }
+      if (msg.note) showStatus(msg.note, 8000);
+      break;
 
     case 'exit':
     case 'gone':
@@ -748,6 +767,8 @@ function ensurePane(id) {
 
   const root = document.createElement('div');
   root.className = 'pane';
+  // Which tab a file dropped on this pane belongs to; see dropTargetFor.
+  root.dataset.id = id;
 
   const termEl = document.createElement('div');
   termEl.className = 'term';
@@ -1330,6 +1351,190 @@ async function paste(id) {
   } catch {
     showStatus('Clipboard read was blocked — allow clipboard access for this window.', 4000);
   }
+}
+
+// ------------------------------------------------------------------ dropping
+
+/*
+ * A file dragged into a window.
+ *
+ * Dropping an image on a terminal and having its path typed is how you put one
+ * in front of a program running there, and every other terminal on the desktop
+ * does it. A page cannot: Chrome hands over a dropped file's name, size,
+ * modification time and bytes, and nothing whatever about where it came from.
+ * So the window reports what it was given and the daemon works out a path —
+ * the file's own if it can find it, a copy's if it cannot. src/daemon/drops.js
+ * is the other half of this.
+ *
+ * Anything dropped that is not a file — a URL out of a browser, selected text —
+ * is pasted as it stands, which is also what dropping it anywhere else does.
+ */
+
+/** Drops the daemon is still working on, keyed by the token it will answer with. */
+const dropsInFlight = new Map();
+
+let dropSeq = 0;
+const dropToken = () => `d${Date.now().toString(36)}-${dropSeq++}`;
+
+/** True when a drag is carrying something a terminal can take. */
+function droppable(dt) {
+  if (!dt) return false;
+  const types = [...dt.types];
+  return types.includes('Files') || types.includes('text/uri-list') || types.includes('text/plain');
+}
+
+/** Which tab a drop lands in: the pane under the pointer, or the tab it is over. */
+function dropTargetFor(event) {
+  const node = event.target instanceof Element ? event.target : null;
+  const pane = node?.closest('.pane[data-id]');
+  if (pane && sessions.has(pane.dataset.id)) return { id: pane.dataset.id, node: pane };
+
+  const tab = node?.closest('#tabs [data-id]');
+  if (tab && sessions.has(tab.dataset.id)) return { id: tab.dataset.id, node: tab };
+
+  if (activeId && panes.has(activeId)) return { id: activeId, node: panes.get(activeId).root };
+  return null;
+}
+
+/** The tab or pane about to take the drop, outlined while the mouse is held. */
+let dropMark = null;
+
+function markDrop(node) {
+  if (dropMark === node) return;
+  dropMark?.classList.remove('dropping');
+  dropMark = node || null;
+  dropMark?.classList.add('dropping');
+}
+
+/*
+ * What was dropped, as files.
+ *
+ * Read out here and now, because a DataTransfer only lives for the length of
+ * the event: reaching into it afterwards comes back empty.
+ */
+function droppedFiles(dt) {
+  const out = [];
+  const items = dt.items;
+  for (let i = 0; items && i < items.length; i++) {
+    const item = items[i];
+    if (item.kind !== 'file') continue;
+    const file = item.getAsFile();
+    if (!file) continue;
+    // A folder arrives as a file carrying the directory's own size, and only
+    // the entry says which it is. The daemon has to know: a folder has no bytes
+    // to copy, so either it is found on disk or the drop has nothing to type.
+    const entry = item.webkitGetAsEntry?.();
+    out.push({ file, dir: !!entry?.isDirectory });
+  }
+  if (!out.length) {
+    for (let i = 0; dt.files && i < dt.files.length; i++) out.push({ file: dt.files[i], dir: false });
+  }
+  // Dropping a photo album on a terminal is a slip, not a request for two
+  // hundred paths.
+  return out.slice(0, 20);
+}
+
+window.addEventListener('dragover', (event) => {
+  if (dragId) return; // a tab being dragged along the tab bar is not a drop
+  if (!droppable(event.dataTransfer)) return;
+  // Without this the browser takes the drop itself, and a window whose entire
+  // job is to stay where it is navigates away to the image somebody dropped.
+  event.preventDefault();
+  event.dataTransfer.dropEffect = 'copy';
+  markDrop(dropTargetFor(event)?.node);
+});
+
+// Only when the pointer has left the window: crossing the elements inside a
+// pane fires this the whole way across.
+window.addEventListener('dragleave', (event) => {
+  if (event.relatedTarget === null) markDrop(null);
+});
+
+window.addEventListener('drop', (event) => {
+  markDrop(null);
+  if (dragId) return;
+  if (!droppable(event.dataTransfer)) return;
+  event.preventDefault();
+
+  const target = dropTargetFor(event);
+  if (!target) {
+    showStatus('Open a tab to drop that into.', 3000);
+    return;
+  }
+  // Dropping on a tab means that tab — and it is brought to the front, because
+  // text arriving in a tab nobody is looking at is how you end up typing it
+  // twice.
+  if (target.id !== activeId) activate(target.id);
+
+  const files = droppedFiles(event.dataTransfer);
+  if (!files.length) {
+    pasteInto(target.id, event.dataTransfer.getData('text/uri-list') || event.dataTransfer.getData('text/plain'));
+    return;
+  }
+
+  const token = dropToken();
+  dropsInFlight.set(token, { id: target.id, files });
+  send({
+    t: 'drop',
+    id: target.id,
+    drop: token,
+    files: files.map(({ file, dir }) => ({
+      name: file.name,
+      size: file.size,
+      mtime: file.lastModified,
+      dir,
+    })),
+  });
+});
+
+/** The bytes of one dropped file, as base64, which is what the daemon asked for. */
+function readBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    // A data: URL rather than an ArrayBuffer turned into base64 here: encoding
+    // tens of megabytes a character at a time in the page is slow at best and a
+    // blown stack at worst, and this is the browser's own encoder.
+    reader.onload = () => resolve(String(reader.result).split(',')[1] || '');
+    reader.onerror = () => reject(reader.error || new Error('unreadable'));
+    reader.readAsDataURL(file);
+  });
+}
+
+/** Send up the files the daemon could not find, one at a time. */
+async function sendDropBytes(token, need) {
+  const pending = dropsInFlight.get(token);
+  if (!pending) return;
+
+  const names = need.map((index) => pending.files[index]?.file.name).filter(Boolean);
+  if (names.length) showStatus(`Copying ${names.join(', ')} into clio…`, 15000);
+
+  // In turn, not all at once: one file is in memory twice as it is, and a drop
+  // of several large ones should not be in memory six times over.
+  for (const index of need) {
+    const entry = pending.files[index];
+    if (!entry) {
+      send({ t: 'dropdata', drop: token, index, error: 'that file is no longer there' });
+      continue;
+    }
+    try {
+      send({ t: 'dropdata', drop: token, index, data: await readBase64(entry.file) });
+    } catch (err) {
+      send({ t: 'dropdata', drop: token, index, error: String(err?.message || err) });
+    }
+  }
+}
+
+/*
+ * Into the terminal as a paste, which is what it is. A program that asked for
+ * bracketed paste is told this arrived in one piece, so a shell shows it as
+ * something to look at rather than running the lines, and an editor does not
+ * indent it as though it had been typed.
+ */
+function pasteInto(id, text) {
+  const pane = panes.get(id);
+  if (!pane || !text) return;
+  pane.term.focus();
+  pane.term.paste(text);
 }
 
 // ----------------------------------------------------------------- shortcuts

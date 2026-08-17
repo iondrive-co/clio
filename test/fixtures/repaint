@@ -17,12 +17,24 @@ process.stdout.write('\x1b[?1004h');
 process.stdout.on('resize', () => paint('winch'));
 
 if (process.stdin.isTTY) process.stdin.setRawMode(true);
+/*
+ * The other thing a real agent does to a tab nobody is touching: it puts its
+ * terminal back the way it likes it. This is verbatim what Claude Code 2.1.233
+ * writes — an ASCII charset, shift in, and mouse reporting back on — and not a
+ * byte of it can be seen.
+ */
+const housekeeping = () => process.stdout.write('\x1b(B\x0f\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h');
+
 process.stdin.on('data', (data) => {
   const seen = data.toString();
   // Anything else is somebody typing, and what a program draws in answer to
   // that is news: a tab nobody is looking at should go red for it.
   if (seen.includes('\x1b[I')) paint('focus in');
   else if (seen.includes('\x1b[O')) paint('focus out');
+  else if (seen.includes('q')) housekeeping();
+  // And renaming itself, which clio reads and puts in the tab strip. The name
+  // changing is the whole of the news; there is nothing to go and read.
+  else if (seen.includes('t')) process.stdout.write('\x1b]0;renamed-itself\x07');
   else paint('typed');
 });
 

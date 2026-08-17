@@ -577,6 +577,14 @@ export class SessionManager extends EventEmitter {
         pid: saved.extPid ?? saved.agentPid ?? null,
       });
       session.seedScrollback(readScrollback(saved.id));
+      // Handed over rather than read back out of the buffer, and so it wins
+      // over whatever seedScrollback found: the daemon that just stood down
+      // was reading this tab's titles the whole time it was up, including the
+      // ones that have since scrolled out of the 512K that is kept. Without
+      // this, a reload renames every tab that has been quiet since it last
+      // said what it was doing — which for a row of agents is most of them,
+      // and they all come back called `claude`.
+      if (saved.termTitle) session.termTitle = saved.termTitle;
       this.wire(session);
       this.sessions.set(session.id, session);
 

@@ -24,7 +24,7 @@ bin/clio install
 | `clio status` | Show the daemon, its windows and their tabs |
 | `clio log [n]` | Tail the daemon log |
 
-## Keys
+## Input
 
 | Key | Action |
 | --- | --- |
@@ -34,9 +34,13 @@ bin/clio install
 | `Alt+1`…`Alt+9` | Jump to tab |
 | `Ctrl+Shift+C` | Copy selection |
 | `Ctrl+Shift+V` / `Ctrl+V` | Paste |
+
+| Mouse | Action |
+| --- | --- |
 | Double-click a tab | Rename it |
 | Drag a tab | Reorder |
 | Middle-click a tab | Close it |
+| Drag a file onto a tab | Type its path there |
 
 `Ctrl+C`, `Ctrl+D`, `Ctrl+Z` and friends go to the shell untouched.
 Text size can be increased and decreased via arrows at the right end 

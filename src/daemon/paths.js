@@ -13,6 +13,13 @@ export const RUNTIME_DIR = join(runtimeBase, 'clio');
 export const STATE_DIR = join(stateBase, 'clio');
 export const SCROLLBACK_DIR = join(STATE_DIR, 'scrollback');
 
+// Files dragged into a window that are not on this disk anywhere else — an
+// image out of a browser, a mail attachment. They are copied here so there is a
+// path to type, and a path typed into a shell has to still be there tomorrow
+// when somebody scrolls back to it, so this is state and not runtime. See
+// src/daemon/drops.js, which prunes it.
+export const DROPS_DIR = join(STATE_DIR, 'drops');
+
 // A dedicated browser profile keeps the terminal out of the everyday browsing
 // profile: no extensions injecting into it, no session-restore prompts, and
 // clipboard permission granted once here rather than against normal browsing.
@@ -39,4 +46,5 @@ export function ensureDirs() {
   mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 });
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
   mkdirSync(SCROLLBACK_DIR, { recursive: true, mode: 0o700 });
+  mkdirSync(DROPS_DIR, { recursive: true, mode: 0o700 });
 }
