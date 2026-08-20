@@ -1052,7 +1052,7 @@ function renderTabs(force = false) {
     order.map((id) => {
       const meta = sessions.get(id);
       return meta
-        ? [id, tabLabel(meta), meta.status, meta.unseenOutput, id === activeId]
+        ? [id, tabLabel(meta), meta.status, meta.unseenOutput, meta.waiting, id === activeId]
         : null;
     }),
   );
@@ -1069,7 +1069,12 @@ function renderTabs(force = false) {
     tab.className =
       'tab' +
       (id === activeId ? ' active' : '') +
-      (meta.unseenOutput ? ' activity' : '');
+      (meta.unseenOutput ? ' activity' : '') +
+      // Something in there has stopped and is waiting to be answered. Never the
+      // tab that is open: the daemon will not flag one anybody is looking at,
+      // and this says so again here, so that clicking a flashing tab stops it
+      // on the spot rather than when the next broadcast comes round.
+      (meta.waiting && id !== activeId ? ' waiting' : '');
     tab.draggable = true;
     tab.dataset.id = id;
     // The label is often elided, so keep the full text reachable on hover.

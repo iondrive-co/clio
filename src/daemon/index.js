@@ -889,6 +889,9 @@ async function main() {
         // disk, where a reboot would make it somebody else's pid.
         extPid: session.ext?.pid ?? null,
         unseenOutput: session.unseenOutput,
+        // Same reasoning: a reload must not answer a question on the user's
+        // behalf by quietly putting the flashing tab out.
+        waiting: session.waiting,
         // What the program in the tab last called itself. The successor can
         // read titles out of the scrollback and does, but only the ones still
         // in it: a tab that has said nothing since it named itself has that
@@ -1345,6 +1348,28 @@ async function main() {
     broadcastSessions();
   });
 
+  /*
+   * Something in a tab has stopped and is waiting to be answered — an agent at
+   * the end of a turn, or holding a question up. The row flashes that tab.
+   *
+   * Not the tab somebody is looking at, and this is the whole of the rule: a
+   * flashing tab is for the tabs you are not in front of, and the one on screen
+   * says what it wants in its own words, in full, in the terminal. Same bargain
+   * as unseen output above, and cleared in the same place — the moment the tab
+   * is looked at, it has been answered as far as the row is concerned.
+   *
+   * The manager decides when this is announced and knows nothing about windows;
+   * everything about who is looking at what is here.
+   */
+  manager.on('attention', (id, waiting) => {
+    const session = manager.get(id);
+    if (!session) return;
+    const wants = waiting && !watchedByAnyone(id);
+    if (session.waiting === wants) return;
+    session.waiting = wants;
+    broadcastSessions();
+  });
+
   wss.on('connection', (ws, req) => {
     const params = new URL(req.url, origin).searchParams;
     const asked = params.get('c');
@@ -1373,8 +1398,11 @@ async function main() {
     const focus = (id) => {
       client.focused = id;
       const session = manager.get(id);
-      if (session?.unseenOutput) {
+      if (session?.unseenOutput || session?.waiting) {
         session.unseenOutput = false;
+        // Looking at the tab is the answer to it flashing. Whatever it is
+        // waiting for, it is now waiting for it in front of somebody.
+        session.waiting = false;
         broadcastSessions();
       }
     };

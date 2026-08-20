@@ -51,6 +51,10 @@ mkdirSync(process.env.XDG_STATE_HOME, { recursive: true });
 // Says "sandbox" in the window title, and is what the daemon reads to know it
 // is one — the dev badge, the UI watcher, and section 17 below all hang off it.
 process.env.CLIO_DEV = '1';
+// Section 15c runs a stand-in for claude, which writes a transcript where it is
+// told to. Told here, and not left to find the real ~/.claude and file a
+// conversation nobody had in among somebody's own.
+process.env.CLAUDE_CONFIG_DIR = join(SANDBOX, 'claude-config');
 
 const HANDSHAKE = join(process.env.XDG_RUNTIME_DIR, 'clio', 'daemon.json');
 const SHOTS = join(process.cwd(), 'test', 'screenshots');
@@ -987,8 +991,59 @@ async function main() {
   await page.waitForTimeout(2000);
   check('real output in a background tab is still flagged', await agentFlagged());
 
+  // ---- an agent that has stopped -----------------------------------------
+  //
+  // The other half of the same argument. Output arriving behind your back is
+  // worth a colour; an agent that has stopped and is waiting to be answered is
+  // worth a label that moves, because it is the one thing in a row of thirty
+  // tabs that somebody is being kept waiting for. Which of the two an agent is
+  // doing is in the terminal title and nowhere else a terminal can see it — see
+  // `activity` in src/agents/claude.js — so what has to be running in the tab
+  // is the stand-in that writes those titles.
+  console.log('\n15c. a tab whose agent has stopped');
+  await page.locator('#newtab').click();
+  await page.waitForTimeout(1200);
+  const stopped = await page.evaluate(() => activeId);
+  await page.evaluate(
+    (fixture) => send({ t: 'input', id: activeId, data: `node ${fixture}\r` }),
+    join(process.cwd(), 'test', 'fixtures', 'claude'),
+  );
+  await page.waitForTimeout(3000);
+
+  // And look away. The tab on screen is the one tab that is never flagged: it is
+  // in front of somebody, saying whatever it wants in full.
+  await page.locator(`.tab[data-id="${watched}"]`).click();
+  await page.waitForTimeout(1200);
+
+  const stoppedFlagged = () =>
+    page.locator(`.tab[data-id="${stopped}"]`).evaluate((e) => e.classList.contains('waiting'));
+  check('an agent that has not worked yet is not flagged', !(await stoppedFlagged()));
+
+  // A turn: the stand-in spins its title for a couple of seconds and then stops,
+  // which is the only moment any of this is about.
+  await page.evaluate((id) => send({ t: 'input', id, data: 'a question\r' }), stopped);
+  await page.waitForTimeout(9000);
+  check('the tab is flagged once its agent stops', await stoppedFlagged());
+
+  const stoppedTitle = page.locator(`.tab[data-id="${stopped}"] .tab-title`);
+  const stoppedColour = await stoppedTitle.evaluate((e) => getComputedStyle(e).color);
+  check('its label is amber, and not the red of unread output',
+    stoppedColour === 'rgb(229, 192, 123)', stoppedColour);
+  const pulse = await stoppedTitle.evaluate((e) => getComputedStyle(e).animationName);
+  check('and it pulses', pulse === 'tab-waiting', pulse);
+  await page.screenshot({ path: join(SHOTS, '08b-waiting.png') });
+
+  await page.locator(`.tab[data-id="${stopped}"]`).click();
+  await page.waitForTimeout(1500);
+  check('looking at the tab is the answer to it', !(await stoppedFlagged()));
+
+  // Not left running: a tab holding an agent is a tab clio would start again by
+  // itself in section 16, which is about something else entirely.
+  await page.evaluate((id) => send({ t: 'close', id }), stopped);
+  await page.waitForTimeout(800);
+
   // ---- closing every tab but one -----------------------------------------
-  console.log('\n15c. close other tabs');
+  console.log('\n15d. close other tabs');
   while ((await page.locator('.tab').count()) < 3) {
     await page.locator('#newtab').click();
     await page.waitForTimeout(1200);

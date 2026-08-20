@@ -5,6 +5,7 @@ import { Session } from './session.js';
 import { cwdOf, environOf, startedAt, markedProcesses } from './procinfo.js';
 import {
   observeExtension,
+  observeAttention,
   resumeExtension,
   recoverExtension,
   extensionFromState,
@@ -602,6 +603,11 @@ export class SessionManager extends EventEmitter {
       });
       session.command = saved.command || null;
       session.unseenOutput = !!saved.unseenOutput;
+      // A handover is not a restore. The shells are the same shells and the
+      // agent in this tab is the same agent, still stopped, still waiting for
+      // the same answer — so the flashing tab keeps flashing across a reload
+      // rather than going quiet until the next time it happens to work.
+      session.waiting = !!saved.waiting;
       // Whatever it was holding is still running — a handover does not disturb
       // the shells — so its pid comes across with it and nothing has to be
       // found again.
@@ -978,6 +984,29 @@ export class SessionManager extends EventEmitter {
       session.ext = record;
       hold(extensionIdentity(record), 1);
       if (moved) changed = true;
+
+      /*
+       * And, having just looked at what is in the tab, whether it is working or
+       * waiting to be answered.
+       *
+       * Asked here rather than on a poll of its own because this is where the
+       * record is: the answer is about the same process that has just been
+       * identified, and the title it is being read from arrived in this daemon
+       * without anybody having to go and look for it.
+       *
+       * Reported and not acted on. Whether an announcement becomes a tab
+       * flashing depends on whether anyone is looking at that tab, and which
+       * tabs are on screen is a thing only ./index.js knows — the manager has
+       * no windows.
+       */
+      const edge = record
+        ? observeAttention(record, { termTitle: session.termTitle, titleAt: session.titleAt })
+        : null;
+      if (edge) this.emit('attention', session.id, edge === 'waiting');
+      // Nothing left in the tab to be waiting for: whatever it was has exited,
+      // or somebody typed exit, and a tab that goes on flashing after that is
+      // flashing about a process that is not there.
+      if (!record && session.waiting) this.emit('attention', session.id, false);
     }
     return changed;
   }

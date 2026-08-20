@@ -70,3 +70,10 @@ window in `clio status`, and a line in the window once it is back.
 ## Extensions
 
 Clio ships with claude code and ssh extensions that resume claude and ssh sessions
+
+A Claude Code tab that has stopped — a turn finished, or a permission question
+waiting on screen — pulses its name in the tab row until you look at it. It is
+read off the terminal title, which is where Claude Code says which of the two it
+is doing: a spinner while it works, a still glyph when it stops. Only tabs you
+are not looking at, and only ones that were working a moment ago, so a restart
+never brings a row back with every tab announcing itself at once.

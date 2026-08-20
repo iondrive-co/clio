@@ -91,6 +91,16 @@ export class Session {
     this.titles = new TitleReader();
     /** A title nobody has been told about yet; see takeTitleChange. */
     this.titleMoved = false;
+    /**
+     * When the title last became something else.
+     *
+     * A title that is being rewritten twice a second is a program working, and
+     * one that has sat unchanged is a program that has stopped — which for an
+     * agent is the difference between a spinner and a question waiting for an
+     * answer. Only an extension knows how to read that of its own program; this
+     * is the clock it reads it against. See src/extensions, observeAttention.
+     */
+    this.titleAt = 0;
 
     this.pty = null;
     this.status = 'restorable'; // 'live' | 'exited' | 'restorable'
@@ -104,6 +114,17 @@ export class Session {
     this.dirty = false;
     /** Output has arrived since anyone last looked at this session. */
     this.unseenOutput = false;
+    /**
+     * What this tab is holding has stopped and is waiting for the user.
+     *
+     * Set on the edge, when something that was working stops, and only for a
+     * tab nobody is looking at; cleared when it starts again or when somebody
+     * looks. Not persisted, and deliberately: a tab that comes back from disk
+     * is holding something that stopped before this daemon existed, and a row
+     * of tabs all announcing that at once is not news. See ./index.js, where
+     * the arming and the clearing both live.
+     */
+    this.waiting = false;
     /**
      * When clio last asked the program in here to draw itself again.
      *
@@ -142,9 +163,12 @@ export class Session {
     this.rows = rows;
     this.cwd = cwd;
     // A shell of its own: whatever the last program in this tab called it was
-    // not about this one. The new shell announces its own soon enough.
+    // not about this one. The new shell announces its own soon enough, and
+    // whatever was waiting for somebody in here is not what is in here now.
     this.termTitle = null;
+    this.titleAt = 0;
     this.titles = new TitleReader();
+    this.waiting = false;
 
     this.take(
       spawnPty({
@@ -320,6 +344,7 @@ export class Session {
     const announced = this.titles.read(data);
     if (announced === null || announced === this.termTitle) return;
     this.termTitle = announced;
+    this.titleAt = Date.now();
     this.titleMoved = true;
   }
 
@@ -498,6 +523,9 @@ export class Session {
       status: this.status,
       exitCode: this.exitCode,
       unseenOutput: this.unseenOutput,
+      // Whatever is in here has stopped and is waiting to be answered. The row
+      // flashes the tab; see .tab.waiting in src/ui/style.css.
+      waiting: this.waiting,
       pid: this.shellPid,
       cols: this.cols,
       rows: this.rows,

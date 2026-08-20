@@ -56,6 +56,36 @@ const TERMINAL = 'cli';
 const HEAD_BYTES = 64 * 1024;
 
 /*
+ * The glyphs Claude Code puts in front of the terminal title while it is
+ * working.
+ *
+ * It writes one about twice a second — `◐ Search cost outstanding plan`, then
+ * `◑ …`, and on — and when it stops, whether that is the end of a turn or a
+ * question it is holding in front of you, it writes the same title with a still
+ * glyph and then says nothing more. That is the only place a terminal can see
+ * the difference: the process looks identical either way, and the transcript is
+ * written a turn at a time and cannot tell "finished" from "stopped to ask".
+ *
+ * Which glyphs these are is nobody's promise — this is claude 2.1.237 — so the
+ * other half of the answer is the title having stopped moving at all (see
+ * WAITING_STILL_MS), and the two together decide what a strange glyph means. A
+ * frame nobody here has heard of goes on rewriting the title every half second,
+ * which is not stillness either, so it is answered with "no opinion": if the
+ * spinner is ever redrawn the tab quietly stops flashing until a frame is added
+ * to this line, rather than flashing at somebody about work in progress. Of the
+ * two ways for this to be wrong, that is the one worth having.
+ */
+const SPINNER = new Set(['◐', '◑', '◒', '◓']);
+
+/*
+ * How long a title has to sit unchanged before it is somebody waiting rather
+ * than a spinner between frames. Frames arrive about every 500ms; three of
+ * those is long enough to be sure of, and short enough that a tab lights up
+ * while whoever left it is still in the room.
+ */
+const WAITING_STILL_MS = 1500;
+
+/*
  * A transcript written before the process started belongs to an earlier
  * conversation in the same directory — yesterday's, most likely. The slack is
  * for the gap between exec and the first line being written, and for clocks
@@ -225,6 +255,30 @@ export default {
    */
   identify(state) {
     return state?.sessionId || null;
+  },
+
+  /**
+   * Working, or waiting for the person whose tab this is?
+   *
+   * Answered from the title and nothing else, because the title is the only
+   * thing Claude Code says out loud that says which — and it is already on its
+   * way past the daemon for every tab, whether or not a window has been opened
+   * on it. The alternatives are worse than they look: a hook would have to be
+   * installed in somebody's settings before any of this worked at all, and the
+   * transcript's last entry looks the same at the end of a turn as it does with
+   * a permission prompt on screen.
+   *
+   * `null` is a real answer and the honest one for the first second after
+   * anything changes: the title has not settled, and nobody should be told
+   * anything yet.
+   */
+  activity(state, { termTitle = null, titleAt = 0, now = Date.now() } = {}) {
+    if (!termTitle) return null;
+    // The first codepoint rather than the first character: these glyphs sit in
+    // the BMP today, but one that did not would arrive as half a surrogate pair
+    // and match nothing at all.
+    if (SPINNER.has([...termTitle][0])) return 'working';
+    return now - titleAt >= WAITING_STILL_MS ? 'waiting' : null;
   },
 
   capture({ argv = [], cwd = null, startedAt = 0, env = null, previous = null, taken = new Set() }) {

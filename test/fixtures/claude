@@ -30,5 +30,38 @@ appendFileSync(
 
 process.stdout.write(resuming ? `RESUMED ${sessionId}\r\n` : `STARTED ${sessionId}\r\n`);
 
+/*
+ * Titles, the way Claude Code writes them: a spinner into the terminal title
+ * while it is working, and a still glyph the moment it stops. That is the only
+ * place a terminal can see which of the two is going on — see `activity` in
+ * src/agents/claude.js — so a stand-in that never writes one leaves the tab
+ * flash with nothing to read.
+ *
+ * The work is deliberately longer than clio's two-second proc poll, so that a
+ * poll cannot miss the spinner and mistake a turn for a tab that never worked.
+ */
+const SPINNER = ['◐', '◑'];
+const FRAME_MS = 300;
+const WORK_MS = 2400;
+
+const announce = (glyph) => process.stdout.write(`\x1b]0;${glyph} a stand-in\x07`);
+let spinning = null;
+
+function stop() {
+  clearInterval(spinning);
+  spinning = null;
+  announce('✳');
+}
+stop();
+
+// Anything typed at it is a turn. Not raw mode, on purpose: Ctrl-C has to go on
+// killing this the way it kills an agent, which is what test 5 is about.
+process.stdin.on('data', () => {
+  if (spinning) return;
+  let frame = 0;
+  spinning = setInterval(() => announce(SPINNER[frame++ % SPINNER.length]), FRAME_MS);
+  setTimeout(stop, WORK_MS);
+});
+
 // Hold the terminal, as an agent waiting for you would.
 setInterval(() => {}, 1 << 30);

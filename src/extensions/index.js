@@ -201,6 +201,12 @@ export function observeExtension(record, { foreground = null, taken = new Set(),
         capturedAt: now,
         pid: foreground.pid,
         resumedAt: null,
+        // Carried across the rebuild rather than started again: the process has
+        // not changed, and whether it was last seen working is the one thing
+        // observeAttention cannot work out from a single look. Dropping it every
+        // capture would mean a tab that stopped in the wrong eight seconds never
+        // said so.
+        activity: known ? record.activity ?? null : null,
       },
       changed: !known || !sameState(record.state, state),
     };
@@ -230,6 +236,35 @@ function claims(adapter, taken) {
     if (entry.startsWith(prefix)) claimed.add(entry.slice(prefix.length));
   }
   return claimed;
+}
+
+/**
+ * Has this tab stopped and started waiting for the person in front of it?
+ *
+ * Only some adapters can tell, and only about some things: an agent announces
+ * whether it is working, an ssh session has no idea. The ones that can carry an
+ * `activity` hook, and it is asked on every poll — the answer is about a running
+ * process, not about anything on disk, so it is cheap and it goes stale fast.
+ *
+ * What comes back is an edge and not a state — `'waiting'` the once, when
+ * something that was working has stopped, `'working'` when it picks up again,
+ * and null the rest of the time, which is nearly always. That is the whole
+ * design of it. A tab rebuilt from disk is holding something that was already
+ * at rest before this daemon ever looked at it, and after a reboot that is
+ * every agent tab there is; a level would light the entire row up on the way
+ * back, which is noise and not news. Nothing is ever said about a thing that
+ * has not been seen working first.
+ */
+export function observeAttention(record, { termTitle = null, titleAt = 0, now = Date.now() } = {}) {
+  const adapter = adapterFor(record);
+  if (!adapter?.activity) return null;
+
+  const answer = safely(() => adapter.activity(record.state || {}, { termTitle, titleAt, now }), null);
+  if ((answer !== 'working' && answer !== 'waiting') || answer === record.activity) return null;
+
+  const was = record.activity;
+  record.activity = answer;
+  return answer === 'waiting' && was !== 'working' ? null : answer;
 }
 
 /**

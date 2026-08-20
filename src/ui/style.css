@@ -13,6 +13,10 @@
   --term-bg: #000000;
   --danger: #e06c75;
   --activity: #ef7b84;
+  /* An agent that has stopped and is waiting for an answer. Deliberately not
+     --activity: output arriving in a tab and a tab with a question in it are
+     different pieces of news, and the row has to be readable at a glance. */
+  --waiting: #e5c07b;
   --tabbar-height: 32px;
 }
 
@@ -116,6 +120,45 @@ body {
 .tab.activity .tab-title {
   color: var(--activity);
   font-weight: 600;
+}
+
+/*
+ * A tab whose agent has stopped and is waiting for you.
+ *
+ * Both flags will usually be on the same tab, because an agent finishing a turn
+ * is also output nobody has read. So this rule sits after .tab.activity and
+ * takes the label off it: unread output can wait, and somebody being waited on
+ * cannot.
+ *
+ * A pulse rather than a hard blink, and a shallow one that spends most of its
+ * time lit: it has to be visible in the corner of an eye from across a row of
+ * thirty tabs, survivable by somebody who leaves clio open all day, and legible
+ * at every point of it — a tab caught at the bottom of a deeper fade reads as
+ * disabled rather than as waiting.
+ */
+@keyframes tab-waiting {
+  0%,
+  55%,
+  100% {
+    opacity: 1;
+  }
+  80% {
+    opacity: 0.45;
+  }
+}
+
+.tab.waiting .tab-title {
+  color: var(--waiting);
+  font-weight: 600;
+  animation: tab-waiting 1.3s ease-in-out infinite;
+}
+
+/* Somebody who has asked the desktop for less motion is not asking for less
+   news: keep the colour, drop the pulse. */
+@media (prefers-reduced-motion: reduce) {
+  .tab.waiting .tab-title {
+    animation: none;
+  }
 }
 
 .tab.dragging {

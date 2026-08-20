@@ -284,6 +284,19 @@ async function main() {
     JSON.stringify(since.slice(-300)),
   );
 
+  /*
+   * And it came back quiet. A tab rebuilt from disk is holding an agent that
+   * stopped before this daemon existed — after a reboot that is every agent tab
+   * on the machine — so a flash there would light the whole row up on the way
+   * back, about nothing that has just happened. See section 9 for the flash
+   * itself, and observeAttention in src/extensions for why it is an edge.
+   */
+  check(
+    'and the restored tab is not flashing about having stopped',
+    back.tab(agentTab.id)?.waiting === false,
+    JSON.stringify(back.tab(agentTab.id)?.waiting),
+  );
+
   console.log('\n4. the tab next door is left alone');
   back.send({ t: 'attach', id: plainTab.id, cols: 80, rows: 24 });
   const plainReplay = (await back.await((m) => m.t === 'attached' && m.id === plainTab.id))?.scrollback || '';
@@ -430,6 +443,70 @@ async function main() {
     `${oneNow} vs ${twoNow}`,
   );
 
+  console.log('\n9. a tab whose agent has stopped says so — unless you are looking at it');
+  /*
+   * An agent that has finished a turn, or that is holding a question up, stops
+   * writing the spinner into its terminal title. Nothing else about the tab
+   * changes: the process is the same process, the transcript looks the same at
+   * the end of a turn as it does with a permission prompt on screen. So the
+   * title is what this reads, and what is tested here is the whole chain of it —
+   * the stand-in stops, the adapter notices, and a window is told without
+   * having asked anything.
+   */
+  const flash = await newTab(last);
+  check('a tab to watch stop', !!flash);
+  if (!flash) return report();
+
+  // And look at something else. Opening a tab is looking at it, so without this
+  // the tab under test is the one on screen for the whole of the section — and
+  // the tab on screen is the one tab that is never flashed at.
+  last.send({ t: 'focus', id: one });
+  await sleep(800);
+  last.send({ t: 'input', id: flash, data: 'claude\n' });
+  await sleep(5000);
+  check(
+    'an agent that has not worked yet is not news',
+    last.tab(flash)?.waiting === false,
+    JSON.stringify(last.tab(flash)?.waiting),
+  );
+
+  // A turn: the stand-in spins for a couple of seconds and then stops. That
+  // edge is the whole feature.
+  last.send({ t: 'input', id: flash, data: 'a question\n' });
+  check(
+    'the tab flashes once its agent stops',
+    await until(() => last.tab(flash)?.waiting === true),
+    JSON.stringify(last.tab(flash)),
+  );
+
+  last.send({ t: 'focus', id: flash });
+  check(
+    'and stops the moment somebody looks at it',
+    await until(() => last.tab(flash)?.waiting === false, 4000),
+    JSON.stringify(last.tab(flash)?.waiting),
+  );
+
+  // Nor does a tab somebody is looking at ever start. The terminal is on screen
+  // saying the same thing in full; a flashing label is for the tabs you are not
+  // in front of.
+  last.send({ t: 'input', id: flash, data: 'another question\n' });
+  await sleep(9000);
+  check(
+    'a tab being watched does not flash at all',
+    last.tab(flash)?.waiting === false,
+    JSON.stringify(last.tab(flash)?.waiting),
+  );
+
+  // Look away, and the next time it stops it is news again.
+  last.send({ t: 'focus', id: one });
+  last.send({ t: 'input', id: flash, data: 'once more\n' });
+  check(
+    'and once nobody is looking, the next stop flashes again',
+    await until(() => last.tab(flash)?.waiting === true),
+    JSON.stringify(last.tab(flash)),
+  );
+
+  last.send({ t: 'close', id: flash });
   last.send({ t: 'close', id: seven.id });
   last.send({ t: 'close', id: one });
   last.send({ t: 'close', id: two });
@@ -444,6 +521,23 @@ async function main() {
  * src/extensions, plus a proc poll to carry the question, plus room to spare.
  */
 const RECAPTURE_MS = 12000;
+
+/**
+ * Wait for something the daemon says to become true.
+ *
+ * The tab flash arrives on the proc poll and is broadcast when it changes, so
+ * the wait is for a session field to turn over rather than for a message of its
+ * own — and a fixed sleep long enough to be reliable is long enough to be worth
+ * not spending on every run.
+ */
+async function until(pred, timeout = 12000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (pred()) return true;
+    await sleep(150);
+  }
+  return false;
+}
 
 const newId = () =>
   'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
