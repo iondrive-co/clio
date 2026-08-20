@@ -363,6 +363,12 @@ function handle(msg) {
       if (!msg.ok) showStatus(`Could not open a new window — ${msg.error}`, 6000);
       break;
 
+    // A tab pulled out into a window of its own that never got one. It has been
+    // put back where it was dragged from, so nothing is lost but the gesture.
+    case 'tab':
+      if (!msg.ok) showStatus(`Could not open a window for that tab — ${msg.error}`, 6000);
+      break;
+
     // Same bargain as a window: only ever sent when the click went nowhere. A
     // browser that came up says so by being on screen.
     case 'link':
@@ -459,7 +465,15 @@ function syncSessions(list, home) {
     return;
   }
   bootstrapped = true;
-  if (!activeId || !sessions.has(activeId)) {
+  // A tab dragged in from another window: it is ours as of this payload, so put
+  // it on screen, which is what dropping it here asked for. One payload only —
+  // if it is not in this one the move did not happen, and waiting for a later
+  // one would mean an unrelated update bringing an old drag back to life.
+  const arrived = adopting;
+  adopting = null;
+  if (arrived && sessions.has(arrived)) {
+    activate(arrived);
+  } else if (!activeId || !sessions.has(activeId)) {
     activate(order[0]);
   }
   renderTabs();
@@ -1089,53 +1103,253 @@ function startRename(tab, id) {
   input.onblur = () => commit(true);
 }
 
-// -------------------------------------------------------------- drag reorder
+// ----------------------------------------------------------- dragging tabs
 
+/*
+ * A tab is dragged to move it, and there are three places it can go: along this
+ * window's strip to reorder it, onto another clio window's strip to hand it
+ * over, and out of every window on the desktop to pull it into one of its own.
+ * All three are what a Chrome tab does, and none of it had to be invented —
+ * something that looks like a tab should move like one.
+ *
+ * What makes the last two possible is that a tab was never the window's to
+ * begin with. The shell is in the daemon and the page is a viewer, so handing
+ * one over is a change of which page draws it: no process is signalled, nothing
+ * is re-opened, and the program running in the tab is not told anything at all.
+ *
+ * Two windows are two pages that cannot see each other. What crosses between
+ * them is what the browser carries in the drag, and what the daemon does about
+ * it afterwards — the daemon being the only thing both of them are talking to.
+ * The drag carries the tab's id and the window it came from under a type of
+ * clio's own, and deliberately not as text/plain: a terminal is entitled to
+ * paste anything dropped on it as text, and a tab is not text.
+ */
+const TAB_MIME = 'application/x-clio-tab';
+
+/** The tab this window is dragging, while it is dragging one. */
 let dragId = null;
+
+/** A tab dragged in from elsewhere, waiting for the daemon to make it ours. */
+let adopting = null;
+
+/**
+ * How long a tab let go of outside this window waits before becoming a window
+ * of its own.
+ *
+ * It may have landed on another clio window's strip — a window this page cannot
+ * see, cannot ask, and gets no event from. The only sign is the tab leaving our
+ * own list a moment later, when the daemon says who has it now. So that round
+ * trip is given this long before "outside" is taken to mean "nowhere".
+ */
+const POP_WAIT_MS = 300;
+
+/** True when a drag is carrying one of our tabs rather than something to type. */
+function carriesTab(dt) {
+  return !!dt && [...dt.types].includes(TAB_MIME);
+}
 
 function wireDrag(tab, id) {
   tab.ondragstart = (event) => {
     dragId = id;
     tab.classList.add('dragging');
     event.dataTransfer.effectAllowed = 'move';
-    event.dataTransfer.setData('text/plain', id);
+    // Which tab, and which window it is leaving. Nothing more is needed or
+    // wanted: whoever takes it asks the daemon for it by id, and the daemon is
+    // the one holding the shell.
+    event.dataTransfer.setData(TAB_MIME, JSON.stringify({ id, container: containerId }));
   };
 
-  tab.ondragend = () => {
+  tab.ondragend = (event) => {
+    const dragged = dragId;
     dragId = null;
+    // Not left to the re-render: nothing about the row has changed when a drag
+    // is abandoned, and renderTabs would rightly decide there was nothing to
+    // draw — leaving the tab faded out for as long as the window stayed open.
+    tab.classList.remove('dragging');
     clearDropMarkers();
     renderTabs();
-  };
+    if (!dragged) return;
 
-  tab.ondragover = (event) => {
-    if (!dragId || dragId === id) return;
-    event.preventDefault();
-    const rect = tab.getBoundingClientRect();
-    const after = event.clientX > rect.left + rect.width / 2;
-    clearDropMarkers();
-    tab.classList.add(after ? 'drop-after' : 'drop-before');
-  };
-
-  tab.ondragleave = () => tab.classList.remove('drop-before', 'drop-after');
-
-  tab.ondrop = (event) => {
-    event.preventDefault();
-    if (!dragId || dragId === id) return;
-    const rect = tab.getBoundingClientRect();
-    const after = event.clientX > rect.left + rect.width / 2;
-
-    const next = order.filter((other) => other !== dragId);
-    const index = next.indexOf(id);
-    next.splice(after ? index + 1 : index, 0, dragId);
-
-    order = next;
-    clearDropMarkers();
-    renderTabs();
-    send({ t: 'reorder', ids: order });
+    // Let go inside this window is a drag that came to nothing — a tab dropped
+    // on a terminal is not a request to move it, and the row above is the one
+    // place that acts on one.
+    if (within(event.clientX, event.clientY)) return;
+    popOut(dragged, { x: event.screenX, y: event.screenY });
   };
 }
 
+/**
+ * When Escape was last seen, so a drag it cancelled is not acted on.
+ *
+ * The keydown that cancels a drag never reaches the page — the browser's drag
+ * session swallows it — but the keyup arrives a moment after dragend, and it is
+ * the only thing that tells an abandoned drag from a deliberate one. dropEffect
+ * does not: it reports what the last thing the pointer crossed made of the drag,
+ * so a tab let go over the desktop reads as 'none' if it went straight there and
+ * 'move' if it passed over another window's strip on the way, and an abandoned
+ * drag reads the same as the first of those. Measured, not assumed.
+ */
+let escapedAt = 0;
+
+window.addEventListener('keyup', (event) => {
+  if (event.key === 'Escape') escapedAt = Date.now();
+});
+
+/** Whether a point is inside this window's own page. */
+function within(x, y) {
+  // A browser that will not say lands here, and it must read as "inside": doing
+  // nothing is the right answer to a drag nobody can account for.
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return true;
+  return x >= 0 && y >= 0 && x <= window.innerWidth && y <= window.innerHeight;
+}
+
+/**
+ * A tab let go of somewhere this window is not.
+ *
+ * Another clio window may have taken it, and the only way that shows up here is
+ * the tab going quiet and leaving our list. So the answer waits: a tab still
+ * ours after the wait was dropped on nothing, and a tab dropped on nothing was
+ * pulled out to stand on its own.
+ */
+function popOut(id, at) {
+  // The only tab in the window: it *is* a window of its own. Pulling it out
+  // would move it one frame to the right and leave an empty one behind.
+  if (order.length < 2) return;
+
+  const letGoAt = Date.now();
+  setTimeout(() => {
+    if (escapedAt >= letGoAt) return; // abandoned rather than let go
+    if (!sessions.has(id)) return; // somebody else has it now
+    send({ t: 'poptab', id, geometry: popGeometry(at) });
+  }, POP_WAIT_MS);
+}
+
+/**
+ * Where a window pulled out of this one opens: under the cursor that pulled it,
+ * at the size of the window it came from, which is what dropping a Chrome tab
+ * on the desktop gives you.
+ *
+ * The offset is what puts the strip near the pointer rather than the top-left
+ * corner, so the tab lands roughly where it was let go.
+ */
+function popGeometry(at) {
+  const now = currentGeometry();
+  // Not past the top left of the desktop, which is not always zero: a monitor
+  // above or left of the primary one has negative coordinates, and a tab let go
+  // over there belongs over there rather than pulled back onto the primary.
+  const left = Number.isFinite(window.screen?.availLeft) ? window.screen.availLeft : 0;
+  const top = Number.isFinite(window.screen?.availTop) ? window.screen.availTop : 0;
+  return {
+    x: Math.max(left, Math.round(at.x - 60)),
+    y: Math.max(top, Math.round(at.y - 16)),
+    width: now?.width || window.outerWidth,
+    height: now?.height || window.outerHeight,
+  };
+}
+
+/**
+ * Where in the row a tab held over the strip would land: which tab it would sit
+ * against, and on which side.
+ *
+ * Past the last tab — over the +, or the empty stretch after it — means the end
+ * of the row, which is where a tab dropped on a window with room to spare
+ * should go.
+ */
+function insertionAt(clientX) {
+  const tabs = [...el.tabs.querySelectorAll('.tab[data-id]')];
+  for (const tab of tabs) {
+    const rect = tab.getBoundingClientRect();
+    if (clientX < rect.left + rect.width / 2) return { tab, before: true };
+  }
+  const last = tabs[tabs.length - 1];
+  return last ? { tab: last, before: false } : null;
+}
+
+/** This window's row of tabs with `id` moved — or added — at that spot. */
+function orderWith(id, spot) {
+  const next = order.filter((other) => other !== id);
+  const index = next.indexOf(spot.tab.dataset.id);
+  if (index === -1) return [...next, id];
+  next.splice(spot.before ? index : index + 1, 0, id);
+  return next;
+}
+
+/**
+ * The strip is the target, rather than each tab in it.
+ *
+ * A tab arriving from another window is a tab this page has never heard of, and
+ * the gaps between tabs, the + and the empty stretch beyond it are all places a
+ * person will let go of one. One handler on the row covers the lot, and works
+ * out what it was over from where the pointer is.
+ */
+function wireStrip() {
+  el.tabs.addEventListener('dragover', (event) => {
+    if (!carriesTab(event.dataTransfer)) return;
+    const spot = insertionAt(event.clientX);
+    // Its own place in the row: there is nothing to show and nothing to do.
+    if (!spot || spot.tab.dataset.id === dragId) {
+      clearDropMarkers();
+      return;
+    }
+    // Without this the drop is refused, and a tab dragged from another window
+    // would spring back for no visible reason.
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'move';
+    clearDropMarkers();
+    // A tab out of another window: the row itself says it will take one, since
+    // nothing else on screen has told the person so — the tab they are dragging
+    // is in a window that cannot draw anything here. One of our own moving along
+    // the row needs no such announcement, and the marker is enough.
+    if (!dragId) el.tabs.classList.add('taking');
+    spot.tab.classList.add(spot.before ? 'drop-before' : 'drop-after');
+  });
+
+  // Crossing from one tab to the next fires this the whole way along the strip,
+  // so only leaving the row itself counts.
+  el.tabs.addEventListener('dragleave', (event) => {
+    if (el.tabs.contains(event.relatedTarget)) return;
+    clearDropMarkers();
+  });
+
+  el.tabs.addEventListener('drop', (event) => {
+    if (!carriesTab(event.dataTransfer)) return;
+    event.preventDefault();
+    const spot = insertionAt(event.clientX);
+    clearDropMarkers();
+
+    let dropped = null;
+    try {
+      dropped = JSON.parse(event.dataTransfer.getData(TAB_MIME));
+    } catch {
+      /* not something we put there */
+    }
+    // Its own place in the row, which is not a move. dragover refuses the
+    // position so the drop should never arrive, and it is cheap to be sure.
+    if (!dropped?.id || !spot || spot.tab.dataset.id === dropped.id) return;
+
+    const next = orderWith(dropped.id, spot);
+
+    // One of our own, moved along the row.
+    if (dropped.container === containerId) {
+      if (!sessions.has(dropped.id)) return;
+      order = next;
+      renderTabs(true);
+      send({ t: 'reorder', ids: order });
+      return;
+    }
+
+    /*
+     * A tab out of another window. Nothing is drawn yet — this page has no
+     * shell for it, no scrollback and no claim to it — so it asks the daemon,
+     * which owns the tab, and the tab appears when the daemon says it is ours.
+     */
+    adopting = dropped.id;
+    send({ t: 'adopttab', id: dropped.id, ids: next });
+  });
+}
+
 function clearDropMarkers() {
+  el.tabs.classList.remove('taking');
   for (const tab of el.tabs.children) {
     tab.classList.remove('drop-before', 'drop-after');
   }
@@ -1380,6 +1594,10 @@ const dropToken = () => `d${Date.now().toString(36)}-${dropSeq++}`;
 function droppable(dt) {
   if (!dt) return false;
   const types = [...dt.types];
+  // A tab from another clio window comes through here too — it is a drag from
+  // outside this page like any other. It is not something to type: it belongs
+  // to the strip, and the strip is the only thing that takes it.
+  if (types.includes(TAB_MIME)) return false;
   return types.includes('Files') || types.includes('text/uri-list') || types.includes('text/plain');
 }
 
@@ -1660,8 +1878,15 @@ function applyGeometry(saved) {
   if (!saved || !now || !moved(now, saved)) return;
   // A window on Wayland can neither move itself nor read where it is; both calls
   // are simply ignored there, which is the same as having nothing saved.
-  window.moveTo(saved.x, saved.y);
+  //
+  // Sized before it is moved, and the order matters: the browser will not put a
+  // window where it would hang off the desktop, and it works that out from the
+  // size the window is at the time. A window Chrome opened at its own default
+  // and is about to be made smaller would be dragged back up the screen to make
+  // room for a height it is not going to have — which is exactly the case of a
+  // tab pulled out low on the screen into a window the size of the one it left.
   window.resizeTo(saved.width, saved.height);
+  window.moveTo(saved.x, saved.y);
 }
 
 /** Tell the daemon where we are, when that changes. */
@@ -1724,6 +1949,8 @@ function hideStatus() {
 }
 
 // ---------------------------------------------------------------------- boot
+
+wireStrip();
 
 el.newtab.onclick = newTab;
 el.newwindow.onclick = () => {

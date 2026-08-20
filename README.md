@@ -38,7 +38,9 @@ bin/clio install
 | Mouse | Action |
 | --- | --- |
 | Double-click a tab | Rename it |
-| Drag a tab | Reorder |
+| Drag a tab | Reorder it |
+| Drag a tab onto another window's tabs | Move it there, shell and scrollback and all |
+| Drag a tab out of every window | It becomes a window of its own |
 | Middle-click a tab | Close it |
 | Drag a file onto a tab | Type its path there |
 

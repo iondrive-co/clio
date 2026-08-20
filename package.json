@@ -4,7 +4,7 @@
   "description": "The immortal terminal",
   "main": "index.js",
   "scripts": {
-    "test": "bash test/launcher.sh && node test/survive.mjs && node test/reload.mjs && node test/links.mjs && node test/drops.mjs && node test/agents.mjs && node test/ssh.mjs && node test/scripts.mjs && node test/windows.mjs && node test/ui.mjs",
+    "test": "bash test/launcher.sh && node test/survive.mjs && node test/reload.mjs && node test/links.mjs && node test/drops.mjs && node test/agents.mjs && node test/ssh.mjs && node test/scripts.mjs && node test/windows.mjs && node test/tabmove.mjs && node test/ui.mjs",
     "start": "./bin/clio",
     "test:daemon": "node test/survive.mjs",
     "test:reload": "node test/reload.mjs",
@@ -14,6 +14,7 @@
     "test:ssh": "node test/ssh.mjs",
     "test:scripts": "node test/scripts.mjs",
     "test:windows": "node test/windows.mjs",
+    "test:tabmove": "node test/tabmove.mjs",
     "test:ui": "node test/ui.mjs",
     "daemon": "node src/daemon/index.js",
     "test:launcher": "bash test/launcher.sh"

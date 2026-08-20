@@ -315,6 +315,38 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
+   * Move one tab out of the window it is in and into another.
+   *
+   * Nothing happens to the shell. A pty belongs to the daemon and not to any
+   * window, so a tab dragged from one window to the next is a change of which
+   * page draws it and nothing else — the process never learns that it moved,
+   * which is why this is a line of bookkeeping rather than a re-open. It is the
+   * same trick the daemon already lives on, turned sideways: a tab outlives the
+   * window it was opened in exactly as it outlives the window being closed.
+   *
+   * A window left with nothing in it is forgotten, the same way it is when its
+   * last tab is closed — the page showing it closes itself, and there is
+   * nothing left worth putting away.
+   */
+  moveToContainer(id, containerId) {
+    const session = this.sessions.get(id);
+    if (!session || !this.containers.has(containerId)) return false;
+    if (session.container === containerId) return false;
+
+    const from = session.container;
+    // Last in the row it is joining, until the window that took it says
+    // otherwise — which is also where a tab dropped past the end belongs.
+    const last = this.sessionsIn(containerId).reduce((max, s) => Math.max(max, s.order), -1);
+    session.container = containerId;
+    session.order = last + 1;
+    if (from) this.forgetContainerIfEmpty(from);
+
+    this.scheduleSave();
+    this.emit('update');
+    return true;
+  }
+
+  /**
    * Where the window showing this container is on the desktop, as the window
    * itself reports it.
    *

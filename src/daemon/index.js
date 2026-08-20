@@ -1141,6 +1141,24 @@ async function main() {
     return false;
   }
 
+  /**
+   * A tab has moved to another window; every window but that one lets go of it.
+   *
+   * The window it left is still holding it open as far as this daemon is
+   * concerned — it asked for the output stream when the tab was on screen there,
+   * and it has no way to say otherwise until its page notices the tab is gone.
+   * Left alone that is worse than untidy: a tab counts as watched by whoever
+   * last looked at it, so output arriving in its new window would never be
+   * flagged as unseen while the old window went on being told about it.
+   */
+  function releaseElsewhere(id, keep = null) {
+    for (const client of clients) {
+      if (client === keep) continue;
+      client.attached.delete(id);
+      if (client.focused === id) client.focused = null;
+    }
+  }
+
   manager.on('data', (id, data) => {
     const payload = JSON.stringify({ t: 'data', id, data });
     for (const client of clients) {
@@ -1558,6 +1576,84 @@ async function main() {
         case 'reorder':
           manager.reorder((msg.ids || []).filter(mine));
           break;
+
+        /*
+         * A tab was dragged out of another window and dropped on this one's
+         * strip.
+         *
+         * This is the one message that arrives about a tab the window sending it
+         * has no business touching yet, so `mine` is not the check — that is the
+         * whole point of it. What is checked is that the id names a real tab in
+         * some *other* window of this daemon: the drag came out of a clio window
+         * belonging to the same person, over a socket already trusted to open
+         * shells, and what it asks for is a change of which page draws a tab.
+         *
+         * `ids` is where the window wants its row to end up, the moved tab
+         * included. It is the same list `reorder` takes and is filtered the same
+         * way — by then the tab is one of this window's own.
+         */
+        case 'adopttab': {
+          const session = manager.get(msg.id);
+          if (!session || session.container === client.container) break;
+
+          // The window may have been emptied and forgotten a moment ago — by
+          // this very drag, if what is being handed over is the last tab of a
+          // window and this frame is what is left — so make sure there is
+          // something for it to move into.
+          manager.openContainer(client.container);
+          cancelContainerClose(client.container);
+          manager.reviveContainer(client.container);
+
+          if (!manager.moveToContainer(msg.id, client.container)) break;
+          releaseElsewhere(msg.id, client);
+          // A tab dropped on a window is as much an answer to the picker as
+          // opening a shell in it would have been.
+          client.picking = false;
+          manager.reorder((msg.ids || []).filter(mine));
+          console.log(`[clio] a tab moved to window ${client.container}`);
+          break;
+        }
+
+        /*
+         * A tab was dragged out of this window and let go where no window was:
+         * it becomes a window of its own, which is what pulling a tab off a
+         * Chrome window does.
+         *
+         * The tab is moved before the window is asked for, because a window
+         * opens showing whatever is in the container it was given — one that
+         * found it empty would open a shell nobody asked for and then be handed
+         * the tab as well.
+         */
+        case 'poptab': {
+          if (!mine(msg.id)) break;
+          const from = client.container;
+          // The only tab in the window: it is a window of its own already, and
+          // pulling it out would leave an empty frame behind it.
+          if (manager.sessionsIn(from).length < 2) break;
+
+          const container = manager.openContainer();
+          // Where it was let go, so the window comes up under the cursor that
+          // pulled it out rather than wherever the browser feels like.
+          if (msg.geometry) manager.setGeometry(container.id, msg.geometry);
+          if (!manager.moveToContainer(msg.id, container.id)) {
+            manager.forgetContainerIfEmpty(container.id);
+            break;
+          }
+          releaseElsewhere(msg.id);
+          console.log(`[clio] a tab was pulled out of ${from} into a window of its own`);
+
+          showWindow(container.id).then((result) => {
+            if (result.ok) return;
+            // No window came up, so the tab is sitting in a container nothing
+            // is showing and nothing offers. Give it back rather than leave it
+            // somewhere it cannot be reached from.
+            manager.openContainer(from);
+            manager.moveToContainer(msg.id, from);
+            manager.forgetContainerIfEmpty(container.id);
+            send({ t: 'tab', ok: false, error: result.error });
+          });
+          break;
+        }
 
         default:
           break;

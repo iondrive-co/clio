@@ -130,6 +130,14 @@ body {
   box-shadow: inset -2px 0 0 var(--accent);
 }
 
+/* A tab from another window is being held over this row, which will take it.
+   The marks above say where in the row it would land; this says the row is a
+   target at all — the one thing a page cannot show by following the pointer,
+   because the drag it is answering started in a window it cannot see. */
+#tabs.taking {
+  background: #2c3348;
+}
+
 /* A file held over the tab bar. The tab it would land in says so, the same way
    the pane does below — a drop that goes into the tab you were not looking at
    is the one thing this has to be clear about. */
