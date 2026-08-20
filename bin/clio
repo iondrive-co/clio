@@ -362,9 +362,11 @@ case "${1:-run}" in
               const name = container.name ? ` “${container.name}”` : "";
               const note = container.onScreen
                 ? ""
-                : container.saved
-                  ? "  — closed, its shells are still running; open it from the picker"
-                  : "  — no window on it, run clio to bring it back";
+                : container.killed
+                  ? "  — its page was killed; press Ctrl+R in that window, or run clio if it went too"
+                  : container.saved
+                    ? "  — closed, its shells are still running; open it from the picker"
+                    : "  — no window on it, run clio to bring it back";
               console.log(`  window ${index + 1}${name}${note}`);
               for (const tab of container.sessions) {
                 console.log(`    ${tab.id}  ${tab.title || tab.command || tab.cwd || "shell"}`);

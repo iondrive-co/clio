@@ -1,7 +1,10 @@
 import { spawn } from 'node:child_process';
 import { accessSync, constants } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { BROWSER_PROFILE_DIR } from './paths.js';
+
+const ICON = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'assets', 'icon-128.png');
 
 const BROWSERS = [
   'google-chrome',
@@ -85,6 +88,47 @@ export function openUrl(raw, env = process.env) {
       ? `${override} could not be run`
       : `nothing on this machine opens links (tried ${URL_OPENERS.map(([c]) => c).join(', ')})`,
   );
+}
+
+/**
+ * Say something on the desktop, and say whether anything was there to hear it.
+ *
+ * There is one thing clio has to tell somebody who is not looking at a clio
+ * window: that a window's page was killed, and what is in that window now is
+ * Chrome's error page rather than anything of ours. Nothing inside the window
+ * can say it — the page that would have said it is the thing that died — so it
+ * is said out here instead.
+ *
+ * Critical urgency because the notification outliving the glance matters: a
+ * desktop that clears it after five seconds is a desktop where a window stays
+ * dead all afternoon because nobody happened to be looking. Nothing clio has
+ * to say is urgent in the battery-is-empty sense; this is the only thing it
+ * says at all, and it is about a window that is not coming back on its own.
+ *
+ * CLIO_NOTIFIER names a program to use instead, for a desktop without
+ * notify-send and for the tests, which read back what was said.
+ */
+export function notifyDesktop(summary, body, env = process.env) {
+  const override = env.CLIO_NOTIFIER || process.env.CLIO_NOTIFIER;
+  const command = override || 'notify-send';
+  const found = command.includes('/') ? command : onPath(command, env);
+  if (!found) return false;
+
+  // Only notify-send is known to take these; anything named by hand is given
+  // the two strings and nothing to choke on.
+  const args = override
+    ? [summary, body]
+    : ['--app-name=clio', `--icon=${ICON}`, '--urgency=critical', summary, body];
+
+  try {
+    const child = spawn(found, args, { detached: true, stdio: 'ignore', env });
+    child.unref();
+    return true;
+  } catch {
+    // A desktop with nothing listening is one where this was never going to
+    // arrive. The window is still there, and still fixable by hand.
+    return false;
+  }
 }
 
 /**

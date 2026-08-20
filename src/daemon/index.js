@@ -11,7 +11,7 @@ import { isAlive, cwdOf } from './procinfo.js';
 import { locate, spool, quote, searchBudget, MAX_SPOOL_BYTES } from './drops.js';
 import { SessionManager } from './manager.js';
 import { drawsSomething } from './output.js';
-import { openBrowserWindow, openUrl } from './window.js';
+import { openBrowserWindow, openUrl, notifyDesktop } from './window.js';
 
 const ENTRY = fileURLToPath(import.meta.url);
 const HERE = dirname(ENTRY);
@@ -101,6 +101,37 @@ const DEV = process.env.CLIO_DEV === '1';
 // window that blinked during a reload should not turn up in the picker as
 // though somebody had put it away.
 const WINDOW_GRACE_MS = 10000;
+
+/*
+ * A page that was killed rather than closed.
+ *
+ * The renderer holding a clio window is the biggest thing on the desktop by
+ * the time somebody has a day's scrollback in it, so it is the first thing the
+ * system reaches for when it runs out of memory — on this machine, earlyoom,
+ * whose opening move is a SIGTERM to exactly that process. Chrome puts its own
+ * error page in the window, and which one depends on how many times it has
+ * happened: the first is “Aw, Snap!”, which has a Reload button on it, and the
+ * second is “Can't open this page”, which has nothing on it but Send feedback.
+ * Neither is ours, so neither can be made to say anything about clio, and the
+ * only key that helps is one nobody has a reason to guess.
+ *
+ * So the daemon says it instead, in the places somebody would look: the desktop
+ * at the moment it happens, `clio status` afterwards, and the window itself
+ * once it is back. Everything in the tabs was always fine — it is only the page
+ * that died.
+ */
+// Long enough to cover being away from the desk, short enough that a window
+// opened out of the picker tomorrow is not still being told about it.
+const KILLED_NOTICE_MS = 60 * 60 * 1000;
+
+// One kill takes every clio window, because they share a renderer. Collect them
+// so the desktop gets one notification saying two windows, not two saying one.
+const KILLED_COALESCE_MS = 750;
+
+// A goodbye is only ever moments old: it is sent as a window goes and read when
+// the grace period is up. Anything older is a window that went without leaving
+// any tabs behind, and nothing is ever going to come and collect it.
+const GOODBYE_TTL_MS = 60000;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -411,6 +442,30 @@ async function main() {
       return;
     }
 
+    // A window on its way out, said while there is still a page to say it. See
+    // the pagehide handler in ../ui/app.js: a window that is closed and a page
+    // that is killed drop their socket in exactly the same way, and this is the
+    // only thing that tells them apart. sendBeacon, so it is a POST with no
+    // body and nothing to read.
+    if (path === '/gone') {
+      if (!authorized(req, url, token)) {
+        res.writeHead(403);
+        res.end();
+        return;
+      }
+      const going = url.searchParams.get('c') || '';
+      if (going) {
+        // Nothing collects these but the grace period, so a window that left no
+        // tabs behind would sit here for the life of the daemon otherwise.
+        const stale = Date.now() - GOODBYE_TTL_MS;
+        for (const [id, when] of goodbyes) if (when < stale) goodbyes.delete(id);
+        goodbyes.set(going, Date.now());
+      }
+      res.writeHead(204, { 'cache-control': 'no-store' });
+      res.end();
+      return;
+    }
+
     // What `clio status` reports. Live rather than read back from the state
     // file, which is only written on a debounce and says nothing about which
     // windows are actually on screen.
@@ -434,6 +489,9 @@ async function main() {
             saved: saved(container),
             onScreen: containerHasClient(container.id),
             closing: closing.has(container.id),
+            // Its window is still on screen, with Chrome's error page in it
+            // where the terminal used to be. Ctrl+R there brings it all back.
+            killed: wasKilled(container.id),
             sessions: manager.sessionsIn(container.id).map((s) => ({
               id: s.id,
               title: s.title,
@@ -574,9 +632,46 @@ async function main() {
   const arrivals = new Map();
 
   /**
+   * Windows that said they were going, against when they said it.
+   *
+   * A page being closed and a page being killed look identical from here: the
+   * socket drops and nothing comes back. The difference is that the one being
+   * closed still had a page in it, and a page on its way out can say so — see
+   * the pagehide handler in ../ui/app.js. A killed renderer says nothing,
+   * because there is nothing left of it to say anything with, and that silence
+   * is the whole signal.
+   */
+  const goodbyes = new Map();
+
+  /** Windows whose page was killed, against when we worked that out. */
+  const killed = new Map();
+
+  function saidGoodbye(id) {
+    const when = goodbyes.get(id);
+    goodbyes.delete(id);
+    return when !== undefined && Date.now() - when < GOODBYE_TTL_MS;
+  }
+
+  /**
+   * Is a window's page having been killed still news?
+   *
+   * News for as long as somebody might come back to that window and wonder
+   * what happened to it. After that it is history, and a window opened out of
+   * the picker tomorrow should not be greeted with it.
+   */
+  function wasKilled(id) {
+    const when = killed.get(id);
+    if (when === undefined) return false;
+    if (Date.now() - when < KILLED_NOTICE_MS) return true;
+    killed.delete(id);
+    return false;
+  }
+
+  /**
    * A window's page has gone. Give it WINDOW_GRACE_MS to come back — a reload
-   * takes well under a second — and if it does not, it was closed, so its tabs
-   * are put away under a name and wait there to be opened again.
+   * takes well under a second — and if it does not, the window is not showing
+   * these tabs any more, so they are put away under a name and wait there to be
+   * opened again.
    */
   function scheduleContainerClose(id) {
     if (!id || closing.has(id) || containerHasClient(id)) return;
@@ -587,11 +682,62 @@ async function main() {
       if (containerHasClient(id)) return; // it made it back with nothing to spare
       const count = manager.parkContainer(id);
       const name = manager.getContainer(id)?.name;
-      if (count) console.log(`[clio] window closed — ${count} shell(s) kept as “${name}”`);
+      const closed = saidGoodbye(id);
+      if (count && closed) {
+        console.log(`[clio] window closed — ${count} shell(s) kept as “${name}”`);
+      } else if (count) {
+        // Nothing said goodbye, so nothing was there to: the page was killed
+        // and its window is still on screen showing Chrome's error page.
+        killed.set(id, Date.now());
+        console.log(
+          `[clio] a window's page was killed — ${count} shell(s) kept as “${name}”; ` +
+            'Ctrl+R in that window brings them back, or clio if the window went too',
+        );
+        announceKilled(name);
+      }
     }, WINDOW_GRACE_MS);
 
     timer.unref?.();
     closing.set(id, timer);
+  }
+
+  /**
+   * Tell the desktop that a window is sitting there dead, and how to fix it.
+   *
+   * Waits a moment first: all clio windows share one renderer, so one kill
+   * takes the lot, and two notifications a heartbeat apart saying the same
+   * thing is worse than one that counts them.
+   */
+  let killedPending = [];
+  let killedTimer = null;
+
+  function announceKilled(name) {
+    killedPending.push(name);
+    clearTimeout(killedTimer);
+    killedTimer = setTimeout(() => {
+      const names = killedPending;
+      const many = names.length > 1;
+      killedPending = [];
+      // A sandbox must never put anything on the real desktop; a test that
+      // wants to see this points CLIO_NOTIFIER at something of its own.
+      if (DEV && !process.env.CLIO_NOTIFIER) return;
+      notifyDesktop(
+        // Named, because when only one window went the useful thing to say is
+        // which — the tabs are waiting under that name either way.
+        many
+          ? `clio — ${names.length} windows lost their page`
+          : `clio — ${names[0] ? `“${names[0]}”` : 'a window'} lost its page`,
+        // Both halves of the advice are needed. Usually it is the renderer that
+        // was killed and the window is still there with Chrome's error page in
+        // it, which Ctrl+R fixes; if what went was the browser itself, the
+        // window went with it and only `clio` will bring it back. Nothing here
+        // can tell which, so say both.
+        (many ? 'Their pages were killed — ' : 'Its page was killed — ') +
+          'out of memory, most likely. Press Ctrl+R in the window to bring the tabs back, ' +
+          'or run clio if the window has gone too. The shells kept running throughout.',
+      );
+    }, KILLED_COALESCE_MS);
+    killedTimer.unref?.();
   }
 
   /* ------------------------------------------------------------- handover */
@@ -860,6 +1006,9 @@ async function main() {
 
   /** The window came back. Whatever it was, it was not a close. */
   function cancelContainerClose(id) {
+    // A page that said goodbye and then came back was reloading, and the next
+    // socket to drop here has to be judged on its own.
+    goodbyes.delete(id);
     const timer = closing.get(id);
     if (!timer) return;
     clearTimeout(timer);
@@ -1345,6 +1494,15 @@ async function main() {
     send(sessionsPayload(client.container));
     if (client.picking) send(groupsPayload(client.container));
 
+    // The page that was in this window before this one did not close: it was
+    // killed, and what has been sitting here since is Chrome's error page. That
+    // page could not say so — it is Chrome's, not ours, and the one that could
+    // have was the one that died — so this one says it, now that there is
+    // somewhere to say it.
+    const tellIt = wasKilled(client.container);
+    killed.delete(client.container);
+    if (tellIt) send({ t: 'killed' });
+
     ws.on('message', (raw) => {
       let msg;
       try {
@@ -1467,6 +1625,14 @@ async function main() {
         // knowing because it is what the next launch opens onto.
         case 'geometry':
           manager.setGeometry(client.container, msg);
+          break;
+
+        // This window is going, from a page with no sendBeacon to send it with.
+        // The road it normally takes is /gone, which survives the page being
+        // taken apart around it; this one may not arrive at all, and a goodbye
+        // that was lost reads as a window that was killed.
+        case 'gone':
+          goodbyes.set(client.container, Date.now());
           break;
 
         case 'focus':

@@ -299,6 +299,36 @@ function send(msg) {
   else showStatus('Not connected to the clio daemon yet — that did nothing.', 3000);
 }
 
+/*
+ * A window on its way out says so, while there is still something here to say
+ * it with.
+ *
+ * Closing a window and having its page killed are the same event from the
+ * daemon's side: the socket drops, and nothing comes back for the tabs. They
+ * need opposite answers — one is somebody putting a window away, the other is
+ * a window sitting on screen with Chrome's error page in it and no way to say
+ * so — and the only thing that can tell them apart is this. A page being torn
+ * down gets to speak; a renderer the system killed does not, and that silence
+ * is what the daemon reads. pagehide covers the lot: a close, a reload, a
+ * navigation.
+ *
+ * sendBeacon rather than the socket, because this is the one message that has
+ * to leave: a frame written into a WebSocket while the page is being taken
+ * apart may never go anywhere, and a goodbye that was lost reads exactly like
+ * a window that was killed.
+ */
+addEventListener('pagehide', () => {
+  if (!containerId) return;
+  const url = `/gone?c=${encodeURIComponent(containerId)}`;
+  if (navigator.sendBeacon?.(url)) return;
+  // No sendBeacon: the socket is all there is, and it may still flush.
+  try {
+    ws?.send(JSON.stringify({ t: 'gone' }));
+  } catch {
+    /* going anyway */
+  }
+});
+
 /**
  * Say out loud when this window belongs to a sandbox.
  *
@@ -348,6 +378,20 @@ function handle(msg) {
         break;
       }
       renderPicker(msg.groups || [], msg.error);
+      break;
+
+    // The page that was in this window before this one was killed rather than
+    // closed — the renderer holding a window is the largest thing on the
+    // desktop once there is a day's scrollback in it, so it is the first thing
+    // the system takes when it runs out of memory. Chrome put its own error
+    // page here in the meantime, which could say nothing about clio or about
+    // the shells, so this says it now that there is somewhere to say it.
+    case 'killed':
+      showStatus(
+        'This window’s page was killed — out of memory, most likely. ' +
+          'Nothing in these tabs was lost; the shells kept running throughout.',
+        12000,
+      );
       break;
 
     // The UI files on disk changed. Nothing here is compiled or cached, so the

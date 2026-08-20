@@ -44,10 +44,28 @@ bin/clio install
 | Middle-click a tab | Close it |
 | Drag a file onto a tab | Type its path there |
 
-`Ctrl+C`, `Ctrl+D`, `Ctrl+Z` and friends go to the shell untouched.
+`Ctrl+C`, `Ctrl+D`, `Ctrl+Z` and friends go to the shell untouched — `Ctrl+R`
+included, so reverse search works as it does anywhere else.
 Text size can be increased and decreased via arrows at the right end 
 of the tab row, and changes will be saved. New windows are opened
 with the plus button after the arrows.
+
+## When a window loses its page
+
+A window whose page Chrome has replaced with an error page — `Aw, Snap!`, or
+`Can't open this page` with nothing on it but Send feedback — comes back with
+**Ctrl+R**, tabs, names, scrollback and running programs and all. That is the
+one moment `Ctrl+R` does not reach the shell: there is no page left to give it
+to, so the browser takes it. If the window itself has gone, `clio` puts it back.
+
+It happens because the renderer holding a window is the largest process on the
+desktop once there is a day's scrollback in it, so it is the first thing killed
+when the machine runs out of memory — earlyoom, on a desktop that runs it, opens
+with a SIGTERM to exactly that process. Nothing in the tabs is affected: the shells are
+in the daemon and never knew the window went. Chrome's error page belongs to
+Chrome and cannot be made to explain any of that, so clio says it in the three
+places it can reach — a desktop notification as it happens, a note against the
+window in `clio status`, and a line in the window once it is back.
 
 ## Extensions
 
