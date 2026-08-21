@@ -22,6 +22,20 @@ const THEME = {
   // per-cell inversion xfce4-terminal actually performs.
   selectionBackground: '#ffffff',
   selectionForeground: '#000000',
+  // xterm draws its own scrollbar rather than the browser's, and its slider
+  // defaults to the foreground at 20% opacity — which over this background is
+  // #333333, a shade nobody can find on a black terminal. These are the same
+  // greys the tab row is built from, and the gutter they run in is in
+  // style.css (.scrollbar.vertical).
+  scrollbarSliderBackground: '#6e6e85',
+  scrollbarSliderHoverBackground: '#8f8fa8',
+  scrollbarSliderActiveBackground: '#aeaec8',
+  // Asking for a scrollbar wider than xterm's own turns the overview ruler on
+  // (see SCROLLBAR_WIDTH), and the ruler draws a 1px outline down the left of
+  // the gutter in this colour. Its default is the foreground, so leaving it
+  // unset puts a white line down the right-hand side of every pane. The
+  // gutter's own edge is drawn in style.css instead.
+  overviewRulerBorder: '#000000',
   black: '#000000',
   red: '#aa0000',
   green: '#00aa00',
@@ -49,6 +63,15 @@ const DEFAULT_FONT_SIZE = (11 * 96) / 72;
 const FONT_MIN = 8;
 const FONT_MAX = 40;
 const FONT_KEY = 'clio.fontSize';
+
+// The scrollbar down the right of a pane. xterm has no option for its width on
+// its own: it takes `overviewRuler.width` if that is set and 14 otherwise, and
+// the fit addon reserves exactly the same number, so this one figure both
+// widens the bar and keeps the text clear of it. 14 is thinner than the
+// scrollbar in the terminal clio stands in for, and the slider xterm paints in
+// it bottoms out at 20px tall — which at 10,000 lines of scrollback is what you
+// are looking for. Costs one column.
+const SCROLLBAR_WIDTH = 18;
 
 // A pane that has not been laid out yet measures as a couple of cells. Resizing
 // a pty to 2x1 would mangle whatever is running in it, so refuse anything below
@@ -840,6 +863,9 @@ function ensurePane(id) {
     theme: THEME,
     cursorBlink: true,
     scrollback: 10000,
+    // Sets the width of the scrollbar; see SCROLLBAR_WIDTH. Nothing in clio
+    // adds decorations, so the ruler itself has nothing to draw.
+    overviewRuler: { width: SCROLLBAR_WIDTH },
     allowProposedApi: true,
     macOptionIsMeta: false,
     // 1 disables xterm's contrast adjustment, which is not a safety net so much

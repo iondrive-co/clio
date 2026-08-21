@@ -359,6 +359,20 @@ body {
   background: var(--term-bg);
 }
 
+/* The gutter xterm's scrollbar runs in. xterm paints the slider and nothing
+   else, and a slider is at its 20px floor for most of a day's scrollback — so
+   the bar is only findable if the track it runs in is drawn too, the way the
+   scrollbar in a GTK terminal is. Painted only while the pane has something to
+   scroll: xterm marks the bar `.invisible` otherwise, and that rule wins on
+   opacity whatever this says about the colour.
+
+   The slider's own colours are theme keys, so they sit in app.js with the rest
+   of the palette, and SCROLLBAR_WIDTH there is what makes this 18px wide. */
+.xterm .xterm-scrollable-element > .scrollbar.vertical {
+  background: #16161c;
+  box-shadow: inset 1px 0 0 var(--border);
+}
+
 /* ---------- context menu ---------- */
 
 #ctxmenu {

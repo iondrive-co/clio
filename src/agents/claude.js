@@ -2,21 +2,36 @@
  * Claude Code.
  *
  * What has to be worked out is which conversation a tab was showing, and the
- * only durable name for one is the session id. Claude does not advertise it:
- * it is not in the process's environment, which is fixed at exec and so cannot
- * hold an id generated afterwards, and the transcript is opened, appended to
- * and closed again rather than held, so it is not in the open descriptors
- * either. What it does do is write ~/.claude/projects/<slug>/<id>.jsonl, where
- * the file's name is the id — so the id is read off the filesystem, from the
- * newest transcript in this directory that was written while this process has
- * been running.
+ * only durable name for one is the session id. Claude does not advertise it in
+ * its own environment, which is fixed at exec and so cannot hold an id
+ * generated afterwards, and the transcript is opened, appended to and closed
+ * again rather than held, so it is not in the open descriptors either. What it
+ * does do is write ~/.claude/projects/<slug>/<id>.jsonl, where the file's name
+ * is the id — so the id can be read off the filesystem, from the newest
+ * transcript in this directory that was written while this process has been
+ * running.
  *
- * That is a guess, and what it can be wrong about is another conversation open
- * in the same directory. Three things narrow it. The registry says which ids
- * other tabs have already claimed. Each transcript says which Claude Code wrote
- * it, so the desktop app's and a script's are not mistaken for a tab's — see
- * TERMINAL. And an explicit --resume on the command line beats the guess
- * outright.
+ * That last part is a guess, and it is wrong about the one thing that matters:
+ * another conversation open in the same directory. Every tab in a repository
+ * shares that directory, so the newest file in it belongs to whichever of them
+ * wrote last — which on 21 August put four ~/ops conversations into the wrong
+ * four tabs, each tab quietly recorded as holding its neighbour's, and a crash
+ * then resumed exactly what had been written down. See `capture`.
+ *
+ * So a guess is now the last resort rather than the first answer, and two
+ * things come before it, both of them about *this* process rather than about
+ * the directory. Anything on its own command line — `--resume <id>` — is its
+ * own by definition. And anything a child of it carries in
+ * CLAUDE_CODE_SESSION_ID is too: the id does not exist at exec, but Claude Code
+ * puts it into the environment of everything it starts afterwards, so its MCP
+ * servers and tool shells hold the proof that its own environment cannot.
+ * Neither of those can name a conversation belonging to the tab next door.
+ *
+ * What is left for the guess is a conversation that has written a file and
+ * proved nothing — an agent with no MCP servers that has not run a tool yet.
+ * Two things still narrow it there. The registry says which ids other tabs have
+ * already claimed. And each transcript says which Claude Code wrote it, so the
+ * desktop app's and a script's are not mistaken for a tab's — see TERMINAL.
  */
 
 import { readdirSync, statSync, existsSync, openSync, readSync, closeSync } from 'node:fs';
@@ -43,6 +58,24 @@ const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
  * directory was all this adapter looked at.
  */
 const TERMINAL = 'cli';
+
+/*
+ * Where a running conversation says its own id out loud.
+ *
+ * Claude Code generates the id after exec, so it is not in its own environment
+ * — but it exports it into every process it starts, and the ones it starts at
+ * startup and keeps are its MCP servers. That is what turns "the newest file in
+ * a shared directory" into "the file this process wrote": one readdir of
+ * /proc/<pid>/task/<pid>/children and an environ each, next to a guess that has
+ * put a conversation in the wrong tab twice.
+ *
+ * Nobody promises this variable — it is claude 2.1.238 — so nothing here
+ * depends on finding it. A process with no children, or a claude that stops
+ * exporting it, simply falls through to the older answers below, which is where
+ * this adapter was before and is still correct about a tab on its own in a
+ * directory.
+ */
+const SESSION_ENV = 'CLAUDE_CODE_SESSION_ID';
 
 /*
  * How much of a transcript to read to find out who is writing it.
@@ -212,6 +245,35 @@ function resumeArgument(argv) {
 }
 
 /**
+ * The conversations this process can be shown to own, the command line first.
+ *
+ * "Shown" is the point of it. Everything else this adapter knows comes from a
+ * directory that every tab in the same repository writes into, where the only
+ * question that can be answered is which file was touched last — and the answer
+ * to that is somebody else's conversation as often as it is this one's. These
+ * two say *this process*: the id it was started on, and the ids its own
+ * children are carrying. A tab cannot pick up either of them by accident.
+ *
+ * Both are collected rather than one preferred, because a process can own more
+ * than one in a lifetime: a tab is resumed onto a conversation and may then be
+ * moved off it — `/clear` starts a new one without the process changing — and
+ * the children spawned since are the only ones who know about that. Which of
+ * them it is *on* is then the ordinary question of which was written last, asked
+ * of these instead of the whole directory. The command line goes in first only
+ * so that it is the one answered with when none of them has written a file yet.
+ */
+function ownedBy(argv, children) {
+  const owned = new Set();
+  const asked = resumeArgument(argv);
+  if (asked) owned.add(asked);
+  for (const env of children) {
+    const id = env?.[SESSION_ENV];
+    if (id && SESSION_ID.test(id)) owned.add(id);
+  }
+  return owned;
+}
+
+/**
  * Claude, and not the several other things called claude on a desktop.
  *
  * A -p run is somebody's script piping a question through, not a conversation
@@ -281,26 +343,74 @@ export default {
     return now - titleAt >= WAITING_STILL_MS ? 'waiting' : null;
   },
 
-  capture({ argv = [], cwd = null, startedAt = 0, env = null, previous = null, taken = new Set() }) {
+  /**
+   * Which conversation is in this tab, in descending order of how sure of it
+   * this can be.
+   *
+   * Proof, then a claim that is still true, then a guess. The order is the
+   * whole of the fix for 21 August: it used to be the guess first — newest file
+   * in the directory wins, on the reasoning that starting a fresh conversation
+   * in a tab that had one is a change of subject rather than a second tab. It is
+   * that, when the tab is on its own in the directory. When it is not, "newest
+   * file" is the tab next door finishing a turn, and this recorded a tab as
+   * holding its neighbour's conversation while the neighbour was still in it.
+   * Nothing looked wrong until the crash, because a tab goes on showing the
+   * conversation it is showing whatever clio has written down about it — and
+   * then the restore typed what had been written down into four ~/ops tabs and
+   * shuffled the morning's work between them.
+   */
+  capture({
+    argv = [],
+    cwd = null,
+    startedAt = 0,
+    env = null,
+    children = [],
+    previous = null,
+    taken = new Set(),
+  }) {
     const dir = projectDir(cwd, env);
     const mine = previous?.sessionId || null;
+    const owned = ownedBy(argv, children);
 
     if (dir) {
       const since = Math.max(0, (startedAt || 0) - CLOCK_SLACK_MS);
       const seen = transcripts(dir, since);
-      // Newest wins — starting a fresh conversation in a tab that had one is a
-      // change of subject, not a second tab — except that another tab's
-      // conversation is never stolen, and neither is one that was never in a
-      // tab at all. What this one already has is taken at its word without a
-      // file being opened: it is the answer on almost every poll.
-      const pick = seen.find((t) => t.id === mine || (!taken.has(t.id) && inATerminal(dir, t.id)));
-      if (pick) return { v: 1, sessionId: pick.id, cwd, at: Math.round(pick.mtimeMs) };
+
+      // Proof, and it outranks everything below including another tab's claim:
+      // an id this process was started on, or that its own children carry, is
+      // not something the tab next door can have. If somebody else has it
+      // written down, their record is the one that is wrong, and they are asked
+      // to pick again on the next pass — see the count in
+      // SessionManager.pollExtensions.
+      const proven = seen.find((t) => owned.has(t.id));
+      if (proven) return { v: 1, sessionId: proven.id, cwd, at: Math.round(proven.mtimeMs) };
+
+      // No proof, but this tab's own claim is still being written, so it is
+      // still true and is not revised — not for a newer file, which is the tab
+      // next door, and not for anything else in a directory this one shares.
+      // Taken at its word without a file being opened: it is the answer on
+      // almost every poll.
+      //
+      // Unless somebody else has the same claim, which is the one case where
+      // giving it up is right: two tabs on one conversation is one of them
+      // typing over the other, and a tab that will not let go of a contested
+      // claim is how the pair of them never come apart again.
+      const held = mine && !taken.has(mine) ? seen.find((t) => t.id === mine) : null;
+      if (held) return { v: 1, sessionId: held.id, cwd, at: Math.round(held.mtimeMs) };
+
+      // Nothing proved and nothing held: the newest conversation in the
+      // directory that no other tab has claimed and that was written in a
+      // terminal. A guess, and the only thing here that can be wrong about
+      // which tab a conversation was in.
+      const guess = seen.find((t) => !taken.has(t.id) && inATerminal(dir, t.id));
+      if (guess) return { v: 1, sessionId: guess.id, cwd, at: Math.round(guess.mtimeMs) };
     }
 
-    // Nothing written yet. If it was started on a conversation, that is still
-    // the conversation it is showing.
-    const asked = resumeArgument(argv);
-    if (asked) return { v: 1, sessionId: asked, cwd, at: null };
+    // Nothing written yet — a conversation opened a moment ago, or a resume
+    // whose transcript is in a directory this cannot see. What the process
+    // names is still the conversation it is showing.
+    const [named] = owned;
+    if (named) return { v: 1, sessionId: named, cwd, at: null };
 
     return previous || { v: 1, sessionId: null, cwd, at: null };
   },

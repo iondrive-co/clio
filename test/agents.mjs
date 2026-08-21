@@ -433,14 +433,29 @@ async function main() {
   check('each on a conversation of its own', !!oneConv && !!twoConv, `${oneConv} vs ${twoConv}`);
   check('and not on each other\'s', oneConv !== twoConv, `${oneConv} vs ${twoConv}`);
 
+  /*
+   * And the morning after that one. A tab holding a conversation is not looking
+   * for another, however new: every tab in a repository writes into the same
+   * directory, so the newest file in it is the tab next door finishing a turn.
+   * Taking it used to be deliberate — starting a fresh conversation in a tab
+   * that had one is a change of subject rather than a second tab — and in a
+   * directory with one tab in it that is exactly right. In a directory with
+   * four, it recorded each tab as holding its neighbour's conversation, nothing
+   * looked wrong until the crash, and then the restore typed what had been
+   * written down into all four of them.
+   *
+   * Every tab holding a conversation is checked and not just the two just
+   * opened, because the one that loses is whichever is asked first — the tab
+   * that has been there longest, whose claim was taken while it sat idle.
+   */
+  const held = new Map([one, two, seven.id].map((id) => [id, heldBy(id)]));
   writeTranscript(newId(), 'cli');
   await sleep(RECAPTURE_MS);
-  const oneNow = heldBy(one);
-  const twoNow = heldBy(two);
+  const moved = [...held].filter(([id, was]) => heldBy(id) !== was);
   check(
-    'a conversation loose in the directory is taken by at most one of them',
-    !!oneNow && !!twoNow && oneNow !== twoNow,
-    `${oneNow} vs ${twoNow}`,
+    'and a conversation loose in the directory moves none of them',
+    moved.length === 0,
+    moved.map(([id, was]) => `${id}: ${was} → ${heldBy(id)}`).join(', '),
   );
 
   console.log('\n9. a tab whose agent has stopped says so — unless you are looking at it');
@@ -506,6 +521,41 @@ async function main() {
     JSON.stringify(last.tab(flash)),
   );
 
+  console.log('\n10. a tab that changes conversation without changing process');
+  /*
+   * The other side of test 8, and the reason a tab holding a conversation
+   * cannot simply be left alone forever: `/clear` starts a new conversation in
+   * the same process. Nothing about the tab changes — same pid, same command,
+   * same directory — and the transcript it was on stops being the one it is
+   * showing.
+   *
+   * Which cannot be seen from the directory, because the newest file in it is
+   * whatever any tab wrote last, so this is the case the child processes are
+   * for: the id is not in the agent's own environment, but it is in the
+   * environment of everything the agent has started since, and the stand-in
+   * keeps one of those the way the real one keeps its MCP servers. To make sure
+   * that is what is being read and not the mtimes, there is a conversation
+   * loose in the directory that is newer than either.
+   */
+  const cleared = await agentIn(last);
+  check('a tab on a conversation to clear', !!cleared.conversation, cleared.detail);
+
+  const quiet = (last.output.get(cleared.id) || '').length;
+  last.send({ t: 'input', id: cleared.id, data: '/clear\n' });
+  await sleep(2000);
+  writeTranscript(newId(), 'cli');
+  const said = (last.output.get(cleared.id) || '').slice(quiet);
+  const after = /STARTED ([0-9a-f-]{36})/.exec(said)?.[1] || null;
+  check('and a new one started in it', !!after && after !== cleared.conversation, JSON.stringify(said.slice(-200)));
+
+  await sleep(RECAPTURE_MS);
+  check(
+    'the tab is recorded as holding the new conversation',
+    heldBy(cleared.id) === after,
+    `${heldBy(cleared.id)} vs ${after}`,
+  );
+
+  last.send({ t: 'close', id: cleared.id });
   last.send({ t: 'close', id: flash });
   last.send({ t: 'close', id: seven.id });
   last.send({ t: 'close', id: one });

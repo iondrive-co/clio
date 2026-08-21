@@ -102,6 +102,26 @@ function childrenOf(pid) {
 }
 
 /**
+ * The environments of a process's own children.
+ *
+ * Worth having for the thing a process cannot say about itself. An environment
+ * is fixed at exec, so anything a program works out about itself afterwards —
+ * an id it generated, a port it bound — is missing from its own, and present in
+ * the environment of everything it has started since. See SESSION_ENV in
+ * src/agents/claude.js, which is how a conversation's id is proved to belong to
+ * one tab rather than guessed from the timestamps in a directory that every tab
+ * in a repository writes into.
+ *
+ * Direct children only, and not the tree below them: a grandchild is as likely
+ * to be a nested agent of its own — a tool shell that ran `claude` — and that
+ * one's conversation is not this tab's. Each read is a few kilobytes and this
+ * is asked once per capture, which is once every few seconds per tab.
+ */
+export function childEnvirons(pid) {
+  return childrenOf(pid).map((child) => environOf(child));
+}
+
+/**
  * The command currently in the foreground of this pty, or null when the shell
  * itself is at the prompt.
  *

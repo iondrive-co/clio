@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { Session } from './session.js';
-import { cwdOf, environOf, startedAt, markedProcesses } from './procinfo.js';
+import { childEnvirons, cwdOf, environOf, startedAt, markedProcesses } from './procinfo.js';
 import {
   observeExtension,
   observeAttention,
@@ -976,6 +976,15 @@ export class SessionManager extends EventEmitter {
           },
           get env() {
             return environOf(fg.pid);
+          },
+          // What this process has started since it started, which is where a
+          // program that generated an id for itself after exec can be caught
+          // saying so. See childEnvirons, and SESSION_ENV in
+          // src/agents/claude.js: it is the difference between proving which
+          // conversation is in this tab and guessing from a directory that
+          // every tab in a repository shares.
+          get children() {
+            return childEnvirons(fg.pid);
           },
         },
         taken: claimed,
