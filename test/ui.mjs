@@ -645,6 +645,51 @@ async function main() {
     JSON.stringify([...labelsBefore].sort()) === JSON.stringify([...labelsAfter].sort()),
   );
 
+  /*
+   * And it lands where it was aimed, which is a different question.
+   *
+   * A drag holds the tab at the point it was pressed, so a row that measures the
+   * pointer is out by however far in that was. Pressed near its right edge and
+   * dragged one place to the left, the cursor is still over the slot the tab came
+   * from — which the row read as "put it back where it was": no marker, no move,
+   * and the tab sprang home. The same gesture to the *right* landed perfectly,
+   * because there the error points the way the tab is already going, and that is
+   * the whole of "sometimes I can drag a tab and sometimes I can't".
+   *
+   * So both edges are pressed here, in both directions. The centre is the one
+   * grab point the old arithmetic got right, and dragTo above uses it, which is
+   * why it passed the entire time this was broken.
+   */
+  const oneAlong = async (index, places, hold) => {
+    const before = await page.evaluate(() => order.slice());
+    const box = await page.locator('.tab').nth(index).boundingBox();
+    const from = hold === 'right' ? box.x + box.width - 8 : box.x + 8;
+    const y = box.y + box.height / 2;
+    // Walked across, not jumped: a drag is a gesture, and the row answers every
+    // step of it. One long jump would test an arithmetic this never sees.
+    await page.mouse.move(from, y);
+    await page.mouse.down();
+    for (let step = 1; step <= 10; step++) {
+      await page.mouse.move(from + (box.width * places * step) / 10, y);
+      await page.waitForTimeout(20);
+    }
+    await page.mouse.up();
+    await page.waitForTimeout(900);
+    const want = before.slice();
+    want.splice(index + places, 0, want.splice(index, 1)[0]);
+    const after = await page.evaluate(() => order.slice());
+    check(
+      `a tab dragged one place ${places < 0 ? 'left' : 'right'}, held by its ${hold} edge, went one place ${places < 0 ? 'left' : 'right'}`,
+      JSON.stringify(after) === JSON.stringify(want),
+      after.join(' ') === before.join(' ') ? 'it did not move at all' : `landed ${after.join(' ')}, wanted ${want.join(' ')}`,
+    );
+  };
+
+  await oneAlong(3, -1, 'right');
+  await oneAlong(2, -1, 'left');
+  await oneAlong(3, +1, 'left');
+  await oneAlong(2, +1, 'right');
+
   await page.screenshot({ path: join(SHOTS, '05-final.png') });
   check('no console errors overall', consoleErrors.length === 0, consoleErrors.join(' | '));
 
@@ -658,7 +703,14 @@ async function main() {
     `${font.size}px`);
   check('uses Liberation Mono first', font.family.startsWith('"Liberation Mono"'), font.family);
   const cellWidth = await page.evaluate(
-    () => document.querySelector('.xterm-cursor-layer, .xterm-rows')?.getBoundingClientRect().width,
+    // The pane on screen, and not whichever one comes first in the document:
+    // every pane but the open one is display:none and measures zero, so an
+    // unscoped selector answers "is the frontmost tab also the oldest one",
+    // which is not what this is asking.
+    () =>
+      document
+        .querySelector('.pane.active .xterm-cursor-layer, .pane.active .xterm-rows')
+        ?.getBoundingClientRect().width,
   );
   check('terminal actually laid out at that size', cellWidth > 0);
 

@@ -62,14 +62,30 @@ const RESTORE_LEAD_MS = 20000;
  * through a bastion that would otherwise ask each of them for its own 2FA code.
  * Six dialled at once all miss that socket and all ask.
  *
- * So the gap is a guess about a person, not about a connection: long enough to
- * read a code off a phone and type it, short enough that six hosts are all back
- * inside a minute. A resume still going when it runs out is not cancelled; the
- * queue simply stops waiting for it, because the connection sitting at a prompt
- * nobody is at the desk to answer must not hold the rest of a restore behind it
- * for the night.
+ * So the gap is about the connection: long enough for the first dial to have
+ * built the socket the next one is going to look for, short enough that six
+ * hosts are all back inside a minute. It is counted from the moment the line
+ * goes into the terminal and not from the moment the tab joined the queue —
+ * a profile that takes half a minute to run would otherwise spend the whole gap
+ * before its ssh had been dialled at all, and the tab behind it would follow
+ * immediately.
+ *
+ * The gap is not what a *person* is waited for with. That has no length to
+ * guess at, and guessing at it was the bug: on 21 August fourteen tabs came
+ * back, the first stopped on the bastion's verification code, and the other
+ * thirteen were dialled twelve seconds apart into a desktop where nobody had
+ * been able to answer it yet — so every one of them missed the socket and every
+ * one of them asked for its own code. A question is waited for until it has
+ * been answered, however long that is; see nextResume.
  */
 const RESUME_GAP_MS = 12000;
+
+/*
+ * How often the tab at the head of a queue is asked whether its question has
+ * been answered yet. Cheap — the tail of one tab's output and one look in
+ * /proc — and a second is well inside the time it takes to type a code.
+ */
+const ANSWER_POLL_MS = 1000;
 
 // Container ids travel in window URLs and come back from whatever a window asks
 // for, so keep the shape narrow rather than trusting the string.
@@ -140,8 +156,29 @@ function basename(path) {
  * It goes into the scrollback ahead of the seam rather than being written to
  * the pty, because the replay is what actually reaches a terminal — including
  * the replay into a window that opens tomorrow.
+ *
+ * The save and the restore around it are not housekeeping. They are the reason
+ * a restored tab reads top to bottom at all.
+ *
+ * Two of these resets move the cursor, and both move it to the top left of the
+ * screen. Leaving the alternate screen puts the cursor back where it was saved
+ * on the way in, and a tab that was never on the alternate screen has nothing
+ * saved, so it goes to the top; setting the scrolling region homes the cursor
+ * by definition. Everything after that — the seam, the new shell's prompt, and
+ * whatever is typed into it next — is written from the top of the screen down,
+ * over what was on the screen when the daemon died. That is what a restore
+ * looked like on 21 August: the old text still covering the screen, and the new
+ * text threaded through it from the top.
+ *
+ * DECSC here and DECRC after them puts the cursor back where the program that
+ * died had left it. It is the right thing for the tab that really was on the
+ * alternate screen too: a saved cursor belongs to the screen that was active
+ * when it was written, so this one lands in the alternate screen's slot and
+ * leaves the normal screen's — the shell's own cursor, saved by the program on
+ * its way in — for `?1049l` to restore, which is exactly what it is for.
  */
 const RESET_MODES = [
+  '\x1b7', // remember where the cursor is; the two resets below both move it
   '\x1b[?1049l', // leave the alternate screen
   '\x1b[?1000l\x1b[?1002l\x1b[?1003l', // mouse click, drag and motion reporting off
   '\x1b[?1005l\x1b[?1006l\x1b[?1015l', // and the extended encodings that carry them
@@ -149,9 +186,28 @@ const RESET_MODES = [
   '\x1b[?2004l', // bracketed paste off
   '\x1b[?1l\x1b>', // cursor keys and keypad back to normal
   '\x1b[r', // scrolling region back to the whole screen
+  '\x1b8', // and the cursor back where the program that died left it
   '\x1b[?7h\x1b[?25h', // wrap back on, cursor visible again
+  // Last, because the restore above brings back the charset and the colours
+  // that were saved with the cursor, and those were the dead program's.
   '\x1b(B\x1b[0m', // ASCII charset, no leftover colours or bold
 ].join('');
+
+/*
+ * And take what the last frame drew below the cursor off the screen.
+ *
+ * What is above the cursor is what the program had already said, and it is
+ * worth keeping: a conversation, a build's output, the shell's own scrollback.
+ * What is below it is the bottom half of a frame that is never going to be
+ * finished — an input box nothing is reading, a status line about a process
+ * that is gone. Left there, the new shell prints its prompt into the middle of
+ * it, and the two sit interleaved on the screen with nothing to say which is
+ * which.
+ *
+ * So everything kept stays above the seam, and the tab reads in the order it
+ * happened.
+ */
+const CLEAR_BELOW = '\x1b[J';
 
 /**
  * Owns every pty on the machine for this user, independent of any window.
@@ -735,7 +791,7 @@ export class SessionManager extends EventEmitter {
       : session.command
         ? `──── new shell ${when} — ${session.command} was running here and was not restarted ────`
         : `──── new shell ${when} ────`;
-    session.append(`${RESET_MODES}\r\n\x1b[38;5;244m${note}\x1b[0m\r\n`);
+    session.append(`${RESET_MODES}${CLEAR_BELOW}\r\n\x1b[38;5;244m${note}\x1b[0m\r\n`);
     if (lost) {
       // Brighter than the seam: this is the one line in the tab somebody
       // actually has to read, and they are reading it after a crash.
@@ -805,16 +861,21 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
-   * Type the resume at the head of a queue, and set the clock running on the
-   * one after it.
+   * Type the resume at the head of a queue, and start the one after it once
+   * this one has stopped needing the desk to itself.
    *
-   * The gap is a guess about a person, because what the first one is buying for
-   * the rest is an answer — a passphrase, a verification code — and only a
-   * person has that. It is not a promise that the first has finished: a resume
-   * still going when the gap runs out is not cancelled, and the queue simply
-   * stops waiting for it. That is deliberate. The connection sitting at a code
-   * prompt nobody is at the desk to answer must not hold the rest of a restore
-   * behind it for the night.
+   * Two different waits, because two different things are being waited for.
+   * The gap is a length of time and is about the connection: a socket takes a
+   * moment to appear, and the tab behind this one must not go looking for it
+   * before it is there. A question is not a length of time at all — what the
+   * first connection is buying for the rest is an answer, a passphrase or a
+   * verification code, and only a person has that. So a tab stopped at one is
+   * waited for until it has been answered, and the gap does not run out from
+   * under it.
+   *
+   * What ends the wait either way is the tab itself: an ssh that connects, or
+   * fails, or is interrupted, leaves nothing on the line for anyone to answer,
+   * and the queue moves on the next time it looks.
    */
   nextResume(kind) {
     const queue = this.resumeQueues.get(kind);
@@ -824,19 +885,40 @@ export class SessionManager extends EventEmitter {
       return;
     }
 
-    // Once: the gap and the shell can both get here, and shifting twice would
-    // step over a tab's resume without ever typing it.
+    // Once: the gap, the question and the shell can all get here, and shifting
+    // twice would step over a tab's resume without ever typing it.
     let moved = false;
+    let waiting = null;
     const advance = () => {
       if (moved) return;
       moved = true;
-      clearTimeout(gap);
+      clearTimeout(waiting);
       queue.shift();
       this.nextResume(kind);
     };
 
-    const gap = setTimeout(advance, RESUME_GAP_MS);
-    gap.unref?.();
+    /*
+     * The gap has run out. Whether that is enough depends on what the tab is
+     * doing with it: a connection that is through, or that has failed, or that
+     * is still sitting on its banner has had its turn and the next one can go.
+     * One that is stopped at a question has *not* had its turn — nothing it was
+     * dialled for has happened yet, and the whole point of going one at a time
+     * is that the answer to that question is what the rest are waiting for. So
+     * it is left alone until somebody answers it, for as long as that takes.
+     *
+     * Nothing is lost by waiting. A tab further down the queue shows the seam
+     * naming the host it is about to dial, and a person who does not want to
+     * wait can dial it themselves — while the alternative, going ahead, is
+     * thirteen more tabs each stopping on a question of its own.
+     */
+    const whenAnswered = () => {
+      if (head.session.atUnansweredQuestion()) {
+        waiting = setTimeout(whenAnswered, ANSWER_POLL_MS);
+        waiting.unref?.();
+        return;
+      }
+      advance();
+    };
 
     head.session.typeWhenReady(head.plan.command, {
       run: head.plan.run,
@@ -844,7 +926,12 @@ export class SessionManager extends EventEmitter {
         head.then?.();
         // Never typed, because something else had the terminal for the whole of
         // its wait. Nothing was dialled, so there is nothing to give room to.
-        if (!typed) advance();
+        if (!typed) {
+          advance();
+          return;
+        }
+        waiting = setTimeout(whenAnswered, RESUME_GAP_MS);
+        waiting.unref?.();
       },
     });
   }

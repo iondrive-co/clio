@@ -1208,6 +1208,12 @@ let dragId = null;
 let adopting = null;
 
 /**
+ * Where in the tab this drag took hold of it, so the row can follow the tab
+ * rather than the pointer. See draggedEdge.
+ */
+let dragGrab = null;
+
+/**
  * How long a tab let go of outside this window waits before becoming a window
  * of its own.
  *
@@ -1226,6 +1232,8 @@ function carriesTab(dt) {
 function wireDrag(tab, id) {
   tab.ondragstart = (event) => {
     dragId = id;
+    const rect = tab.getBoundingClientRect();
+    dragGrab = { dx: event.clientX - rect.left, width: rect.width };
     tab.classList.add('dragging');
     event.dataTransfer.effectAllowed = 'move';
     // Which tab, and which window it is leaving. Nothing more is needed or
@@ -1237,6 +1245,7 @@ function wireDrag(tab, id) {
   tab.ondragend = (event) => {
     const dragged = dragId;
     dragId = null;
+    dragGrab = null;
     // Not left to the re-render: nothing about the row has changed when a drag
     // is abandoned, and renderTabs would rightly decide there was nothing to
     // draw — leaving the tab faded out for as long as the window stayed open.
@@ -1322,19 +1331,65 @@ function popGeometry(at) {
   };
 }
 
+/** Where the tab being dragged still sits in the row, if it is one of ours. */
+function homeRect() {
+  const home = dragId && el.tabs.querySelector(`.tab[data-id="${dragId}"]`);
+  return home ? home.getBoundingClientRect() : null;
+}
+
+/**
+ * The edge of the tab being dragged that is leading the way, which is what the
+ * row measures against — not the pointer.
+ *
+ * A drag holds the tab at the point it was picked up, so what is on screen sits
+ * to the left of the cursor by however far in the press landed. Reading the
+ * pointer reads the wrong thing: press near a tab's right edge, drag it one
+ * place left, and the cursor is still over the tab's old position, so the row
+ * concluded the tab was being put back where it already was — no marker, no
+ * drop, and it sprang back. The same drag to the *right* landed, because there
+ * the same error points the way the tab is already going. That is the whole of
+ * "sometimes I can drag a tab and sometimes I can't": it was where in the tab
+ * you happened to press, and which way you were going.
+ *
+ * Which edge leads is which way it is being taken, and the answer that falls out
+ * is the one every tab strip has: a tab covering more than half of its
+ * neighbour takes the neighbour's place. Centre against centre would do as well
+ * anywhere but the ends of the gesture, and the ends are where it matters — a
+ * tab dragged exactly one place along has its middle exactly on its neighbour's
+ * middle, which is a coin toss between the slot it is asking for and the one it
+ * is already in.
+ *
+ * A tab out of another window has no offset here to correct by — the page
+ * drawing it has that, and a drag cannot be asked for its data until it is let
+ * go. The pointer is all there is, and no position in this row is that tab's
+ * own, so nothing is silently refused either way.
+ */
+function draggedEdge(clientX) {
+  if (!dragGrab) return clientX;
+  const left = clientX - dragGrab.dx;
+  const home = homeRect();
+  const moved = home ? left - home.left : 0;
+  if (moved > 0) return left + dragGrab.width;
+  if (moved < 0) return left;
+  // Not moved at all, and neither edge leads: the middle, which reads as its own
+  // place in the row and asks for nothing.
+  return left + dragGrab.width / 2;
+}
+
 /**
  * Where in the row a tab held over the strip would land: which tab it would sit
- * against, and on which side.
+ * against, and on which side. `x` is the leading edge of the tab being dragged,
+ * not the pointer.
  *
  * Past the last tab — over the +, or the empty stretch after it — means the end
  * of the row, which is where a tab dropped on a window with room to spare
  * should go.
  */
-function insertionAt(clientX) {
+function insertionAt(x) {
   const tabs = [...el.tabs.querySelectorAll('.tab[data-id]')];
   for (const tab of tabs) {
     const rect = tab.getBoundingClientRect();
-    if (clientX < rect.left + rect.width / 2) return { tab, before: true };
+    if (x < rect.left + rect.width / 2) return { tab, before: true };
   }
   const last = tabs[tabs.length - 1];
   return last ? { tab: last, before: false } : null;
@@ -1342,11 +1397,20 @@ function insertionAt(clientX) {
 
 /** This window's row of tabs with `id` moved — or added — at that spot. */
 function orderWith(id, spot) {
+  // Held against itself, on either side, is the place it is already in: the
+  // insertion point is worked out from where the dragged tab is, so covering its
+  // own slot lands on its own tab, and that is not a move.
+  if (spot.tab.dataset.id === id) return [...order];
   const next = order.filter((other) => other !== id);
   const index = next.indexOf(spot.tab.dataset.id);
   if (index === -1) return [...next, id];
   next.splice(spot.before ? index : index + 1, 0, id);
   return next;
+}
+
+/** Whether that would leave the row any different from the one on screen. */
+function changesRow(next) {
+  return next.length !== order.length || next.some((id, i) => id !== order[i]);
 }
 
 /**
@@ -1360,14 +1424,10 @@ function orderWith(id, spot) {
 function wireStrip() {
   el.tabs.addEventListener('dragover', (event) => {
     if (!carriesTab(event.dataTransfer)) return;
-    const spot = insertionAt(event.clientX);
-    // Its own place in the row: there is nothing to show and nothing to do.
-    if (!spot || spot.tab.dataset.id === dragId) {
-      clearDropMarkers();
-      return;
-    }
-    // Without this the drop is refused, and a tab dragged from another window
-    // would spring back for no visible reason.
+    // Taken wherever it is held, its own place in the row included. Without this
+    // the drop is refused, and a refusal is not something a person can act on:
+    // the cursor turns to no-entry and the tab springs back, over a row that
+    // will plainly take a tab. What lands where is settled on drop.
     event.preventDefault();
     event.dataTransfer.dropEffect = 'move';
     clearDropMarkers();
@@ -1376,6 +1436,10 @@ function wireStrip() {
     // is in a window that cannot draw anything here. One of our own moving along
     // the row needs no such announcement, and the marker is enough.
     if (!dragId) el.tabs.classList.add('taking');
+    const spot = insertionAt(draggedEdge(event.clientX));
+    // Where it already is: nothing to show, and a marker there would promise a
+    // move that is not going to happen.
+    if (!spot || (dragId && !changesRow(orderWith(dragId, spot)))) return;
     spot.tab.classList.add(spot.before ? 'drop-before' : 'drop-after');
   });
 
@@ -1389,7 +1453,7 @@ function wireStrip() {
   el.tabs.addEventListener('drop', (event) => {
     if (!carriesTab(event.dataTransfer)) return;
     event.preventDefault();
-    const spot = insertionAt(event.clientX);
+    const spot = insertionAt(draggedEdge(event.clientX));
     clearDropMarkers();
 
     let dropped = null;
@@ -1398,15 +1462,16 @@ function wireStrip() {
     } catch {
       /* not something we put there */
     }
-    // Its own place in the row, which is not a move. dragover refuses the
-    // position so the drop should never arrive, and it is cheap to be sure.
-    if (!dropped?.id || !spot || spot.tab.dataset.id === dropped.id) return;
+    if (!dropped?.id || !spot) return;
 
     const next = orderWith(dropped.id, spot);
 
     // One of our own, moved along the row.
     if (dropped.container === containerId) {
       if (!sessions.has(dropped.id)) return;
+      // Let go where it already was, which is not a move: the row is as it was,
+      // and the daemon has nothing to be told.
+      if (!changesRow(next)) return;
       order = next;
       renderTabs(true);
       send({ t: 'reorder', ids: order });

@@ -161,6 +161,21 @@ const WITH_COMMAND = `ssh -o "ProxyCommand=sleep 900" build-01.test.invalid make
 const HOST2 = 'i-hel-009.test.invalid';
 const DIALLED2 = `ssh -o "ProxyCommand=sleep 900" ops@${HOST2}`;
 
+/*
+ * And a third that wants a verification code, which is what the other two are
+ * really queued behind. Its ProxyCommand asks in the tab and waits, the way a
+ * bastion with 2FA on it does; see test/fixtures/ask-code.sh. Created first, so
+ * that it is the one at the head of the restore queue.
+ */
+const HOST3 = 'b-hel-001.test.invalid';
+const ASKS = join(ROOT, 'test', 'fixtures', 'ask-code.sh');
+const DIALLED3 = `ssh -o "ProxyCommand=${ASKS}" code@${HOST3}`;
+
+// The daemon's own gap between one dial and the next — RESUME_GAP_MS in
+// src/daemon/manager.js — which section 4b needs a number for twice: to wait
+// out more than one of them, and to say what going "without waiting" means.
+const RESUME_GAP_MS = 12000;
+
 let daemon = null;
 
 /**
@@ -321,6 +336,31 @@ async function said(client, id, text, timeout = 6000) {
 }
 
 /**
+ * Only what a restored tab has said since it was given a new shell.
+ *
+ * Everything above the seam is the scrollback from before the crash, and for a
+ * tab that was on a host that is where the command being watched for already
+ * is — the seam's own line names the host too. Nothing below it has been said
+ * before. A tab with no seam yet has not been rebuilt, so it has said nothing.
+ */
+function sinceRestore(client, id) {
+  const seen = client.output.get(id) || '';
+  const seam = seen.lastIndexOf('──── new shell');
+  const below = seam === -1 ? -1 : seen.indexOf('\n', seam);
+  return below === -1 ? '' : seen.slice(below);
+}
+
+/** `said`, for a tab that is coming back rather than one that is new. */
+async function saidSinceRestore(client, id, text, timeout = 6000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (sinceRestore(client, id).includes(text)) return true;
+    await sleep(100);
+  }
+  return false;
+}
+
+/**
  * Note when each of these tabs first says the thing it is watched for.
  *
  * Times are milliseconds from the moment this was set up, which is as close to
@@ -337,15 +377,11 @@ function watchFor(client, wanted) {
   const look = () => {
     for (const [id, text] of Object.entries(wanted)) {
       if (Number.isFinite(at[id])) continue;
-      // Only what this tab has said since it was given a new shell, and only
-      // below the seam rather than including it. Everything it said on the
-      // same subject before the crash is still in its scrollback, and the seam
-      // itself names the host it is about to dial — either would otherwise read
-      // as a connection made instantly.
-      const seen = client.output.get(id) || '';
-      const seam = seen.lastIndexOf('──── new shell');
-      const below = seam === -1 ? -1 : seen.indexOf('\n', seam);
-      if (below !== -1 && seen.slice(below).includes(text)) at[id] = Date.now() - started;
+      // Only what this tab has said since it was given a new shell: everything
+      // it said on the same subject before the crash is still in its
+      // scrollback, and the seam itself names the host it is about to dial —
+      // either would otherwise read as a connection made instantly.
+      if (sinceRestore(client, id).includes(text)) at[id] = Date.now() - started;
     }
     return Object.values(at).every(Number.isFinite);
   };
@@ -382,23 +418,32 @@ async function main() {
   await client.connect();
   await client.await((m) => m.t === 'sessions');
 
+  // First, so that it is first out of the restore queue in section 4b.
   client.send({ t: 'create', cwd: WORK, cols: 80, rows: 24 });
-  const sshTab = await client.await((m) => m.t === 'created');
+  const codeTab = await client.await((m) => m.t === 'created');
+  check('a tab on the host that asks for a code', !!codeTab);
+  if (!codeTab) return report();
+
+  client.send({ t: 'create', cwd: WORK, cols: 80, rows: 24 });
+  const sshTab = await client.await((m) => m.t === 'created' && m.id !== codeTab.id);
   check('a tab to hold the connection', !!sshTab);
   if (!sshTab) return report();
 
   client.send({ t: 'create', cwd: WORK, cols: 80, rows: 24 });
-  const workTab = await client.await((m) => m.t === 'created' && m.id !== sshTab.id);
+  const workTab = await client.await(
+    (m) => m.t === 'created' && m.id !== codeTab.id && m.id !== sshTab.id,
+  );
   check('and one to run something over ssh', !!workTab);
 
   client.send({ t: 'create', cwd: WORK, cols: 80, rows: 24 });
   const otherTab = await client.await(
-    (m) => m.t === 'created' && m.id !== sshTab.id && m.id !== workTab.id,
+    (m) => m.t === 'created' && m.id !== codeTab.id && m.id !== sshTab.id && m.id !== workTab.id,
   );
   check('and one on a second host', !!otherTab);
   if (!otherTab) return report();
 
   await sleep(800);
+  client.send({ t: 'input', id: codeTab.id, data: `${DIALLED3}\n` });
   client.send({ t: 'input', id: sshTab.id, data: `${DIALLED}\n` });
   client.send({ t: 'input', id: workTab.id, data: `${WITH_COMMAND}\n` });
   client.send({ t: 'input', id: otherTab.id, data: `${DIALLED2}\n` });
@@ -461,10 +506,11 @@ async function main() {
   await back.connect();
   await back.await((m) => m.t === 'sessions');
 
-  // Both tabs before anything else is asked, because a window is only sent the
-  // output of the tabs it is showing, and what section 4b is about is *when*
-  // each of these two was dialled — there is no second chance to have been
-  // watching.
+  // All three before anything else is asked, because a window is only sent the
+  // output of the tabs it is showing, and what sections 4b and 4d are about is
+  // *when* each of them was dialled and what the first one said — there is no
+  // second chance to have been watching.
+  back.send({ t: 'attach', id: codeTab.id, cols: 80, rows: 24 });
   back.send({ t: 'attach', id: sshTab.id, cols: 80, rows: 24 });
   back.send({ t: 'attach', id: otherTab.id, cols: 80, rows: 24 });
   await back.await((m) => m.t === 'attached' && m.id === otherTab.id);
@@ -480,6 +526,50 @@ async function main() {
     JSON.stringify(replayed.slice(-300)),
   );
 
+  console.log('\n4b. nothing else is dialled until the first tab has been answered');
+  /*
+   * The other half of going one at a time, and the half a timer cannot do.
+   *
+   * What the first connection is buying for the rest is an answer — the bastion
+   * builds its socket once and every later dial rides it — so until somebody
+   * has given it, dialling the next host does not save that host a question, it
+   * asks a second one. On 21 August fourteen tabs came back, the first stopped
+   * on `Verification code:`, and the twelve-second gap ran out under it twelve
+   * more times: every tab in the window ended up holding a code prompt of its
+   * own. So the queue waits on the question rather than on the clock.
+   */
+  check(
+    'the first tab back is the one stopped at a question',
+    await saidSinceRestore(back, codeTab.id, 'Verification code:', 20000),
+    JSON.stringify(sinceRestore(back, codeTab.id).slice(-200)),
+  );
+
+  // Well past the gap, which is twelve seconds. Nothing may have moved.
+  await sleep(RESUME_GAP_MS + 4000);
+  check(
+    'the tab behind it has not been dialled, gap or no gap',
+    !sinceRestore(back, sshTab.id).includes(`safe@${HOST}`),
+    JSON.stringify(sinceRestore(back, sshTab.id).slice(-200)),
+  );
+  check(
+    'and neither has the one behind that',
+    !sinceRestore(back, otherTab.id).includes(`ops@${HOST2}`),
+    JSON.stringify(sinceRestore(back, otherTab.id).slice(-200)),
+  );
+
+  // The code, at last — typed by a person into the tab that asked for it.
+  const answeredAt = Date.now();
+  back.send({ t: 'input', id: codeTab.id, data: '424242\r' });
+  const released = await saidSinceRestore(back, sshTab.id, `safe@${HOST}`, 20000);
+  check('and once it is answered the next one goes', released,
+    JSON.stringify(sinceRestore(back, sshTab.id).slice(-200)));
+  check(
+    'without waiting out another gap first',
+    released && Date.now() - answeredAt < RESUME_GAP_MS,
+    `${Math.round((Date.now() - answeredAt) / 100) / 10}s after the code`,
+  );
+
+  console.log('\n4c. the tab comes back on the connection it was dialled with');
   // Typed into the shell rather than exec'd around it, so the terminal echoes
   // it: what happened here is legible to whoever opens the tab, and repeatable
   // from its history.
@@ -509,7 +599,7 @@ async function main() {
   check('and ssh is running in the tab again, on the same host', running,
     JSON.stringify(back.tab(sshTab.id)));
 
-  console.log('\n4b. two connections are not dialled at once');
+  console.log('\n4d. two connections are not dialled at once');
   /*
    * The restore this is written for put six tabs back on six hosts in the same
    * millisecond. Every one of them missed the ControlMaster socket the first
@@ -523,7 +613,7 @@ async function main() {
    * about its length. What must be true is only that the second connection was
    * not dialled while the first was still being answered.
    */
-  const spacing = await dialledAt.settled(40000);
+  const spacing = await dialledAt.settled(70000);
   check('the first host was dialled', Number.isFinite(spacing[sshTab.id]), JSON.stringify(spacing));
   check('and so was the second', Number.isFinite(spacing[otherTab.id]), JSON.stringify(spacing));
   check(
@@ -584,7 +674,10 @@ async function main() {
   const parked = await savedOnce((s) => s.containers.some((c) => c.closedAt));
   const group = parked.containers.find((c) => c.id === win);
   check('the window was kept rather than ended', !!group?.closedAt, JSON.stringify(group));
-  check('under the name of the host its first tab is on', group?.name === HOST,
+  // The first tab is the one that was asked for a code, and it is still on the
+  // host that asked — that is the tab the window is named after, not this
+  // section's, and not the directory the window was opened from.
+  check('under the name of the host its first tab is on', group?.name === HOST3,
     JSON.stringify(group?.name));
   check('and marked as a name clio chose, not one somebody typed', group?.named === false,
     JSON.stringify(group?.named));

@@ -43,6 +43,21 @@ const SHELL_READY_MS = 30000;
 const UNTYPED_BYTES = 4096;
 
 /*
+ * How much of the end of the output is read to find the line the cursor is on.
+ * A question that does not fit in this is not one anybody could read either.
+ */
+const TAIL_BYTES = 2048;
+
+/*
+ * Escape sequences, taken out only as far as is needed to see the text: a title
+ * (OSC), a colour or a cursor move (CSI), and the two-byte odds and ends. What
+ * is left of the last line is roughly what somebody looking at the tab reads.
+ */
+const OSC = /\x1b][^\x07\x1b]*(?:\x07|\x1b\\)/g;
+const CSI = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+const SHORT_ESCAPE = /\x1b[()#][0-9A-Za-z]|\x1b[=>78]/g;
+
+/*
  * How long a program has to answer clio before the answer stops being clio's.
  *
  * A repaint starts as soon as the program reads the byte that asked for it, so
@@ -399,6 +414,48 @@ export class Session {
 
   scrollback() {
     return this.chunks.join('');
+  }
+
+  /** What is on the line the cursor is on, with the escapes taken out. */
+  cursorLine() {
+    let tail = '';
+    for (let i = this.chunks.length - 1; i >= 0 && tail.length < TAIL_BYTES; i--) {
+      tail = this.chunks[i] + tail;
+    }
+    const text = tail.slice(-TAIL_BYTES).replace(OSC, '').replace(CSI, '').replace(SHORT_ESCAPE, '');
+    const line = text.slice(text.lastIndexOf('\n') + 1);
+    // A carriage return puts the cursor back at the start of the line, so what
+    // is on the line is whatever was written after the last one.
+    const restart = line.lastIndexOf('\r');
+    return (restart === -1 ? line : line.slice(restart + 1)).trimEnd();
+  }
+
+  /**
+   * Is this tab stopped at a question that only a person can answer?
+   *
+   * The shape of one rather than the words: something has the terminal, and the
+   * cursor is left at the end of a line ending in a colon or a question mark
+   * with no newline after it. `Verification code:`, `Enter passphrase for key
+   * '/home/miles/.ssh/id_rsa':`, `safe@host's password:`, `Are you sure you
+   * want to continue connecting (yes/no/[fingerprint])?` — all of them, without
+   * clio holding a list of other people's wordings, or having to know whether
+   * it is ssh, sudo, a bastion's 2FA or a script on the far end doing the
+   * asking. A program that has finished a line has ended it; one that is
+   * waiting to be answered leaves the cursor sitting after the colon.
+   *
+   * A shell's own prompt is not a question — `$ `, `%`, `❯` — and a shell at
+   * its own prompt has nothing in the foreground anyway, which is the cheaper
+   * half of the test and is why it is asked first.
+   *
+   * What it is for is the restore queue, which must not dial a second host
+   * while the first is still waiting for somebody to read a code off their
+   * phone. See SessionManager.nextResume.
+   */
+  atUnansweredQuestion() {
+    if (!this.pty) return false;
+    if (!foregroundCommand(this.pty.pid)) return false;
+    const line = this.cursorLine();
+    return line.length > 0 && /[:?]$/.test(line);
   }
 
   /** Seed the buffer from disk when reconstructing a session after a reboot. */
