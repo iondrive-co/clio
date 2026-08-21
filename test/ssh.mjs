@@ -133,6 +133,9 @@ const env = {
   // desktop by accident either.
   DISPLAY: undefined,
   WAYLAND_DISPLAY: undefined,
+  // Section 8 is about what clio does when nobody has said anything about this,
+  // so whatever the machine running the test has said about it is dropped.
+  SSH_ASKPASS_REQUIRE: undefined,
   HOME,
   PATH: `${dirname(process.execPath)}:/usr/local/bin:/usr/bin:/bin`,
   XDG_RUNTIME_DIR: RUN,
@@ -305,6 +308,16 @@ async function savedOnce(pred, timeout = 5000) {
     await sleep(150);
   }
   return last ?? { sessions: [] };
+}
+
+/** Wait for a tab to have said something, since output arrives in pieces. */
+async function said(client, id, text, timeout = 6000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if ((client.output.get(id) || '').includes(text)) return true;
+    await sleep(100);
+  }
+  return false;
 }
 
 /**
@@ -579,6 +592,28 @@ async function main() {
   const final = new Client(info2, win);
   await final.connect();
   await final.await((m) => m.t === 'sessions');
+
+  console.log('\n8. the passphrase is asked for in the tab, not on the desktop');
+  // Not what ssh then does with the answer — that wants a display, a key and a
+  // person — but that the shell is told where to ask. OpenSSH puts the question
+  // in a graphical prompt whenever DISPLAY is set and stdin is not a terminal,
+  // and on a restore that is one modal dialog per tab, all of them fighting
+  // over the one keyboard grab and all but a couple of them failing. See the
+  // note in Session.spawn.
+  final.send({ t: 'create', cwd: WORK, cols: 80, rows: 24 });
+  const askTab = await final.await((m) => m.t === 'created');
+  check('a tab to ask in', !!askTab);
+  if (askTab) {
+    await sleep(800);
+    final.send({ t: 'input', id: askTab.id, data: 'echo "clio-askpass=[$SSH_ASKPASS_REQUIRE]"\n' });
+    check(
+      'the shell is told to ask on its own terminal',
+      await said(final, askTab.id, 'clio-askpass=[never]'),
+      JSON.stringify((final.output.get(askTab.id) || '').slice(-200)),
+    );
+    final.send({ t: 'close', id: askTab.id });
+  }
+
   final.send({ t: 'close', id: sshTab.id });
   final.send({ t: 'close', id: workTab.id });
   final.send({ t: 'close', id: otherTab.id });

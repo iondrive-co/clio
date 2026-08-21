@@ -177,6 +177,30 @@ export class Session {
         cols,
         rows,
         env: {
+          /*
+           * Where OpenSSH asks for a passphrase.
+           *
+           * Its rule is that the question goes to a graphical prompt whenever
+           * DISPLAY is set and stdin is not a terminal — and inside a perfectly
+           * good terminal, plenty of things meet that description: keychain in
+           * a profile, ssh-add down a pipe, ssh's own ProxyCommand. One of them
+           * is a dialog nobody asked for. Forty-five of them is what a desktop
+           * gets on the morning after a crash, because every tab's profile runs
+           * in the same second and only one X client can hold the keyboard: a
+           * couple win the grab and ask for a passphrase, and the rest come up
+           * as “Could not grab input. A malicious client may be eavesdropping
+           * on your session.” — one modal dialog per tab, every one of them
+           * waiting to be clicked before the desktop can be used at all. That
+           * was 21 August, 45 tabs, and it is the same restore the note above
+           * SHELL_SETTLE_MS is about: keychain, in every profile, at once.
+           *
+           * A shell clio starts always has a terminal and somebody looking at
+           * it, so the terminal is where the question belongs. First in the
+           * object rather than last, because somebody who has set this for
+           * themselves has decided something about their own desktop and that
+           * decision still wins.
+           */
+          SSH_ASKPASS_REQUIRE: 'never',
           ...process.env,
           ...env,
           TERM: 'xterm-256color',
