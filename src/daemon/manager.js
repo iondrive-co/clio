@@ -15,8 +15,10 @@ import {
 } from '../extensions/index.js';
 import {
   writeState,
+  writeStateAsync,
   readState,
   writeScrollback,
+  writeScrollbackAsync,
   readScrollback,
   removeScrollback,
   pruneScrollback,
@@ -37,6 +39,15 @@ const PROC_POLL_MS = 2000;
 const RESUME_EXTENSIONS = process.env.CLIO_RESUME !== 'off';
 const SCROLLBACK_FLUSH_MS = 3000;
 const STATE_DEBOUNCE_MS = 400;
+
+/*
+ * A write this slow is not clio's doing and not clio's to fix, but it is worth
+ * one line in the log: it is what a machine that has stopped answering for a
+ * moment looks like from in here. A second is far past anything a page cache
+ * does and well short of the tens of seconds a writeback storm takes.
+ */
+const SLOW_WRITE_MS = 1000;
+const SLOW_WRITE_REPORT_MS = 30000;
 
 /*
  * How long the first rebuilt shell gets to itself before the rest follow. The
@@ -238,6 +249,19 @@ export class SessionManager extends EventEmitter {
      * after a restore.
      */
     this.resumeQueues = new Map();
+
+    /**
+     * Which tabs have a scrollback write in the air, and whether the state file
+     * does — see flushScrollback and scheduleSave. Both writes go to the disk
+     * without anything waiting on them, so both need to know not to start a
+     * second one on top of the first.
+     */
+    this.writingScrollback = new Set();
+    this.savingState = false;
+    this.saveStateAgain = false;
+    /** Set while handing over, when saveNow is the only write allowed. */
+    this.stopped = false;
+    this.lastSlowWriteReport = 0;
 
     this.procTimer = setInterval(() => this.pollProcInfo(), PROC_POLL_MS);
     this.flushTimer = setInterval(() => this.flushScrollback(), SCROLLBACK_FLUSH_MS);
@@ -703,11 +727,20 @@ export class SessionManager extends EventEmitter {
    * daemon is changing hands waits in the kernel's buffers and is read by the
    * daemon that takes over, rather than by the one on its way out.
    */
+  /*
+   * Paused means a handover is under way, and saveNow is about to write the last
+   * word synchronously. Nothing may start a write of its own from here: an
+   * unfinished one landing afterwards would put the file back as it was a moment
+   * before. If the successor fails to come up, resumeAll below undoes all of it
+   * — including this.
+   */
   pauseAll() {
+    this.stopped = true;
     for (const session of this.sessions.values()) session.pause();
   }
 
   resumeAll() {
+    this.stopped = false;
     for (const session of this.sessions.values()) session.resume();
   }
 
@@ -1107,19 +1140,81 @@ export class SessionManager extends EventEmitter {
     return changed;
   }
 
+  /*
+   * Write down what has been on screen, without ever waiting for the disk.
+   *
+   * See atomicWriteAsync in persist.js for why not waiting is the point: this
+   * runs every three seconds, and the file it writes for a busy tab is half a
+   * megabyte of it. A tab whose write is still going is left dirty and picked
+   * up on a later tick — what it writes then is a superset of what this one
+   * would have written, so nothing is lost by skipping it.
+   */
   flushScrollback() {
+    if (this.stopped) return;
     for (const session of this.sessions.values()) {
       if (!session.dirty) continue;
+      if (this.writingScrollback.has(session.id)) continue;
       session.dirty = false;
-      writeScrollback(session.id, session.scrollback());
+      this.writingScrollback.add(session.id);
+      const started = Date.now();
+      writeScrollbackAsync(session.id, session.scrollback())
+        .catch((err) => {
+          // Unwritten is still unwritten: let the next tick try again.
+          session.dirty = true;
+          console.error(`[clio] could not save scrollback for ${session.id}:`, err.message);
+        })
+        .finally(() => {
+          this.writingScrollback.delete(session.id);
+          this.noteWriteTime(Date.now() - started);
+        });
     }
   }
 
+  /*
+   * A disk that took seconds to accept half a megabyte is worth saying out loud
+   * once, because it is the answer to a question somebody is otherwise left
+   * guessing at: everything else on the machine stopped for a moment, and clio
+   * was one of the things waiting rather than the thing at fault. Once every
+   * half minute at most — a slow disk is slow for every tab at once, and the
+   * log is no use if the episode fills it.
+   */
+  noteWriteTime(ms) {
+    if (ms < SLOW_WRITE_MS) return;
+    const now = Date.now();
+    if (now - this.lastSlowWriteReport < SLOW_WRITE_REPORT_MS) return;
+    this.lastSlowWriteReport = now;
+    console.error(
+      `[clio] the disk took ${(ms / 1000).toFixed(1)}s to write a tab's scrollback — ` +
+        'the tabs themselves were unaffected',
+    );
+  }
+
   scheduleSave() {
-    if (this.stateTimer) return;
+    if (this.stopped || this.stateTimer) return;
     this.stateTimer = setTimeout(() => {
       this.stateTimer = null;
-      writeState(this.containerList(), this.list());
+      // One at a time, and if anything asked to be saved while the last write
+      // was in the air, save again after it: the file has to end up holding the
+      // tabs as they are now, not as they were when the write started.
+      if (this.savingState) {
+        this.saveStateAgain = true;
+        return;
+      }
+      this.savingState = true;
+      const started = Date.now();
+      writeStateAsync(this.containerList(), this.list())
+        .catch((err) => {
+          this.saveStateAgain = true;
+          console.error('[clio] could not save state:', err.message);
+        })
+        .finally(() => {
+          this.savingState = false;
+          this.noteWriteTime(Date.now() - started);
+          if (this.saveStateAgain) {
+            this.saveStateAgain = false;
+            this.scheduleSave();
+          }
+        });
     }, STATE_DEBOUNCE_MS);
     this.stateTimer.unref?.();
   }

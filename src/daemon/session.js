@@ -1,5 +1,6 @@
 import { spawnPty, adoptPty } from './pty.js';
 import { cwdOf, foregroundCommand } from './procinfo.js';
+import { Screen } from './screen.js';
 import { TitleReader, lastTitleIn } from './termtitle.js';
 import { extensionToState, extensionTitle } from '../extensions/index.js';
 
@@ -130,6 +131,18 @@ export class Session {
     /** Output has arrived since anyone last looked at this session. */
     this.unseenOutput = false;
     /**
+     * What is on this tab's screen, and what was on it when somebody last
+     * looked.
+     *
+     * The pair is what tells a tab with something new in it from a tab that has
+     * been repainted: an agent checking for a new version writes the answer
+     * into its footer and then wipes it again, which is two screensful of
+     * output and no change at all. See ./screen.js, and the decision itself in
+     * ./index.js, which is the side that knows who is looking at what.
+     */
+    this.screen = new Screen({ cols: this.cols, rows: this.rows });
+    this.seenScreen = null;
+    /**
      * What this tab is holding has stopped and is waiting for the user.
      *
      * Set on the edge, when something that was working stops, and only for a
@@ -184,6 +197,10 @@ export class Session {
     this.titleAt = 0;
     this.titles = new TitleReader();
     this.waiting = false;
+    // A shell of its own on a screen of its own: blank, and blank is something
+    // this can be sure of.
+    this.screen = new Screen({ cols, rows });
+    this.seenScreen = null;
 
     this.take(
       spawnPty({
@@ -238,8 +255,46 @@ export class Session {
   adopt({ fd, pid, cols = this.cols, rows = this.rows }) {
     this.cols = cols;
     this.rows = rows;
+    this.replayScreen(cols, rows);
     this.take(adoptPty({ fd, pid }));
     return this;
+  }
+
+  /**
+   * The screen of a pty this process did not start, worked out from the
+   * recording of it.
+   *
+   * Everything the program in here ever wrote is in the buffer — the daemon
+   * standing down flushed it, this one read it back (see seedScrollback) — and
+   * a screen is what you get by playing a recording into a terminal. That is
+   * not an analogy: it is exactly what happens on the other side, because a
+   * window attaching to a tab is handed this same recording and writes it into
+   * a brand new xterm. So this reconstruction and what somebody sees when they
+   * click the tab are the same screen, from the same bytes.
+   *
+   * A tab with nothing recorded is the one case left: whatever is on that
+   * screen happened somewhere this cannot see, and Screen is told to say so
+   * rather than to claim a blank screen it has not earned.
+   *
+   * Costs a parse of the buffer, which is half a megabyte at the very most and
+   * measured in tens of milliseconds. A reload pays it once per tab, and what
+   * it buys is a row of agents that does not go red at the first thing they
+   * repaint after it.
+   */
+  replayScreen(cols = this.cols, rows = this.rows) {
+    const recording = this.scrollback();
+    this.screen = new Screen({ cols, rows, known: !!recording });
+    if (recording) this.screen.write(recording);
+    this.seenScreen = null;
+    /*
+     * And if this tab was not red when it was handed over, that screen has been
+     * seen — because that is what not being red means. Saying so here is what
+     * makes the reconstruction worth doing: without it every tab spends its
+     * first burst after a reload back on the old coarse answer, and a desktop
+     * where reloading is how new code arrives would go on flashing at somebody
+     * every half hour anyway.
+     */
+    if (!this.unseenOutput) this.markSeen();
   }
 
   /** Wire a pty of either kind up to this session. */
@@ -263,6 +318,7 @@ export class Session {
       // which means from the last thing the shell said rather than the first.
       if (this.pending) this.settlePending();
       this.noteTitle(data);
+      this.screen.write(data);
       this.append(data);
       if (this.onData) this.onData(data);
     });
@@ -401,6 +457,29 @@ export class Session {
     return moved;
   }
 
+  /**
+   * This screen has been seen. Whatever is on it now is what somebody is
+   * looking at, so it is the thing the next lot of output has to differ from.
+   */
+  markSeen() {
+    this.seenScreen = this.screen.digest();
+  }
+
+  /**
+   * Is there something on this screen that nobody has seen?
+   *
+   * `null` — not a boolean — when the question cannot be answered: a screen that
+   * met bytes it did not understand, or one inherited from another daemon, or
+   * one nobody has looked at yet. The caller has an older and coarser answer for
+   * that case (see drawsSomething in ./output.js) and this must not be mistaken
+   * for it, in either direction: saying "nothing happened" about a screen this
+   * cannot read is how a tab with a question in it sits there quietly.
+   */
+  screenIsNew() {
+    if (!this.screen.sure || this.seenScreen === null) return null;
+    return this.screen.digest() !== this.seenScreen;
+  }
+
   append(data) {
     this.chunks.push(data);
     this.bytes += Buffer.byteLength(data);
@@ -498,6 +577,7 @@ export class Session {
     if (!cols || !rows) return;
     this.cols = cols;
     this.rows = rows;
+    this.screen.resize(cols, rows);
     if (this.pty) {
       try {
         this.pty.resize(cols, rows);

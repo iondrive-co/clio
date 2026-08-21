@@ -1,0 +1,43 @@
+#!/usr/bin/env node
+/*
+ * A stand-in for an agent's footer, for the unseen-output tests.
+ *
+ * The one thing it does is what Claude Code does every thirty minutes with
+ * nobody near it: paint the version check into the bottom of the screen, wait
+ * for a network round trip, and then paint the footer back the way it was. Two
+ * frames of visible text and a net change of nothing.
+ *
+ * On demand rather than on a timer, so a test can say when: `v` for the version
+ * check, `n` for a line worth reading. The widths of the wipe come from the
+ * strings it is wiping, because a wipe one column short is a screen that really
+ * did change — and the lines are numbered, because writing the same words into
+ * the same cells twice is not a changed screen either, and a test asking for
+ * news has to ask for something new.
+ */
+const write = (text) => process.stdout.write(text);
+
+/** How many times it has had something to say. */
+let said = 0;
+
+const CURRENT = 'current: 1.2.3 - latest: 1.2.3';
+const CHECKING = 'Checking for update';
+
+/** Row 10, column 20, the way a full-screen program addresses its own footer. */
+const at = (body) => `\x1b[?25l\x1b[H\r\x1b[19C\x1b[9B${body}\x1b[24;1H\x1b[?25h`;
+
+// The screen as somebody left it.
+write('\x1b[H\x1b[2J\x1b[10;1Hworking on it');
+
+if (process.stdin.isTTY) process.stdin.setRawMode(true);
+process.stdin.on('data', (data) => {
+  const typed = data.toString();
+  if (typed.includes('v')) {
+    write(at(`\x1b[38;5;244m${CURRENT}\x1b[52G${CHECKING}\x1b[39m`));
+    setTimeout(() => write(at(`${' '.repeat(CURRENT.length)}\x1b[52G${' '.repeat(CHECKING.length)}`)), 500);
+  } else if (typed.includes('n')) {
+    write(`\x1b[12;1Hthe build failed (${++said})\r\n`);
+  }
+});
+
+// Hold the terminal, as the program it stands in for would.
+setInterval(() => {}, 1 << 30);

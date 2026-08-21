@@ -1,4 +1,5 @@
 import { writeFileSync, readFileSync, renameSync, unlinkSync, readdirSync } from 'node:fs';
+import { writeFile, rename } from 'node:fs/promises';
 import { join } from 'node:path';
 import { STATE_FILE, SCROLLBACK_DIR, scrollbackFile } from './paths.js';
 
@@ -32,7 +33,34 @@ function atomicWrite(path, data) {
   renameSync(tmp, path);
 }
 
-export function writeState(containers, sessions) {
+/*
+ * The same write-then-rename, off the daemon's one thread.
+ *
+ * A write into a warm page cache costs a memcpy, which is why everything here
+ * was synchronous to begin with. A write on a machine that has just hit the
+ * kernel's dirty-page limit costs however long writeback takes — and the daemon
+ * is single-threaded, so a write that blocks stops every pty in every window at
+ * once: not a keystroke reaches a shell, not a byte of output reaches a page,
+ * and clio looks for all the world as though it has hung. On 21 August that was
+ * some thirty seconds each time a large commit landed in an IDE on the same
+ * disk, with clio adding 320 KiB a second to the same dirty pile.
+ *
+ * Nothing waits on these. A scrollback flush is a recording of what has already
+ * been shown; if a write is still going when the next one comes round, the tab
+ * is left dirty and written again on the tick after. The tab keeps working
+ * throughout, which is the whole point.
+ *
+ * A tmp name of its own, so that one of these can never be half-way through the
+ * file that saveNow — the last, synchronous write before the daemon goes down —
+ * is writing at the same moment.
+ */
+async function atomicWriteAsync(path, data) {
+  const tmp = `${path}.writing`;
+  await writeFile(tmp, data, { mode: 0o600 });
+  await rename(tmp, path);
+}
+
+function stateText(containers, sessions) {
   // A container with no tabs is a window with nothing in it; restoring one would
   // put an empty frame on screen.
   const occupied = new Set(sessions.map((s) => s.container));
@@ -51,11 +79,22 @@ export function writeState(containers, sessions) {
       })),
     sessions: sessions.map((s) => s.toState()),
   };
+  return JSON.stringify(payload, null, 2);
+}
+
+/** The last word, on the way down: nothing may outlive this one. */
+export function writeState(containers, sessions) {
   try {
-    atomicWrite(STATE_FILE, JSON.stringify(payload, null, 2));
+    atomicWrite(STATE_FILE, stateText(containers, sessions));
   } catch (err) {
     console.error('[clio] could not save state:', err.message);
   }
+}
+
+export function writeStateAsync(containers, sessions) {
+  // The payload is built here and not in the write, so that what lands is the
+  // set of tabs as they were when the save was asked for.
+  return atomicWriteAsync(STATE_FILE, stateText(containers, sessions));
 }
 
 export function readState() {
@@ -89,6 +128,10 @@ export function writeScrollback(id, text) {
   }
 }
 
+export function writeScrollbackAsync(id, text) {
+  return atomicWriteAsync(scrollbackFile(id), text);
+}
+
 export function readScrollback(id) {
   try {
     return readFileSync(scrollbackFile(id), 'utf8');
@@ -98,7 +141,11 @@ export function readScrollback(id) {
 }
 
 export function removeScrollback(id) {
-  for (const path of [scrollbackFile(id), `${scrollbackFile(id)}.tmp`]) {
+  for (const path of [
+    scrollbackFile(id),
+    `${scrollbackFile(id)}.tmp`,
+    `${scrollbackFile(id)}.writing`,
+  ]) {
     try {
       unlinkSync(path);
     } catch {
@@ -116,7 +163,10 @@ export function pruneScrollback(validIds) {
     return;
   }
   for (const name of files) {
-    const id = name.replace(/\.log(\.tmp)?$/, '');
+    // A half-written file counts as belonging to its session, so that pruning
+    // while a write is in flight cannot delete the file that write is about to
+    // rename into place.
+    const id = name.replace(/\.log(\.tmp|\.writing)?$/, '');
     if (!validIds.has(id)) {
       try {
         unlinkSync(join(SCROLLBACK_DIR, name));

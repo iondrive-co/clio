@@ -73,6 +73,24 @@ const BIND_ATTEMPTS = 25;
 // \e[I when it has the keyboard, \e[O when it loses it. Nobody types these.
 const FOCUS_REPORT = /^(?:\x1b\[[IO])+$/;
 
+/*
+ * How long to let a program finish drawing before deciding a tab has something
+ * new in it.
+ *
+ * A frame is not a screen. An agent checking for a new version paints the
+ * answer into its footer, waits for the network and then paints the footer back
+ * the way it was — two frames, a second or so apart, and only the pair of them
+ * is the truth about what is on the screen. Deciding on the first one is how a
+ * tab flashes red at somebody twice an hour with nothing in it to read.
+ *
+ * Long enough to cover that gap, short enough that nobody is kept waiting for a
+ * tab to light up — and nobody is: this is only ever asked about tabs that are
+ * not on anybody's screen. Any output at all restarts nothing; the check simply
+ * happens once per burst, and a burst still arriving when it fires gets another
+ * one behind it.
+ */
+const UNSEEN_SETTLE_MS = 1200;
+
 // Dropping a directory of holiday photos on a terminal is a mistake, and one
 // path per file is not what the person meant. Enough for a handful of files.
 const MAX_DROP_FILES = 20;
@@ -877,6 +895,12 @@ async function main() {
     // waits in the kernel's buffers for whoever reads next, rather than being
     // read into a process that is about to exit and never reaching a window.
     manager.pauseAll();
+    // Nothing more is coming, so every tab still waiting to be judged can be
+    // judged now — and has to be, because the flag is what goes across and a
+    // decision left booked here is one the successor cannot make: it takes the
+    // screen at its word (see Session.replayScreen) and would count the last
+    // second of output as something somebody had already seen.
+    for (const id of [...bursts.keys()]) decideUnseen(id);
     manager.saveNow();
 
     const fds = [];
@@ -1319,26 +1343,116 @@ async function main() {
       }
     }
 
-    // Flag activity in tabs nobody is looking at. Only the false->true edge
-    // broadcasts, so a chatty build does not spam every window with updates.
-    //
-    // A screen a program drew again because clio asked it to is not activity:
-    // see redrawingForClio, and FOCUS_REPORT below for what does the asking.
-    // Neither is output that puts nothing on the screen; see ./output.js.
+    // Flag activity in tabs nobody is looking at.
     const session = manager.get(id);
-    if (
-      session &&
-      !session.unseenOutput &&
-      !watchedByAnyone(id) &&
-      !session.redrawingForClio() &&
-      drawsSomething(data)
-    ) {
-      session.unseenOutput = true;
-      broadcastSessions();
+    if (!session) return;
+    if (watchedByAnyone(id)) {
+      // Somebody is looking at this: what is on the screen now is what they can
+      // see, and so it is what the next output has to differ from. Kept up to
+      // date here rather than worked out when they look away, because looking
+      // away happens down half a dozen paths — another tab clicked, a window
+      // closed, a tab dragged to a window across the desktop — and a baseline
+      // that is only right on some of them is worse than none.
+      session.markSeen();
+      return;
     }
+    noteUnseen(session, data);
   });
 
+  /*
+   * Output has arrived in a tab nobody is watching. Is it news?
+   *
+   * Not answered here. What arrives is a frame, and a frame is not a screen —
+   * see UNSEEN_SETTLE_MS. All that happens now is that the facts about this
+   * burst are kept, and a decision is booked for when the drawing stops.
+   */
+  const bursts = new Map();
+
+  function noteUnseen(session, data) {
+    let burst = bursts.get(session.id);
+    if (!burst) {
+      burst = { drew: false, forClio: false, timer: null };
+      burst.timer = setTimeout(() => decideUnseen(session.id), UNSEEN_SETTLE_MS);
+      burst.timer.unref?.();
+      bursts.set(session.id, burst);
+    }
+    // Both of these are about the moment output arrived rather than the moment
+    // it is judged: a redraw clio asked for is only recognisable while the
+    // asking is recent, and by the time the burst settles it will not be.
+    if (!burst.drew && drawsSomething(data)) burst.drew = true;
+    if (!burst.forClio && session.redrawingForClio()) burst.forClio = true;
+  }
+
+  function forgetUnseen(id) {
+    const burst = bursts.get(id);
+    if (!burst) return;
+    clearTimeout(burst.timer);
+    bursts.delete(id);
+  }
+
+  /**
+   * Whatever was being drawn has stopped. Does this tab have something in it
+   * that nobody has seen?
+   *
+   * The screen answers when it can: a tab is red because there is something on
+   * it to read, so a screen that is character for character the one somebody
+   * last looked at is not a red tab, however many frames it took to get back
+   * there. That is the whole of the fix for an agent's thirty-minute version
+   * check — and, in the other direction, it is why red can now be taken *off* a
+   * tab without anybody clicking it. The program undid what it drew; there is
+   * nothing in there.
+   *
+   * When the screen cannot answer — bytes it did not understand, a pty
+   * inherited from the daemon before this one, a tab nobody has ever looked at
+   * — the older question is asked instead: did any of this output put anything
+   * on a screen at all (see ./output.js), and was it a repaint clio itself
+   * asked for (see redrawingForClio, and FOCUS_REPORT below for what does the
+   * asking). That is exactly what clio did before screens were modelled, and it
+   * only ever errs towards a tab that is red for a repaint.
+   */
+  function decideUnseen(id) {
+    const burst = bursts.get(id) || { drew: false, forClio: false };
+    forgetUnseen(id);
+    const session = manager.get(id);
+    if (!session) return;
+    if (watchedByAnyone(id)) {
+      session.markSeen();
+      return;
+    }
+
+    const news = session.screenIsNew();
+    let wants = session.unseenOutput;
+    if (news === false) {
+      // Back to the screen somebody last saw, whatever it did in between.
+      wants = false;
+    } else if (news === true) {
+      if (burst.forClio) {
+        /*
+         * A different screen, but clio is the one who asked for it: the pane
+         * lost the keyboard, the tab beside it was clicked, the socket came
+         * back, the size moved. What a full-screen program paints in answer to
+         * that is not news — and the excuse has to go into the baseline rather
+         * than being spent on this one burst, or the screen stays different
+         * from the last one anybody saw and the next byte to arrive, however
+         * invisible, reads as news all over again. That is not hypothetical: it
+         * is a program that prints a line when it hears the pane was blurred,
+         * and then puts its mouse modes back a minute later.
+         */
+        session.markSeen();
+      } else {
+        wants = true;
+      }
+    } else if (burst.drew && !burst.forClio) {
+      wants = true;
+    }
+
+    if (session.unseenOutput === wants) return;
+    session.unseenOutput = wants;
+    broadcastSessions();
+  }
+
   manager.on('exit', (id, containerId) => {
+    forgetUnseen(id);
     const payload = JSON.stringify({ t: 'exit', id });
     for (const client of clients) {
       if (client.container !== containerId) continue;
@@ -1398,6 +1512,13 @@ async function main() {
     const focus = (id) => {
       client.focused = id;
       const session = manager.get(id);
+      // Seen, in the plainest sense: it is on somebody's screen. Whatever is on
+      // it is the thing the next output has to differ from, and a decision
+      // booked before they looked has nothing left to decide.
+      if (session) {
+        session.markSeen();
+        forgetUnseen(id);
+      }
       if (session?.unseenOutput || session?.waiting) {
         session.unseenOutput = false;
         // Looking at the tab is the answer to it flashing. Whatever it is
