@@ -342,6 +342,44 @@ async function main() {
   check('typed command produced output', screenText.includes('real-keyboard-42'));
   await page.screenshot({ path: join(SHOTS, '02-after-typing.png') });
 
+  // ---- clicks that land on nothing ---------------------------------------
+  /*
+   * A few pixels of every window belong to no control at all: the padding above
+   * the first row, and the strip down the left of the grid. A mousedown there
+   * has nothing focusable under it, so the browser takes the focus off the
+   * terminal and gives it to nobody — and an unfocused terminal drops every key
+   * in silence, with the same tab open and the cursor still sitting there.
+   *
+   * Which is not a corner: the click a person makes is at the tab they are
+   * already looking at, on the way back from another window, a pixel or two low.
+   */
+  console.log('\n3b. a click that lands on nothing keeps the keyboard');
+  const deadSpots = await page.evaluate(() => {
+    const term = document.querySelector('.pane.active .term').getBoundingClientRect();
+    const grid = document.querySelector('.pane.active .xterm-screen').getBoundingClientRect();
+    return {
+      'just under the tab row': { x: Math.round(grid.x + 60), y: Math.round(term.y + 1) },
+      'on the left edge of the window': { x: Math.round(term.x + 1), y: Math.round(grid.y + 80) },
+    };
+  });
+  for (const [where, spot] of Object.entries(deadSpots)) {
+    await page.locator('.pane.active .xterm-screen').click();
+    await page.mouse.click(spot.x, spot.y);
+    await page.waitForTimeout(400);
+    const marker = `typed-${where.replace(/\W+/g, '-')}`;
+    await page.keyboard.type(`echo ${marker}`);
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(1200);
+    const after = await page.locator('.pane.active').innerText();
+    // Once as the command line it was typed on, once as the output of running
+    // it: a shell that only shows it once never ran anything.
+    check(
+      `the shell still hears the keyboard after a click ${where}`,
+      after.split(marker).length - 1 >= 2,
+      await page.evaluate(() => document.activeElement?.tagName),
+    );
+  }
+
   // ---- contrast of every piece of chrome text ---------------------------
   console.log('\n4. contrast (WCAG AA needs 4.5:1 for body text)');
   await sweepContrast(page, 'first load');
@@ -572,6 +610,18 @@ async function main() {
   check(
     'the new name stuck',
     (await page.locator('.tab').first().innerText()).includes('renamed-for-real'),
+  );
+
+  // Saving a name takes the input box out of the strip, which leaves the focus
+  // on nobody unless something hands it back. A tab that cannot be typed in
+  // after being given a name is not a tab that was renamed.
+  await page.keyboard.type('echo after-the-rename');
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(1200);
+  check(
+    'the shell has the keyboard back afterwards',
+    (await page.locator('.pane.active').innerText()).includes('after-the-rename'),
+    await page.evaluate(() => document.activeElement?.tagName),
   );
 
   // it must survive a reload, i.e. it reached the daemon

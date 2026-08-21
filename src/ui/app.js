@@ -2020,6 +2020,39 @@ updateFontButtons();
 
 window.addEventListener('resize', resizeActive);
 window.addEventListener('focus', () => panes.get(activeId)?.term.focus());
+
+/*
+ * The window has the focus and nothing inside it does: hand it back to the shell.
+ *
+ * A mousedown puts the focus on the nearest thing above it that can hold it, and
+ * where there is nothing it puts it nowhere: off the terminal's textarea and onto
+ * the page body. Every control in the tab row hands it straight back by name.
+ * What has no control to hand it back are the pixels that belong to none of them
+ * — the padding around the grid, and the sliver of it directly under the tab row,
+ * where a click aimed at the tab that is already open lands when it goes a pixel
+ * low. A rename ends the same way: the input box leaves the strip and takes the
+ * focus with it. Nothing looks any different afterwards — same tab, same window,
+ * cursor still sitting there — and every key typed into it is dropped without a
+ * sound. The only ways out are a click in the middle of the terminal or Alt+1,
+ * neither of which is something anybody should have to know.
+ *
+ * Only while the page still has the focus. The same event fires when the whole
+ * window loses it, and taking the focus back there would be clio snatching at a
+ * keyboard that has gone to another window.
+ */
+document.addEventListener('focusout', (event) => {
+  // Somewhere on purpose — a button, a rename box, the picker's name field.
+  if (event.relatedTarget) return;
+  if (!document.hasFocus()) return;
+  // After the click that did it has finished being handled, so that a click
+  // which hands the focus on itself — a tab, the +, the font arrows — is left
+  // to do exactly that.
+  setTimeout(() => {
+    if (!document.hasFocus() || document.activeElement !== document.body) return;
+    panes.get(activeId)?.term.focus();
+  }, 0);
+});
+
 setInterval(reportGeometry, GEOMETRY_POLL_MS);
 
 connect();
