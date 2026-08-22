@@ -86,6 +86,7 @@ const el = {
   panes: document.getElementById('panes'),
   status: document.getElementById('status'),
   ctxmenu: document.getElementById('ctxmenu'),
+  ctxsub: document.getElementById('ctxsub'),
   picker: document.getElementById('picker'),
   fontUp: document.getElementById('font-up'),
   fontDown: document.getElementById('font-down'),
@@ -193,6 +194,18 @@ let disowned = false;
 let daemonReplaced = false;
 let lastTabsSignature = null;
 let renaming = false;
+/**
+ * The browsers this machine has, as the daemon found them. Names to show and
+ * ids to ask back for; the page never learns how any of them is started.
+ */
+let browsers = [];
+/**
+ * The link under the pointer, if there is one: `{ id, url }` for the tab it is
+ * in. xterm says so as the pointer arrives and again as it leaves, which makes
+ * this exactly the link the terminal is underlining — what the eye is on when
+ * the right button goes down.
+ */
+let hoveredLink = null;
 
 // ---------------------------------------------------------------- connection
 
@@ -434,6 +447,11 @@ function handle(msg) {
     // put back where it was dragged from, so nothing is lost but the gesture.
     case 'tab':
       if (!msg.ok) showStatus(`Could not open a window for that tab — ${msg.error}`, 6000);
+      break;
+
+    // Sent once, when this window connects: what goes under Open Link In.
+    case 'browsers':
+      browsers = Array.isArray(msg.browsers) ? msg.browsers : [];
       break;
 
     // Same bargain as a window: only ever sent when the click went nowhere. A
@@ -886,7 +904,36 @@ function ensurePane(id) {
   // app window that means a bare new window of clio's own private profile:
   // signed in to nothing, remembering nothing, and not where you were reading.
   // The daemon hands it to the desktop instead.
-  term.loadAddon(new WebLinksAddon((event, uri) => send({ t: 'openurl', url: uri })));
+  //
+  // And only when Ctrl is held. What is on screen here is not a page: it is
+  // output being selected, scrolled past and clicked on to put the cursor
+  // somewhere, and a URL in the middle of it is something a program printed
+  // rather than something anybody offered to be followed. A plain click that
+  // navigates turns every `git log` with a link in it into a minefield, so a
+  // plain click does what a click on any other character does — and says, once,
+  // what would have opened it.
+  term.loadAddon(
+    new WebLinksAddon(
+      (event, uri) => {
+        if (!event.ctrlKey) {
+          showStatus('Ctrl+click to open a link — or right-click it to choose a browser.', 4000);
+          return;
+        }
+        send({ t: 'openurl', url: uri });
+      },
+      {
+        // Which link the pointer is on, straight from the thing that decides
+        // whether to underline one. The right-click menu asks this rather than
+        // working the answer out again from coordinates.
+        hover: (event, uri) => {
+          hoveredLink = { id, url: uri };
+        },
+        leave: () => {
+          hoveredLink = null;
+        },
+      },
+    ),
+  );
   term.open(termEl);
 
   // Replayed history is not typing, and must never be answered as though it
@@ -897,6 +944,8 @@ function ensurePane(id) {
   // is how `11;rgb:0000/0000/0000` ends up typed at a bash prompt.
   term.onData((data) => {
     if (panes.get(id)?.replaying) return;
+    // A Ctrl+click is this terminal's, not the program's — see ctrlClick.
+    if (ctrlClick(data)) return;
     send({ t: 'input', id, data });
   });
   term.onResize(({ cols, rows }) => send({ t: 'resize', id, cols, rows }));
@@ -918,6 +967,40 @@ function ensurePane(id) {
   pane = { id, root, termEl, term, fit, attached: false, replaying: false };
   panes.set(id, pane);
   return pane;
+}
+
+/*
+ * A click with Ctrl held, on its way to the program as a mouse report.
+ *
+ * A program that asks for mouse reporting — Claude Code does, and so do vim,
+ * tmux and less — is handed every click in the window, Ctrl+click included. So
+ * a Ctrl+click on a link is acted on twice: clio opens it because that is what
+ * Ctrl+click is for, and the program opens it because it was told about a click
+ * on a link it drew. Two tabs, one click.
+ *
+ * The way out is the bargain terminals already make with Shift, which selects
+ * text rather than reaching the program: a click with Ctrl held is the
+ * terminal's own, and the program is not told about it. That is what this is
+ * for — the report has been encoded by the time it reaches here, so it is
+ * recognised rather than intercepted.
+ *
+ * Two encodings, because a program picks which it wants: SGR (DECSET 1006),
+ * which nearly everything asks for now, and the original, where the button and
+ * the coordinates are three bytes offset by 32. In both, bit 4 of the button
+ * says Ctrl was down and bit 6 says it was the wheel — and Ctrl+scroll stays
+ * the program's, being a thing programs do something useful with.
+ */
+const SGR_MOUSE = /^\x1b\[<(\d+);\d+;\d+[Mm]$/;
+const MOUSE_CTRL = 16;
+const MOUSE_WHEEL = 64;
+
+function ctrlClick(data) {
+  const sgr = SGR_MOUSE.exec(data);
+  let button = null;
+  if (sgr) button = Number(sgr[1]);
+  else if (data.length === 6 && data.startsWith('\x1b[M')) button = data.charCodeAt(3) - 32;
+  if (button === null || !Number.isFinite(button)) return false;
+  return (button & MOUSE_CTRL) !== 0 && (button & MOUSE_WHEEL) === 0;
 }
 
 function removePane(id) {
@@ -1498,17 +1581,47 @@ function clearDropMarkers() {
 // ------------------------------------------------------------- context menu
 
 /*
- * Deliberately fixed for now: copy, paste and tab management, nothing more.
+ * Deliberately fixed for now: the link under the pointer if there is one, then
+ * copy, paste and tab management, and nothing else.
  * Everything the configurable menu will need already routes through here —
  * buildMenu() is the single place entries get assembled, so a user config file
  * becomes a matter of generating this array from disk instead of hard-coding it.
  */
-function buildMenu(id) {
+function buildMenu(id, link) {
   const pane = panes.get(id);
   const selection = pane ? pane.term.getSelection() : '';
   const others = order.filter((other) => other !== id && sessions.has(other)).length;
 
-  const entries = [
+  const entries = [];
+
+  // What can be done with a link goes first, because a link is what the right
+  // button was pressed on. The rest of the menu is about the tab, which is
+  // still there underneath it.
+  if (link) {
+    entries.push(
+      {
+        label: 'Open Link',
+        key: 'Ctrl+Click',
+        run: () => send({ t: 'openurl', url: link }),
+      },
+      {
+        // Open Link goes wherever the desktop sends links, which is the right
+        // answer nearly always. This is for the times it is not: the work login
+        // that is only signed in over there, the page that only renders right
+        // in the other one.
+        label: 'Open Link In',
+        submenu: browsers.length
+          ? browsers.map((browser) => ({
+              label: browser.name,
+              run: () => send({ t: 'openurl', url: link, browser: browser.id }),
+            }))
+          : [{ label: 'No browsers found', disabled: true }],
+      },
+      { sep: true },
+    );
+  }
+
+  entries.push(
     {
       label: 'Copy',
       key: 'Ctrl+Shift+C',
@@ -1525,9 +1638,6 @@ function buildMenu(id) {
         if (tab) startRename(tab, id);
       },
     },
-  ];
-
-  entries.push(
     { label: 'Close Tab', run: () => closeTab(id) },
     {
       label: others === 1 ? 'Close Other Tab' : `Close Other Tabs (${others})`,
@@ -1586,11 +1696,15 @@ let menuAt = { x: 0, y: 0 };
 
 function openContextMenu(x, y, id) {
   menuAt = { x, y };
-  renderMenu(buildMenu(id));
+  // Read now, not when the menu is drawn: the pointer moving onto the menu
+  // leaves the link, and by then the terminal has forgotten it was ever there.
+  const link = hoveredLink && hoveredLink.id === id ? hoveredLink.url : null;
+  renderMenu(buildMenu(id, link));
 }
 
 function renderMenu(entries) {
   const menu = el.ctxmenu;
+  closeSubmenu();
   menu.replaceChildren();
 
   let focusMe = null;
@@ -1630,37 +1744,7 @@ function renderMenu(entries) {
       continue;
     }
 
-    const item = document.createElement('div');
-    item.className =
-      'item' + (entry.disabled ? ' disabled' : '') + (entry.danger ? ' danger' : '');
-
-    const label = document.createElement('span');
-    // A tick in a fixed-width gutter rather than a checkbox: an empty box in a
-    // menu reads as something to fill in, and the space has to be held whether
-    // the tick is there or not or the label shifts as it is toggled.
-    if ('checked' in entry) {
-      const tick = document.createElement('span');
-      tick.className = 'tick';
-      tick.textContent = entry.checked ? '✓' : '';
-      label.append(tick);
-    }
-    label.append(entry.label);
-    item.append(label);
-
-    if (entry.key) {
-      const key = document.createElement('span');
-      key.className = 'key';
-      key.textContent = entry.key;
-      item.append(key);
-    }
-
-    if (!entry.disabled) {
-      item.onclick = () => {
-        closeContextMenu();
-        entry.run();
-      };
-    }
-    menu.append(item);
+    menu.append(menuItem(entry, true));
   }
 
   menu.hidden = false;
@@ -1676,12 +1760,107 @@ function renderMenu(entries) {
   focusMe?.select();
 }
 
+/**
+ * One line of a menu, in the menu itself or in a submenu hanging off it.
+ *
+ * `top` says which: only a line in the menu proper can own a submenu, and only
+ * a line in the menu proper closes one on the way past. Without that second
+ * part a menu with two panes open answers the pointer in the pane it left.
+ */
+function menuItem(entry, top) {
+  const item = document.createElement('div');
+  item.className =
+    'item' + (entry.disabled ? ' disabled' : '') + (entry.danger ? ' danger' : '');
+
+  const label = document.createElement('span');
+  // A tick in a fixed-width gutter rather than a checkbox: an empty box in a
+  // menu reads as something to fill in, and the space has to be held whether
+  // the tick is there or not or the label shifts as it is toggled.
+  if ('checked' in entry) {
+    const tick = document.createElement('span');
+    tick.className = 'tick';
+    tick.textContent = entry.checked ? '✓' : '';
+    label.append(tick);
+  }
+  label.append(entry.label);
+  item.append(label);
+
+  if (top && entry.submenu) {
+    item.classList.add('has-sub');
+    const arrow = document.createElement('span');
+    arrow.className = 'key';
+    arrow.textContent = '›';
+    item.append(arrow);
+    // Opened by arriving at the line, the way every other menu on the desktop
+    // does it, and on a click as well for anyone who lands on it by keyboard or
+    // by touch and never hovers anything.
+    item.onmouseenter = () => openSubmenu(item, entry.submenu);
+    item.onclick = () => openSubmenu(item, entry.submenu);
+    return item;
+  }
+
+  if (entry.key) {
+    const key = document.createElement('span');
+    key.className = 'key';
+    key.textContent = entry.key;
+    item.append(key);
+  }
+
+  if (top) item.onmouseenter = closeSubmenu;
+
+  if (!entry.disabled) {
+    item.onclick = () => {
+      closeContextMenu();
+      entry.run();
+    };
+  }
+
+  return item;
+}
+
+/**
+ * The second pane, alongside the line it belongs to.
+ *
+ * Against the right edge of the menu rather than a few pixels clear of it, so
+ * that the pointer crossing from one to the other never passes over the desktop
+ * in between — a gap there is a submenu that closes as you reach for it.
+ */
+function openSubmenu(anchor, entries) {
+  const sub = el.ctxsub;
+  sub.replaceChildren(...entries.map((entry) => menuItem(entry, false)));
+  sub.hidden = false;
+  for (const item of el.ctxmenu.children) item.classList.toggle('sub-open', item === anchor);
+
+  const from = anchor.getBoundingClientRect();
+  const menu = el.ctxmenu.getBoundingClientRect();
+  sub.style.left = `${menu.right - 2}px`;
+  sub.style.top = `${from.top - 4}px`;
+
+  const rect = sub.getBoundingClientRect();
+  // No room to the right: fold it back over the menu instead of off screen.
+  if (rect.right > window.innerWidth) {
+    sub.style.left = `${Math.max(4, menu.left - rect.width + 2)}px`;
+  }
+  if (rect.bottom > window.innerHeight) {
+    sub.style.top = `${Math.max(4, window.innerHeight - rect.height - 4)}px`;
+  }
+}
+
+function closeSubmenu() {
+  el.ctxsub.hidden = true;
+  el.ctxsub.replaceChildren();
+  for (const item of el.ctxmenu.children) item.classList.remove('sub-open');
+}
+
 function closeContextMenu() {
+  closeSubmenu();
   el.ctxmenu.hidden = true;
 }
 
 window.addEventListener('mousedown', (event) => {
-  if (!el.ctxmenu.hidden && !el.ctxmenu.contains(event.target)) closeContextMenu();
+  if (el.ctxmenu.hidden) return;
+  if (el.ctxmenu.contains(event.target) || el.ctxsub.contains(event.target)) return;
+  closeContextMenu();
 });
 window.addEventListener('blur', closeContextMenu);
 

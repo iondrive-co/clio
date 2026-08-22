@@ -11,7 +11,7 @@ import { isAlive, cwdOf } from './procinfo.js';
 import { locate, spool, quote, searchBudget, MAX_SPOOL_BYTES } from './drops.js';
 import { SessionManager } from './manager.js';
 import { drawsSomething } from './output.js';
-import { openBrowserWindow, openUrl, notifyDesktop } from './window.js';
+import { openBrowserWindow, openUrl, browserChoices, notifyDesktop } from './window.js';
 
 const ENTRY = fileURLToPath(import.meta.url);
 const HERE = dirname(ENTRY);
@@ -1657,6 +1657,11 @@ async function main() {
     send(sessionsPayload(client.container));
     if (client.picking) send(groupsPayload(client.container));
 
+    // What the window offers under Open Link In. Read from disk here rather
+    // than in the page, which has no way to look: a browser is a .desktop file
+    // on this machine, and only this side of the socket can see one.
+    send({ t: 'browsers', browsers: browserChoices({ ...process.env, ...launchOverrides }) });
+
     // The page that was in this window before this one did not close: it was
     // killed, and what has been sitting here since is Chrome's error page. That
     // page could not say so — it is Chrome's, not ours, and the one that could
@@ -1767,14 +1772,20 @@ async function main() {
           break;
         }
 
-        // A link in a tab was clicked. A page cannot start a program, and this
-        // one should not be choosing the browser anyway: the desktop knows
-        // which one, and will put it in a tab of the window already open.
+        // A link in a tab was opened. A page cannot start a program, and left to
+        // itself it should not be choosing the browser either: the desktop knows
+        // which one, and will put it in a tab of the window already open. The
+        // exception is somebody choosing one by name from the menu, which
+        // arrives here as the id of one of the entries listed on connect.
         case 'openurl':
           try {
             // The launcher's display, not whatever this daemon was born with,
             // for the same reason opening a window uses it.
-            const opener = openUrl(msg.url, { ...process.env, ...launchOverrides });
+            const opener = openUrl(
+              msg.url,
+              { ...process.env, ...launchOverrides },
+              typeof msg.browser === 'string' ? msg.browser : null,
+            );
             // Deliberately not logging the link itself: what someone clicks in
             // their own terminal is not the daemon log's business.
             console.log(`[clio] handed a link to ${opener}`);

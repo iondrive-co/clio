@@ -42,6 +42,10 @@
     <div id="status" hidden></div>
 
     <div id="ctxmenu" hidden></div>
+    <!-- The menu's second pane: the browsers under Open Link In. Its own
+         element rather than a child of the menu, so that it can hang past the
+         menu's edge without being clipped or moving anything inside it. -->
+    <div id="ctxsub" hidden></div>
 
     <!-- Which set of tabs this window is going to be. Only ever on screen when
          windows that were closed are waiting to be opened again. -->

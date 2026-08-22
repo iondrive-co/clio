@@ -375,7 +375,8 @@ body {
 
 /* ---------- context menu ---------- */
 
-#ctxmenu {
+#ctxmenu,
+#ctxsub {
   position: fixed;
   z-index: 50;
   min-width: 180px;
@@ -387,7 +388,8 @@ body {
   user-select: none;
 }
 
-#ctxmenu .item {
+#ctxmenu .item,
+#ctxsub .item {
   display: flex;
   justify-content: space-between;
   gap: 16px;
@@ -396,12 +398,14 @@ body {
   white-space: nowrap;
 }
 
-#ctxmenu .item:hover:not(.disabled) {
+#ctxmenu .item:hover:not(.disabled),
+#ctxsub .item:hover:not(.disabled) {
   background: var(--accent);
   color: #10101a;
 }
 
-#ctxmenu .item.disabled {
+#ctxmenu .item.disabled,
+#ctxsub .item.disabled {
   color: var(--fg-dim);
 }
 
@@ -423,11 +427,13 @@ body {
   width: 1.2em;
 }
 
-#ctxmenu .item .key {
+#ctxmenu .item .key,
+#ctxsub .item .key {
   color: var(--fg-dim);
 }
 
-#ctxmenu .item:hover:not(.disabled) .key {
+#ctxmenu .item:hover:not(.disabled) .key,
+#ctxsub .item:hover:not(.disabled) .key {
   color: #10101ab0;
 }
 
@@ -451,7 +457,27 @@ body {
   font: inherit;
 }
 
-#ctxmenu .sep {
+/* The second pane of the menu — the browsers under Open Link In. Above the menu
+   it hangs off, because it is placed against its right edge and overlaps it by a
+   couple of pixels so the pointer never crosses bare desktop on the way over. */
+#ctxsub {
+  z-index: 51;
+}
+
+/* The line a submenu came from keeps the highlight while the pointer is over in
+   the other pane. Hover cannot do this — the pointer has left the line by then —
+   and without it the menu looks like it is showing a pane belonging to nothing. */
+#ctxmenu .item.sub-open {
+  background: var(--accent);
+  color: #10101a;
+}
+
+#ctxmenu .item.sub-open .key {
+  color: #10101ab0;
+}
+
+#ctxmenu .sep,
+#ctxsub .sep {
   height: 1px;
   margin: 4px 6px;
   background: var(--border);

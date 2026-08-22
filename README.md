@@ -43,6 +43,8 @@ bin/clio install
 | Drag a tab out of every window | It becomes a window of its own |
 | Middle-click a tab | Close it |
 | Drag a file onto a tab | Type its path there |
+| `Ctrl`+click a link | Open it wherever the desktop sends links |
+| Right-click a link | Open it in a browser you pick by name |
 
 `Ctrl+C`, `Ctrl+D`, `Ctrl+Z` and friends go to the shell untouched — `Ctrl+R`
 included, so reverse search works as it does anywhere else.

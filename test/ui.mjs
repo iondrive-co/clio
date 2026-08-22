@@ -11,7 +11,15 @@
  *   node test/ui.mjs
  */
 import { chromium } from 'playwright';
-import { readFileSync, mkdirSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
+import {
+  readFileSync,
+  writeFileSync,
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  existsSync,
+} from 'node:fs';
 import { execSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
@@ -56,10 +64,49 @@ process.env.CLIO_DEV = '1';
 // conversation nobody had in among somebody's own.
 process.env.CLAUDE_CONFIG_DIR = join(SANDBOX, 'claude-config');
 
+// Section 7d clicks a link, and a link that is opened for real opens a browser
+// on somebody's desktop. These stand in for one: a script that writes down the
+// URL it was given in place of xdg-open, and a directory of .desktop files in
+// place of the browsers installed — which is all a browser is to the menu that
+// offers it. Set here, before the daemon inherits any of it.
+const OPENED = join(SANDBOX, 'opened.txt');
+const RAN = join(SANDBOX, 'ran.txt');
+const RUNNER = join(SANDBOX, 'record-args');
+const URL_OPENER = join(SANDBOX, 'record-url');
+
+writeFileSync(URL_OPENER, `#!/bin/sh\nprintf '%s\\n' "$1" >> ${OPENED}\n`);
+writeFileSync(RUNNER, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${RAN}\n`);
+chmodSync(URL_OPENER, 0o755);
+chmodSync(RUNNER, 0o755);
+process.env.CLIO_URL_OPENER = URL_OPENER;
+
+mkdirSync(join(SANDBOX, 'data', 'applications'), { recursive: true });
+writeFileSync(
+  join(SANDBOX, 'data', 'applications', 'fakefox.desktop'),
+  `[Desktop Entry]\nType=Application\nName=Fakefox\nExec=${RUNNER} fakefox --new-tab %u\nMimeType=x-scheme-handler/http;\n`,
+);
+writeFileSync(
+  join(SANDBOX, 'data', 'applications', 'catbrowser.desktop'),
+  `[Desktop Entry]\nType=Application\nName=Cat Browser\nCategories=Network;WebBrowser;\nExec=${RUNNER} catbrowser %U\n`,
+);
+// Those two and no others: the browsers on the machine running this are not
+// something to write an assertion about.
+process.env.XDG_DATA_HOME = join(SANDBOX, 'data');
+process.env.XDG_DATA_DIRS = join(SANDBOX, 'no-applications-here');
+
 const HANDSHAKE = join(process.env.XDG_RUNTIME_DIR, 'clio', 'daemon.json');
 const SHOTS = join(process.cwd(), 'test', 'screenshots');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function lines(file) {
+  if (!existsSync(file)) return [];
+  return readFileSync(file, 'utf8').trim().split('\n').filter(Boolean);
+}
+
+/** The links handed to the desktop, and the browsers started by name. */
+const urlsOpened = () => lines(OPENED);
+const browsersRun = () => lines(RAN);
 
 // wmctrl is not involved here, but a browser window with no window manager has
 // nothing to give it a frame or a close button, so keep the same requirement.
@@ -558,6 +605,174 @@ async function main() {
     'and nothing is left waiting once its tabs are closed',
     !(await daemonStatus()).containers.some((c) => c.id === parked),
   );
+
+  // ---- a link in a tab ----------------------------------------------------
+  //
+  // A URL on screen here is not a page's link: it is something a program
+  // printed, in the middle of output that gets selected, scrolled past and
+  // clicked on to put the cursor somewhere. So a plain click leaves it alone
+  // and says what would have opened it, Ctrl+click sends it where the desktop
+  // sends links, and the menu offers the browsers this machine has by name.
+  console.log('\n7d. a link in a tab');
+  await page.locator('.pane.active .xterm-screen').click();
+  await page.keyboard.type("printf 'https://example.com/thing\\n'");
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(1200);
+
+  // The middle of the URL where it was printed, in real page coordinates: the
+  // link is text in a row, and clicking it means clicking those pixels.
+  const findLink = () =>
+    page.evaluate(() => {
+      const rows = [...document.querySelectorAll('.pane.active .xterm-rows > div')];
+      // Not the line it was typed on — that one has the printf around it.
+      const row = rows.find(
+        (r) => r.textContent.includes('https://example.com/thing') && !r.textContent.includes('printf'),
+      );
+      const span = row && [...row.children].find((c) => c.textContent.includes('https://example.com/thing'));
+      if (!span) return null;
+      const rect = span.getBoundingClientRect();
+      return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+    });
+  const linkSpot = await findLink();
+  check('the link is on screen', !!linkSpot);
+  // Somewhere harmless if it is not, so that the checks below fail rather than
+  // the file stopping here and taking every section after it with it.
+  const at = linkSpot || { x: 900, y: 600 };
+
+  await page.mouse.move(at.x, at.y);
+  await page.waitForTimeout(300);
+  await page.mouse.click(at.x, at.y);
+  await page.waitForTimeout(700);
+  check('a plain click opens nothing', urlsOpened().length === 0, urlsOpened().join(' | '));
+  check(
+    'and says how to open it instead',
+    (await page.locator('#status').innerText()).includes('Ctrl+click'),
+    await page.locator('#status').innerText(),
+  );
+
+  await page.keyboard.down('Control');
+  await page.mouse.click(at.x, at.y);
+  await page.keyboard.up('Control');
+  await page.waitForTimeout(700);
+  check(
+    'Ctrl+click hands it to the desktop',
+    urlsOpened().join() === 'https://example.com/thing',
+    urlsOpened().join(' | '),
+  );
+
+  await page.mouse.move(at.x, at.y);
+  await page.waitForTimeout(300);
+  await page.mouse.click(at.x, at.y, { button: 'right' });
+  await page.waitForTimeout(400);
+  const linkMenu = await page.locator('#ctxmenu .item').allInnerTexts();
+  check('right-clicking a link offers to open it', linkMenu.some((t) => t.startsWith('Open Link\n')));
+  check('and to choose what opens it', linkMenu.some((t) => t.startsWith('Open Link In')));
+
+  await page.locator('#ctxmenu .item', { hasText: 'Open Link In' }).hover();
+  await page.waitForTimeout(300);
+  check('the browsers are under it', await page.locator('#ctxsub').isVisible());
+  const offeredBrowsers = await page.locator('#ctxsub .item').allInnerTexts();
+  check(
+    'and they are the ones this machine has',
+    offeredBrowsers.join(', ') === 'Cat Browser, Fakefox',
+    offeredBrowsers.join(', '),
+  );
+  await page.screenshot({ path: join(SHOTS, '04c-open-link-in.png') });
+  await sweepContrast(page, 'open link in');
+
+  await page.locator('#ctxsub .item', { hasText: 'Fakefox' }).click();
+  await page.waitForTimeout(800);
+  check(
+    'choosing one starts it, with the arguments its .desktop file gives it',
+    browsersRun().join() === 'fakefox --new-tab https://example.com/thing',
+    browsersRun().join(' | '),
+  );
+  check('and the menu goes away', await page.locator('#ctxmenu').isHidden());
+  check('with its second pane', await page.locator('#ctxsub').isHidden());
+  check(
+    'the desktop was not asked as well',
+    urlsOpened().length === 1,
+    urlsOpened().join(' | '),
+  );
+
+  // A menu summoned anywhere else is the menu it has always been: there is no
+  // link to open, and nothing about links in it.
+  await page.mouse.move(at.x, at.y + 60);
+  await page.waitForTimeout(300);
+  await page.mouse.click(at.x, at.y + 60, { button: 'right' });
+  await page.waitForTimeout(400);
+  const plainMenu = await page.locator('#ctxmenu .item').allInnerTexts();
+  check(
+    'a right-click away from a link says nothing about links',
+    !plainMenu.some((t) => t.startsWith('Open Link')),
+    plainMenu.join(' | '),
+  );
+  await page.keyboard.press('Escape');
+  await page.mouse.click(550, 500);
+  await page.waitForTimeout(300);
+
+  // A program that asks for mouse reporting is handed every click in the
+  // window. If it draws links of its own — Claude Code does — it opens the one
+  // that was clicked on top of the one clio opened: two browser tabs, one
+  // click. So a Ctrl+click is the terminal's and is not passed on, the same
+  // bargain a terminal already makes with Shift for selecting text. Ordinary
+  // clicks still go to the program, or nothing with a mouse would work at all.
+  //
+  // `cat -v` stands in for such a program: it asks for nothing itself, but the
+  // printf before it turns reporting on, and it shows every byte it is sent.
+  await page.locator('.pane.active .xterm-screen').click();
+  // The Escape that closed the menu above went to the shell, where it is the
+  // start of a key sequence; Ctrl+C puts the line back to a clean prompt.
+  await page.keyboard.press('Control+C');
+  await page.waitForTimeout(400);
+  await page.keyboard.type("printf '\\033[?1000h\\033[?1006h'; cat -v");
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(1000);
+
+  const reportSpot = (await findLink()) || at;
+  const openedBefore = urlsOpened().length;
+  const screenBefore = (await page.locator('.pane.active').innerText()).length;
+
+  await page.mouse.move(reportSpot.x, reportSpot.y);
+  await page.waitForTimeout(300);
+  await page.keyboard.down('Control');
+  await page.mouse.click(reportSpot.x, reportSpot.y);
+  await page.keyboard.up('Control');
+  await page.waitForTimeout(1000);
+
+  const afterCtrl = (await page.locator('.pane.active').innerText()).slice(screenBefore);
+  check(
+    'Ctrl+click on a link opens it once',
+    urlsOpened().length === openedBefore + 1,
+    `${urlsOpened().length - openedBefore} opened`,
+  );
+  check(
+    'and the program in the tab is never told about that click',
+    !/\[<\d+;\d+;\d+[Mm]/.test(afterCtrl),
+    JSON.stringify(afterCtrl),
+  );
+
+  const screenAfter = (await page.locator('.pane.active').innerText()).length;
+  await page.mouse.click(reportSpot.x, reportSpot.y);
+  await page.waitForTimeout(1000);
+  const afterPlain = (await page.locator('.pane.active').innerText()).slice(screenAfter);
+  check(
+    'an ordinary click still reaches it',
+    /\[<\d+;\d+;\d+[Mm]/.test(afterPlain),
+    JSON.stringify(afterPlain),
+  );
+  check(
+    'and still opens nothing',
+    urlsOpened().length === openedBefore + 1,
+    `${urlsOpened().length - openedBefore} opened`,
+  );
+
+  // Put the tab back the way the rest of this file expects it.
+  await page.keyboard.press('Control+C');
+  await page.waitForTimeout(400);
+  await page.keyboard.type("printf '\\033[?1000l\\033[?1006l'");
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(600);
 
   // ---- closing tabs ------------------------------------------------------
   console.log('\n8. closing tabs');
