@@ -831,6 +831,12 @@ export class SessionManager extends EventEmitter {
       session.append(`\x1b[38;5;180m     to pick that up again:  ${lost.command}\x1b[0m\r\n`);
     }
 
+    // Everything this tab draws from here until it goes quiet is clio putting
+    // it back — the profile, the resume command being echoed, the agent reading
+    // its transcript — and none of it is something to go and read. See
+    // Session.beginArrival, and the flag itself in ./index.js.
+    session.beginArrival();
+
     try {
       session.spawn({ cwd: this.validCwd(session.cwd), cols, rows, env: this.launchEnv });
     } catch (err) {

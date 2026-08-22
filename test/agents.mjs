@@ -296,6 +296,25 @@ async function main() {
     back.tab(agentTab.id)?.waiting === false,
     JSON.stringify(back.tab(agentTab.id)?.waiting),
   );
+  /*
+   * Nor red, which is the same argument about the other flag. Everything these
+   * tabs have drawn since the daemon came back — a login profile, the seam, the
+   * resume command being echoed, an agent painting itself — is clio putting
+   * them back, and none of it is something to go and read. The tab next door is
+   * the one that proves it: nobody has attached to that one, so it is a tab
+   * nobody is looking at, which is the only kind that can go red at all. See
+   * ARRIVING_QUIET_MS in src/daemon/session.js.
+   */
+  // Waited for, because the tab next door is rebuilt behind the lead and a tab
+  // with no shell in it yet has drawn nothing to be judged on. Then a beat for
+  // the daemon to make up its mind about what it drew; see UNSEEN_SETTLE_MS.
+  for (let i = 0; i < 100 && !back.tab(plainTab.id)?.pid; i++) await sleep(200);
+  await sleep(2500);
+  check(
+    'and neither tab came back red',
+    back.tab(agentTab.id)?.unseenOutput === false && back.tab(plainTab.id)?.unseenOutput === false,
+    JSON.stringify([back.tab(agentTab.id)?.unseenOutput, back.tab(plainTab.id)?.unseenOutput]),
+  );
 
   console.log('\n4. the tab next door is left alone');
   back.send({ t: 'attach', id: plainTab.id, cols: 80, rows: 24 });

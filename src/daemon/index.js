@@ -1419,6 +1419,20 @@ async function main() {
       session.markSeen();
       return;
     }
+    if (session.arriving() && !session.atUnansweredQuestion()) {
+      // Not news: this tab is still being put back, and what it has drawn so
+      // far is the state it is coming back as. Taking it as seen is what makes
+      // that the thing later output is measured against — without it the whole
+      // row is red before anybody has opened a window. See ARRIVING_QUIET_MS.
+      //
+      // Unless it has stopped at a question, which is the one thing a restore
+      // can produce that somebody has to do something about: a key's passphrase,
+      // a bastion's verification code. The tabs behind it in the queue are
+      // waiting on that answer (see nextResume), so it is the opposite of noise
+      // — it is the only tab in the row worth looking at.
+      session.markSeen();
+      return;
+    }
 
     const news = session.screenIsNew();
     let wants = session.unseenOutput;

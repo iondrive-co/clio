@@ -557,6 +557,23 @@ async function main() {
     JSON.stringify(sinceRestore(back, otherTab.id).slice(-200)),
   );
 
+  /*
+   * And the row says which tab it is. Everything a restore draws is clio
+   * putting the tabs back and none of it turns a tab red — see
+   * ARRIVING_QUIET_MS in src/daemon/session.js, written because a restore used
+   * to light up every tab at once. A question is the exception, and has to be:
+   * the whole window is stopped behind this one until somebody answers it.
+   */
+  // Asked of everything the row has been told since the restore rather than of
+  // it now: this window attaches to the tab holding the question, and looking
+  // at a tab is the answer to it being red.
+  const everRed = (id) =>
+    back.messages.some(
+      (m) => m.t === 'sessions' && m.sessions.find((s) => s.id === id)?.unseenOutput,
+    );
+  check('the tab holding the question went red, so it could be found', everRed(codeTab.id));
+  check('and the tabs waiting behind it did not', !everRed(otherTab.id) && !everRed(sshTab.id));
+
   // The code, at last — typed by a person into the tab that asked for it.
   const answeredAt = Date.now();
   back.send({ t: 'input', id: codeTab.id, data: '424242\r' });

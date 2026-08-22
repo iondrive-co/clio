@@ -69,6 +69,31 @@ const SHORT_ESCAPE = /\x1b[()#][0-9A-Za-z]|\x1b[=>78]/g;
  */
 const REDRAW_MS = 500;
 
+/*
+ * How long a tab that clio has just put back goes on arriving.
+ *
+ * A restore is clio talking, from the first byte to the last: it started the
+ * shell, it typed the resume command, and everything drawn in answer to that is
+ * the tab coming back rather than anything happening in it. On 22 August every
+ * tab in the row was red the moment the windows opened after a restart, which
+ * is the flag saying "there is something in here to read" about a screen nobody
+ * had done anything to — and about thirteen tabs at once, which is the same as
+ * saying nothing at all.
+ *
+ * So a tab that has just been given a shell is arriving until it has been quiet
+ * for a while, and the screen it goes quiet on is the state it came back as —
+ * the thing later output is compared against. Quiet rather than a fixed wait
+ * because the parts of a restore arrive seconds apart: a login profile, then a
+ * resume command typed into it, then an agent reading a transcript off the disk
+ * and painting itself. Ten seconds bridges those and is still short enough that
+ * a tab which really does have news is only quiet for that long once.
+ *
+ * The cap is for the tab that never goes quiet — something restored into a tail
+ * or a build — which would otherwise never be able to say anything again.
+ */
+const ARRIVING_QUIET_MS = 10000;
+const ARRIVING_MAX_MS = 120000;
+
 let nextOrder = 0;
 
 export class Session {
@@ -165,6 +190,14 @@ export class Session {
      * unseen activity in ./index.js.
      */
     this.redrawAskedAt = 0;
+    /**
+     * While this is in the future, the tab is still coming back and what it
+     * draws is the state it comes back as; see ARRIVING_QUIET_MS and
+     * beginArrival. The cap is the same window's outside edge, so a tab that
+     * never stops drawing stops being excused for it.
+     */
+    this.arrivingUntil = 0;
+    this.arrivingCap = 0;
 
     this.onData = null; // set by the manager to fan out to attached clients
     this.onExit = null;
@@ -317,6 +350,10 @@ export class Session {
       // Still drawing, so still not finished. The wait is measured from here,
       // which means from the last thing the shell said rather than the first.
       if (this.pending) this.settlePending();
+      // Still drawing itself back means still arriving. Extended from the last
+      // byte rather than the first, for the same reason SHELL_SETTLE_MS is, and
+      // never past the cap set when it started coming back.
+      if (this.arriving()) this.arrivingUntil = Date.now() + ARRIVING_QUIET_MS;
       this.noteTitle(data);
       this.screen.write(data);
       this.append(data);
@@ -424,6 +461,12 @@ export class Session {
 
     this.whenReady((ready) => {
       if (ready) {
+        // Typed by clio, so what comes back is the tab still arriving — and the
+        // clock starts here rather than at the shell, because a queued resume
+        // can be typed a long way after the shell that will run it was started.
+        // See ARRIVING_QUIET_MS, and RESUME_GAP_MS in ./manager.js for the wait
+        // this is measured from the far side of.
+        this.beginArrival();
         this.write(text);
       } else if (this.pty) {
         this.append(
@@ -640,6 +683,20 @@ export class Session {
   /** Is the output arriving now the answer to something clio asked for? */
   redrawingForClio() {
     return Date.now() - this.redrawAskedAt < REDRAW_MS;
+  }
+
+  /**
+   * clio has just put this tab back: from here until it goes quiet, what it
+   * draws is not news but the screen it is coming back as.
+   */
+  beginArrival(now = Date.now()) {
+    this.arrivingUntil = now + ARRIVING_QUIET_MS;
+    this.arrivingCap = now + ARRIVING_MAX_MS;
+  }
+
+  /** Is this tab still arriving? */
+  arriving(now = Date.now()) {
+    return now < this.arrivingUntil && now < this.arrivingCap;
   }
 
   /** Refresh cwd + running command from /proc. Cheap enough to poll. */

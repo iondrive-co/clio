@@ -502,6 +502,44 @@ async function daemonTests() {
   check('the line still counts as unread on the other side of the reload',
     client.red(painting.id));
 
+  /*
+   * And the other way a tab comes back: the machine was restarted, so there is
+   * no pty to inherit and every tab is rebuilt from disk with a new shell in
+   * it. All of that drawing is clio putting the row back — a profile, a seam, a
+   * resume command typed into a shell that has only just arrived — and on
+   * 22 August the row was red before anybody had opened a window, which is the
+   * flag saying "something in here to read" about thirteen tabs at once.
+   */
+  console.log('\n6. a restart, and the tabs that come back from it');
+  // The state on disk is what a restore is built from, so let the daemon flush
+  // before it is taken away.
+  await sleep(3500);
+  const beforeRestart = last.pid;
+  client.close();
+  execFileSync(join(ROOT, 'bin', 'clio'), ['stop'], { env, stdio: 'ignore' });
+  execFileSync(join(ROOT, 'bin', 'clio'), ['start'], { env, stdio: 'ignore' });
+  const restored = await daemonAfter(beforeRestart);
+  check('a daemon is running again', !!restored && restored.pid !== beforeRestart);
+  if (!restored) return;
+
+  client = new Client(restored, '0ff1ce00');
+  await client.connect();
+  await client.await((m) => m.t === 'sessions');
+  // Long enough for the shells, their profiles and their prompts.
+  await sleep(6000);
+  check('both tabs came back', client.sessions.length === 2, `${client.sessions.length} tab(s)`);
+  check('and neither of them is red', !client.red(painting.id) && !client.red(other.id));
+  check('nor was either of them on the way back',
+    !client.everRed.has(painting.id) && !client.everRed.has(other.id));
+
+  // Once a tab has stopped arriving, the screen it stopped on is the state it
+  // came back as — and anything after that is news again.
+  await sleep(11000);
+  client.send({ t: 'input', id: painting.id, data: 'echo something-new\n' });
+  await sleep(2500);
+  check('a line typed into one afterwards still turns it red', client.red(painting.id));
+  check('and the tab beside it is left alone', !client.red(other.id));
+
   client.close();
 }
 
