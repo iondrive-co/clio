@@ -620,16 +620,23 @@ export class SessionManager extends EventEmitter {
      * other 23 skip the work. Against that, every one of those tabs is without
      * a shell until it is over, so it cannot be much longer either.
      *
-     * And when it does run out — nobody at the desk, the question still on the
-     * screen — the rest do *not* all go at once. That was the old behaviour and
-     * it was survivable in the way a fire is survivable: on 24 August it meant
-     * sixty-two profiles asking for the same passphrase, forty-one of them
-     * still asking ten minutes later. What the lead was buying has not been
-     * bought, so the argument for going together has not been made, and the
-     * tabs follow one at a time instead — each one its own chance to answer the
-     * question, and no tab left without a shell for ever. The first of them to
-     * get through its profile cleanly ends that: it has done the work the lead
-     * was supposed to do, and everybody behind it goes together.
+     * And the rest only go together if the lead got through *clear* — which
+     * means two things, and the second one is the one that was learned the hard
+     * way. It has to have reached its prompt, and nothing may have stopped it to
+     * ask a question on the way. A profile that asked once will ask the next tab
+     * the same thing unless the answer was what it wanted, and clio cannot know
+     * whether it was: a passphrase typed wrong, an empty line, a Ctrl-C — all of
+     * them leave a profile that ran to the end and an agent with nothing in it,
+     * and releasing sixty-one shells on the strength of that is the 24 August
+     * restore again, which was sixty-two profiles asking for the same passphrase
+     * and forty-one of them still asking ten minutes later.
+     *
+     * So a tab that was asked anything is followed by one tab, not by all of
+     * them. That tab is the test of whether the answer took: if its own profile
+     * comes through without asking, the work is done and everybody behind it
+     * goes together; if it asks too, the next one follows it alone. Either way
+     * only one tab is ever being asked at a time, and no tab is left without a
+     * shell for ever.
      */
     const [first, ...rest] = rebuilt;
     if (!first) return this.list().length;
@@ -639,10 +646,10 @@ export class SessionManager extends EventEmitter {
     const oneAtATime = (queue) => {
       const [next, ...later] = queue;
       if (!next) return;
-      open(next, (through) => (through ? together(later) : oneAtATime(later)));
+      open(next, (clear) => (clear ? together(later) : oneAtATime(later)));
     };
 
-    open(first, (through) => (through ? together(rest) : oneAtATime(rest)));
+    open(first, (clear) => (clear ? together(rest) : oneAtATime(rest)));
 
     return this.list().length;
   }
@@ -806,11 +813,12 @@ export class SessionManager extends EventEmitter {
    * because a restore that stops halfway through is worse than any of the
    * things waiting for it.
    *
-   * What it is told is whether the shell ever actually came free — false means
-   * the cap ran out with something still in front of it, which on a restore is
-   * a profile stopped on a question nobody has answered. The tabs behind this
-   * one need that: what they do next depends on whether the work this tab was
-   * supposed to do for all of them got done.
+   * What it is told is whether this tab came back *clear*: the shell reached its
+   * own prompt, and nothing stopped it to ask a question on the way. False means
+   * one or the other — the cap ran out with something still in front of it, or a
+   * profile stopped to ask for a passphrase. The tabs behind this one need that:
+   * what they do next depends on whether the work this tab was supposed to do
+   * for all of them got done, and a question is the sign that it may not have.
    */
   reopen(session, { cols, rows, then = null } = {}) {
     const known = resumeExtension(session.ext, { cwd: session.cwd });
@@ -877,7 +885,7 @@ export class SessionManager extends EventEmitter {
       session.ext = { ...session.ext, pid: null, resumedAt: Date.now() };
     } else {
       // Nothing to type, so the only thing left to wait for is the profile.
-      if (then) session.whenReady((ready) => then(ready), { cap: RESTORE_LEAD_MS });
+      if (then) session.whenReady((ready, how) => then(ready && !how?.asked), { cap: RESTORE_LEAD_MS });
       // Nothing was brought back, so nothing is being held. Saying otherwise
       // would leave the tab offering to resume something that is not there.
       session.ext = null;
@@ -908,7 +916,10 @@ export class SessionManager extends EventEmitter {
    */
   queueResume(session, plan, then = null) {
     if (!plan.alone) {
-      session.typeWhenReady(plan.command, { run: plan.run, onSettled: (typed) => then?.(typed) });
+      session.typeWhenReady(plan.command, {
+        run: plan.run,
+        onSettled: (typed, how) => then?.(typed && !how?.asked),
+      });
       return;
     }
 
@@ -980,8 +991,8 @@ export class SessionManager extends EventEmitter {
 
     head.session.typeWhenReady(head.plan.command, {
       run: head.plan.run,
-      onSettled: (typed) => {
-        head.then?.(typed);
+      onSettled: (typed, how) => {
+        head.then?.(typed && !how?.asked);
         // Never typed, because something else had the terminal for the whole of
         // its wait. Nothing was dialled, so there is nothing to give room to.
         if (!typed) {

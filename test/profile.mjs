@@ -296,9 +296,12 @@ async function main() {
 
   const scriptTab = await client.newTab();
   const plainTab = await client.newTab();
+  // A third, because two tabs cannot tell "the one behind it followed" from
+  // "everything behind it followed", and that is the whole of section 6.
+  const lastTab = await client.newTab();
   check('a tab to run the script in', !!scriptTab);
-  check('and one behind it', !!plainTab);
-  if (!scriptTab || !plainTab) return report();
+  check('and two behind it', !!plainTab && !!lastTab);
+  if (!scriptTab || !plainTab || !lastTab) return report();
 
   // The first shell of the machine asks, and something has to answer it or
   // nothing else in this test can happen. This is a person at the desk.
@@ -428,6 +431,59 @@ async function main() {
   );
 
   /*
+   * And the answer that does not take.
+   *
+   * A profile can run to the end and still leave the machine with nothing in
+   * its agent: a passphrase typed wrong, an empty line, a Ctrl-C. Clio cannot
+   * know which — it does not know what the profile was for — so what it goes on
+   * is that a question was asked at all. One tab follows, not sixty-one, and
+   * that tab is the test of whether the answer took.
+   */
+  console.log('\n6. an answer that does not take, and the tabs still come one at a time');
+  back.close();
+  daemon.kill('SIGKILL');
+  rmSync(LOCK, { force: true });
+  rmSync(ANSWERS, { force: true });
+  await sleep(700);
+
+  const info3 = await startDaemon();
+  const three = new Client(info3, win);
+  await three.connect();
+  await three.await((m) => m.t === 'sessions');
+  const inOrder = [scriptTab, plainTab, lastTab].sort((a, b) => (three.tab(a)?.order ?? 0) - (three.tab(b)?.order ?? 0));
+  const [lead, second, third] = inOrder;
+  for (const id of inOrder) three.send({ t: 'attach', id, cols: 80, rows: 24 });
+
+  const leadAsks = await three.said(lead, 'Enter passphrase', 12000);
+  check('the lead is asked', leadAsks, JSON.stringify(three.since(lead).slice(-200)));
+  // A bare newline: keychain gives up, the profile finishes, and the key is
+  // still not in the agent — which is the case clio has to be careful about.
+  three.send({ t: 'input', id: lead, data: '\n' });
+
+  const secondAsks = await three.said(second, 'Enter passphrase', 20000);
+  check('the tab behind it follows, and is asked in its turn', secondAsks,
+    `${three.tab(second)?.status}: ${JSON.stringify(three.since(second).slice(-200))}`);
+  check(
+    'and the one behind *that* has not been started',
+    three.tab(third)?.status === 'restorable',
+    `${three.tab(third)?.status}`,
+  );
+
+  // Answering it for real ends the queue: the last tab's profile has nothing to
+  // ask, so it comes back on the strength of that.
+  three.send({ t: 'input', id: second, data: `${PASSPHRASE}\n` });
+  const lastUp = await (async () => {
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline) {
+      if (three.tab(third)?.status === 'live') return true;
+      await sleep(250);
+    }
+    return false;
+  })();
+  check('and once it is answered the rest come back', lastUp, `${three.tab(third)?.status}`);
+  three.close();
+
+  /*
    * And the other way it can go: a profile that never comes free at all.
    *
    * The cap is the backstop for that, and what happens when it runs out is the
@@ -440,24 +496,23 @@ async function main() {
    * this can be seen in forty seconds instead of the two and a half minutes a
    * standing question is given. See QUESTION_HOLD_MS.
    */
-  console.log('\n6. a profile that never comes free, and the tabs behind it');
-  back.close();
+  console.log('\n7. a profile that never comes free, and the tabs behind it');
   daemon.kill('SIGKILL');
   writeFileSync(join(HOME, '.bashrc'), ['sleep 40', 'PS1="sandbox$ "', ''].join('\n'));
   await sleep(700);
 
-  const info3 = await startDaemon();
-  const held = new Client(info3, win);
+  const info4 = await startDaemon();
+  const held = new Client(info4, win);
   await held.connect();
   await held.await((m) => m.t === 'sessions');
-  const lead = held.tab(scriptTab)?.order <= held.tab(plainTab)?.order ? scriptTab : plainTab;
-  const behind = lead === scriptTab ? plainTab : scriptTab;
+  const stuckOrder = [scriptTab, plainTab, lastTab].sort((a, b) => (held.tab(a)?.order ?? 0) - (held.tab(b)?.order ?? 0));
+  const [stuckLead, behind] = stuckOrder;
 
   await sleep(20000);
   check(
     'twenty seconds in, the lead still has the terminal and the tab behind it has no shell',
-    held.tab(lead)?.status === 'live' && held.tab(behind)?.status === 'restorable',
-    `lead ${held.tab(lead)?.status}, behind ${held.tab(behind)?.status}`,
+    held.tab(stuckLead)?.status === 'live' && held.tab(behind)?.status === 'restorable',
+    `lead ${held.tab(stuckLead)?.status}, behind ${held.tab(behind)?.status}`,
   );
 
   // The cap, and the bargain it falls back to: the command is named in the tab
@@ -471,7 +526,7 @@ async function main() {
     return false;
   })();
   check('the tab behind it gets its shell once the cap runs out', gaveUp, `${held.tab(behind)?.status}`);
-  if (lead === scriptTab) {
+  if (stuckLead === scriptTab) {
     held.send({ t: 'attach', id: scriptTab, cols: 80, rows: 24 });
     const stuck = (await held.await((m) => m.t === 'attached' && m.id === scriptTab))?.scrollback || '';
     check(
@@ -483,6 +538,7 @@ async function main() {
 
   held.send({ t: 'close', id: scriptTab });
   held.send({ t: 'close', id: plainTab });
+  held.send({ t: 'close', id: lastTab });
   await sleep(600);
   held.close();
 

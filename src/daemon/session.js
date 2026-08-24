@@ -466,6 +466,11 @@ export class Session {
    * prompt — `done(true)` — or when `cap` runs out with it still busy, which is
    * `done(false)` and means somebody else has the terminal.
    *
+   * The second argument is what happened on the way: `{ asked }` is true if
+   * this shell stopped to ask somebody something while it was starting up,
+   * whether or not it was answered in the end. A caller waiting on one shell on
+   * behalf of others cares about that as much as about the prompt.
+   *
    * Only one of these at a time per session; a second replaces the first, which
    * is told it lost. Everything that has to wait for a shell goes through here:
    * typing into it, and holding the next tab's restore back until this one has
@@ -483,7 +488,7 @@ export class Session {
       return;
     }
     this.cancelPending(false);
-    this.pending = { done, idle, settle: null, deadline: null, held: 0, free: 0 };
+    this.pending = { done, idle, settle: null, deadline: null, held: 0, free: 0, asked: false };
     this.armDeadline(cap);
     // A shell that prints nothing at all — a bare PS1 — still has to be waited
     // for. Start the clock now rather than on output that may never come.
@@ -521,6 +526,12 @@ export class Session {
       // about to ask for a passphrase. Wait it out — the cap is the backstop.
       if (this.pending.idle && this.pty && somethingInFront(this.pty.pid)) {
         this.pending.free = 0;
+        // And noted, because it outlives this wait: a profile that stopped to
+        // ask something is a profile that will ask the same thing in the next
+        // tab, unless the answer was what it wanted. Whoever is holding the
+        // rest of a restore back needs to know that happened at all — see
+        // cancelPending, and restoreFromDisk in ./manager.js.
+        if (this.atUnansweredQuestion()) this.pending.asked = true;
         this.settlePending();
         return;
       }
@@ -557,7 +568,7 @@ export class Session {
     clearTimeout(waiting.settle);
     clearTimeout(waiting.deadline);
     this.pending = null;
-    waiting.done(ready);
+    waiting.done(ready, { asked: waiting.asked });
     return waiting;
   }
 
@@ -578,8 +589,9 @@ export class Session {
    * holding a terminal that long is holding it because it is waiting to be told
    * something, and it must not be told this. It is named in the tab instead.
    *
-   * `onSettled` is told which of the two happened; the restore queue waits on it
-   * before starting the next tab. See SessionManager.queueResume.
+   * `onSettled` is told which of the two happened, and whether the shell was
+   * asked anything while it started; the restore queue waits on it before
+   * starting the next tab. See SessionManager.queueResume.
    */
   typeWhenReady(command, { run = true, onSettled = null } = {}) {
     if (!command) {
@@ -590,7 +602,7 @@ export class Session {
     // discipline turns it into a newline on the way in.
     const text = run ? `${command}\r` : command;
 
-    this.whenReady((ready) => {
+    this.whenReady((ready, how) => {
       if (ready) {
         // Typed by clio, so what comes back is the tab still arriving — and the
         // clock starts here rather than at the shell, because a queued resume
@@ -604,7 +616,7 @@ export class Session {
           `\x1b[38;5;180m     something else is holding this terminal, so this was left for you:  ${command}\x1b[0m\r\n`,
         );
       }
-      onSettled?.(ready);
+      onSettled?.(ready, how);
     });
   }
 
