@@ -121,19 +121,8 @@ export function childEnvirons(pid) {
   return childrenOf(pid).map((child) => environOf(child));
 }
 
-/**
- * The command currently in the foreground of this pty, or null when the shell
- * itself is at the prompt.
- *
- * The kernel tracks which process group owns the terminal (tpgid). If that
- * differs from the shell's own process group, some job has the terminal — walk
- * the shell's descendants to find whoever is in that group.
- */
-export function foregroundCommand(shellPid) {
-  const shell = statOf(shellPid);
-  if (!shell) return null;
-  if (shell.tpgid <= 0 || shell.tpgid === shell.pgrp) return null;
-
+/** The first descendant of a shell running in a particular process group. */
+function inGroup(shellPid, pgrp) {
   const seen = new Set();
   const queue = childrenOf(shellPid);
   while (queue.length) {
@@ -142,13 +131,77 @@ export function foregroundCommand(shellPid) {
     seen.add(pid);
 
     const st = statOf(pid);
-    if (st && st.pgrp === shell.tpgid) {
+    if (st && st.pgrp === pgrp) {
       const argv = cmdlineOf(pid);
       if (argv) return { pid, argv, exe: exeOf(pid) };
     }
     queue.push(...childrenOf(pid));
   }
   return null;
+}
+
+/**
+ * The command currently in the foreground of this pty, or null when the shell
+ * itself is at the prompt.
+ *
+ * The kernel tracks which process group owns the terminal (tpgid). If that
+ * differs from the shell's own process group, some job has the terminal — walk
+ * the shell's descendants to find whoever is in that group.
+ *
+ * This is the question "what is running in this tab", and it is asked of a
+ * shell that has been up for a while and has a job in front of it. It is *not*
+ * the question "is this shell free to be typed at" — see somethingInFront,
+ * which is that one and is not the same question at all.
+ */
+export function foregroundCommand(shellPid) {
+  const shell = statOf(shellPid);
+  if (!shell) return null;
+  if (shell.tpgid <= 0 || shell.tpgid === shell.pgrp) return null;
+  return inGroup(shellPid, shell.tpgid);
+}
+
+/**
+ * Is anything in front of this shell — a job it is waiting on, or a command in
+ * its own startup files?
+ *
+ * The second half is why this exists, and it is a correction. A shell only puts
+ * a job into a process group of its own once job control is on, and bash turns
+ * job control on *after* it has finished running its startup files. So for the
+ * whole of ~/.bashrc — every command in it, `keychain` included — the children
+ * it forks stay in the shell's own process group, tpgid never moves off pgrp,
+ * and foregroundCommand above sees nothing at all. Measured on this machine: a
+ * shell running its profile reports "at its own prompt" for every millisecond
+ * of it, and starts answering truthfully only once a person types something.
+ *
+ * What that cost is the whole of the 24 August restore. Sixty-two tabs came
+ * back at 21:22:42 — every one of them in the same second, because the lead
+ * that is supposed to hold the rest behind the first shell asked this question,
+ * was told the first shell was at its prompt a quarter of a second after it
+ * started, and let go. Sixty-two profiles then ran `keychain` at once against
+ * an agent that had nothing in it: forty-one of them were still sitting on
+ * `Enter passphrase for /home/miles/.ssh/id_rsa:` ten minutes later. And
+ * because each tab's resume was typed into a shell still inside its profile,
+ * the line went into the terminal's buffer and `ssh-add` read it as the
+ * passphrase — so `bash scripts/ainun-dashboard-agent.sh` was offered to a key
+ * as its password, and nothing was resumed at all.
+ *
+ * So the process group is asked about twice. A job that has taken the terminal
+ * is the ordinary case and tpgid finds it. Anything still running in the
+ * shell's *own* group is the profile, which has not got as far as job control
+ * yet — and a shell in its profile is exactly the shell nothing may be typed
+ * into.
+ *
+ * The one thing this cannot tell from a profile is a background job left in the
+ * shell's group by one — `something &` in a .bashrc, which job control would
+ * have moved out and, before job control, does not. A tab like that reads as
+ * busy until whatever it is exits; the caps in ../daemon/session.js are the
+ * backstop, and what they fall back to is the behaviour above.
+ */
+export function somethingInFront(shellPid) {
+  const shell = statOf(shellPid);
+  if (!shell) return false;
+  if (shell.tpgid > 0 && shell.tpgid !== shell.pgrp) return true;
+  return !!inGroup(shellPid, shell.pgrp);
 }
 
 /**

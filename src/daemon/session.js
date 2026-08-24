@@ -1,5 +1,5 @@
 import { spawnPty, adoptPty } from './pty.js';
-import { cwdOf, foregroundCommand } from './procinfo.js';
+import { cwdOf, foregroundCommand, somethingInFront } from './procinfo.js';
 import { Screen, isNews, lastScreenSwap } from './screen.js';
 import { TitleReader, lastTitleIn } from './termtitle.js';
 import { extensionToState, extensionTitle } from '../extensions/index.js';
@@ -47,16 +47,50 @@ const UNDERNEATH_BYTES = SCROLLBACK_BYTES / 2;
  * kernel's buffer for bash to read. But the thing it was typed at was one that
  * asks for a passphrase, and a resume command typed into a passphrase prompt is
  * an ssh key's passphrase attempt made of somebody's session id. So the shell is
- * asked directly, through tpgid, whether it is at its own prompt; see
- * ./procinfo.js.
+ * asked directly whether anything is in front of it; see somethingInFront in
+ * ./procinfo.js, and note the correction there — tpgid on its own was the wrong
+ * half of that question, it cannot see a profile at all, and on 24 August the
+ * same night happened again to sixty-two tabs because of it.
  *
  * The ceiling is long because the thing it is waiting through can be a person
- * answering a dialog. When it runs out and the shell is *still* busy, the line
- * is not typed at all — it is named in the tab instead, which is the same
- * bargain the seam makes for everything clio will not run by itself.
+ * answering a dialog. It does not run out *while* they are being asked
+ * something — see QUESTION_HOLD_MS, because the answer is what every other tab
+ * in the restore is waiting for too. When it does run out and the shell is
+ * still busy, the line is not typed at all — it is named in the tab instead,
+ * which is the same bargain the seam makes for everything clio will not run by
+ * itself.
  */
 const SHELL_SETTLE_MS = 250;
 const SHELL_READY_MS = 30000;
+
+/*
+ * How much longer a shell gets when the reason it is busy is that it has
+ * stopped to ask somebody something.
+ *
+ * A cap is a guess about a machine — how long a profile can reasonably take.
+ * A question is not about the machine at all: `Enter passphrase for
+ * /home/miles/.ssh/id_rsa:` takes exactly as long as it takes for somebody to
+ * notice it, and a cap that expires underneath one buys nothing, because it is
+ * the answer and not the elapsed time that lets every other tab's profile skip
+ * the same work. So the clock stops while the question stands, and starts again
+ * the moment it does not.
+ *
+ * Bounded, and not the unbounded wait ../daemon/manager.js gives a queued ssh,
+ * because what is behind this one is not another connection: it is a tab with
+ * no shell in it. Two minutes is long enough to walk back to the desk and
+ * short enough that a machine restored while nobody is there still finishes on
+ * its own — one tab at a time, which is what the chain in restoreFromDisk is
+ * for.
+ */
+const QUESTION_HOLD_MS = 120000;
+
+/*
+ * How often the shell is asked whether that question has been answered yet.
+ * Cheap — the tail of the tab's own output, and one look in /proc — and a
+ * second is well inside the time it takes to type a passphrase. The same
+ * interval the resume queue polls on; see ANSWER_POLL_MS in ./manager.js.
+ */
+const ANSWER_POLL_MS = 1000;
 
 /*
  * How much of what somebody typed at a tab with no shell in it is kept. See
@@ -449,21 +483,62 @@ export class Session {
       return;
     }
     this.cancelPending(false);
-    this.pending = { done, idle, settle: null, deadline: null };
-    this.pending.deadline = setTimeout(() => this.cancelPending(false), cap);
-    this.pending.deadline.unref?.();
+    this.pending = { done, idle, settle: null, deadline: null, held: 0, free: 0 };
+    this.armDeadline(cap);
     // A shell that prints nothing at all — a bare PS1 — still has to be waited
     // for. Start the clock now rather than on output that may never come.
     this.settlePending();
   }
 
+  /**
+   * The cap, and what happens when it runs out.
+   *
+   * Not `cancelPending(false)` straight away: a shell that has run out of time
+   * because it is waiting to be told a passphrase has not had its turn yet, and
+   * giving up on it is how a restore ends up asking the same question in every
+   * tab it has. So the cap is re-armed while the question stands, up to
+   * QUESTION_HOLD_MS of it, and the shell is only handed back as busy when
+   * nobody is being asked anything.
+   */
+  armDeadline(ms) {
+    this.pending.deadline = setTimeout(() => {
+      const waiting = this.pending;
+      if (waiting.idle && waiting.held < QUESTION_HOLD_MS && this.atUnansweredQuestion()) {
+        waiting.held += ANSWER_POLL_MS;
+        this.armDeadline(ANSWER_POLL_MS);
+        return;
+      }
+      this.cancelPending(false);
+    }, ms);
+    this.pending.deadline.unref?.();
+  }
+
   settlePending() {
     clearTimeout(this.pending.settle);
     this.pending.settle = setTimeout(() => {
-      // Quiet, but is it *our* quiet? Something in the foreground here is the
-      // profile still running, and the one that matters is the one that is
+      // Quiet, but is it *our* quiet? Anything in front of the shell here is
+      // its profile still running, and the one that matters is the one that is
       // about to ask for a passphrase. Wait it out — the cap is the backstop.
-      if (this.pending.idle && this.pty && foregroundCommand(this.pty.pid)) {
+      if (this.pending.idle && this.pty && somethingInFront(this.pty.pid)) {
+        this.pending.free = 0;
+        this.settlePending();
+        return;
+      }
+      /*
+       * Free — but a shell that has only just been handed a pty has not had
+       * time to be anything else yet. Between the exec and the fork of the first
+       * line of its profile there is nothing in front of it and nothing on its
+       * screen, which is the same picture as a shell at its prompt, and it is
+       * the one moment /proc cannot tell those apart. It matters because that
+       * moment is longest exactly when it is most expensive: sixty-two shells
+       * starting together, all of them slow to get going.
+       *
+       * So look twice, a settle apart. The gap only has to outlast a fork, and
+       * a profile under way has something in front of it in every sample after
+       * the spawn — see test/profile.mjs, which measures precisely that.
+       */
+      this.pending.free = (this.pending.free || 0) + 1;
+      if (this.pending.idle && this.pending.free < 2) {
         this.settlePending();
         return;
       }
@@ -676,8 +751,8 @@ export class Session {
    * waiting to be answered leaves the cursor sitting after the colon.
    *
    * A shell's own prompt is not a question — `$ `, `%`, `❯` — and a shell at
-   * its own prompt has nothing in the foreground anyway, which is the cheaper
-   * half of the test and is why it is asked first.
+   * its own prompt has nothing in front of it anyway, which is the cheaper half
+   * of the test and is why it is asked first.
    *
    * What it is for is the restore queue, which must not dial a second host
    * while the first is still waiting for somebody to read a code off their
@@ -685,7 +760,7 @@ export class Session {
    */
   atUnansweredQuestion() {
     if (!this.pty) return false;
-    if (!foregroundCommand(this.pty.pid)) return false;
+    if (!somethingInFront(this.pty.pid)) return false;
     const line = this.cursorLine();
     return line.length > 0 && /[:?]$/.test(line);
   }

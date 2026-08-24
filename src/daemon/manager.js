@@ -610,26 +610,39 @@ export class SessionManager extends EventEmitter {
      *
      * One is enough to fix that, because the profile's own idempotence does the
      * rest: the second keychain finds the key already there and says nothing.
-     * So this is a lead and not a queue — the first shell, then everybody.
+     * So this is a lead and not a queue — the first shell, and then, if it got
+     * through, everybody.
      *
      * What the lead is really waiting for is a person, which is why the cap is
      * as long as it is: the first profile is where the one passphrase prompt
      * now appears, and a cap that runs out before it can be answered buys
      * nothing, because it is the answer and not the elapsed time that lets the
      * other 23 skip the work. Against that, every one of those tabs is without
-     * a shell until it is over, so it cannot be much longer either. When it
-     * does run out the old behaviour is what returns, which is survivable, and
-     * anything typed into a tab in the meantime is kept — see Session.write.
+     * a shell until it is over, so it cannot be much longer either.
+     *
+     * And when it does run out — nobody at the desk, the question still on the
+     * screen — the rest do *not* all go at once. That was the old behaviour and
+     * it was survivable in the way a fire is survivable: on 24 August it meant
+     * sixty-two profiles asking for the same passphrase, forty-one of them
+     * still asking ten minutes later. What the lead was buying has not been
+     * bought, so the argument for going together has not been made, and the
+     * tabs follow one at a time instead — each one its own chance to answer the
+     * question, and no tab left without a shell for ever. The first of them to
+     * get through its profile cleanly ends that: it has done the work the lead
+     * was supposed to do, and everybody behind it goes together.
      */
     const [first, ...rest] = rebuilt;
     if (!first) return this.list().length;
 
-    const follow = rest.length
-      ? () => {
-          for (const { session, cols, rows } of rest) this.reopen(session, { cols, rows });
-        }
-      : null;
-    this.reopen(first.session, { cols: first.cols, rows: first.rows, then: follow });
+    const open = ({ session, cols, rows }, then = null) => this.reopen(session, { cols, rows, then });
+    const together = (queue) => queue.forEach((item) => open(item));
+    const oneAtATime = (queue) => {
+      const [next, ...later] = queue;
+      if (!next) return;
+      open(next, (through) => (through ? together(later) : oneAtATime(later)));
+    };
+
+    open(first, (through) => (through ? together(rest) : oneAtATime(rest)));
 
     return this.list().length;
   }
@@ -792,6 +805,12 @@ export class SessionManager extends EventEmitter {
    * runs whatever happens, including when no shell could be started at all,
    * because a restore that stops halfway through is worse than any of the
    * things waiting for it.
+   *
+   * What it is told is whether the shell ever actually came free — false means
+   * the cap ran out with something still in front of it, which on a restore is
+   * a profile stopped on a question nobody has answered. The tabs behind this
+   * one need that: what they do next depends on whether the work this tab was
+   * supposed to do for all of them got done.
    */
   reopen(session, { cols, rows, then = null } = {}) {
     const known = resumeExtension(session.ext, { cwd: session.cwd });
@@ -843,7 +862,7 @@ export class SessionManager extends EventEmitter {
       // Say so in the tab itself. The alternative is a pane that silently
       // swallows everything typed into it.
       session.append(`\x1b[38;5;203m──── no shell could be started: ${err.message} ────\x1b[0m\r\n`);
-      then?.();
+      then?.(false);
       return session;
     }
 
@@ -858,7 +877,7 @@ export class SessionManager extends EventEmitter {
       session.ext = { ...session.ext, pid: null, resumedAt: Date.now() };
     } else {
       // Nothing to type, so the only thing left to wait for is the profile.
-      if (then) session.whenReady(() => then(), { cap: RESTORE_LEAD_MS });
+      if (then) session.whenReady((ready) => then(ready), { cap: RESTORE_LEAD_MS });
       // Nothing was brought back, so nothing is being held. Saying otherwise
       // would leave the tab offering to resume something that is not there.
       session.ext = null;
@@ -889,7 +908,7 @@ export class SessionManager extends EventEmitter {
    */
   queueResume(session, plan, then = null) {
     if (!plan.alone) {
-      session.typeWhenReady(plan.command, { run: plan.run, onSettled: () => then?.() });
+      session.typeWhenReady(plan.command, { run: plan.run, onSettled: (typed) => then?.(typed) });
       return;
     }
 
@@ -962,7 +981,7 @@ export class SessionManager extends EventEmitter {
     head.session.typeWhenReady(head.plan.command, {
       run: head.plan.run,
       onSettled: (typed) => {
-        head.then?.();
+        head.then?.(typed);
         // Never typed, because something else had the terminal for the whole of
         // its wait. Nothing was dialled, so there is nothing to give room to.
         if (!typed) {
@@ -1189,8 +1208,12 @@ export class SessionManager extends EventEmitter {
     const now = Date.now();
     if (now - this.lastSlowWriteReport < SLOW_WRITE_REPORT_MS) return;
     this.lastSlowWriteReport = now;
+    // With the time on it, because the whole use of this line is being lined up
+    // against something that happened at a particular moment — a window that
+    // froze, a commit that landed — and nothing else in this log is stamped.
     console.error(
-      `[clio] the disk took ${(ms / 1000).toFixed(1)}s to write a tab's scrollback — ` +
+      `[clio] ${new Date().toTimeString().slice(0, 8)} the disk took ` +
+        `${(ms / 1000).toFixed(1)}s to write a tab's scrollback — ` +
         'the tabs themselves were unaffected',
     );
   }
