@@ -64,6 +64,25 @@ const TAB = 8;
 const MAX_COLS = 1000;
 const MAX_ROWS = 500;
 
+/**
+ * How many lines a program may rewrite where lines already were before it is
+ * telling you something rather than talking about itself. See isNews.
+ *
+ * A status block is a line or two: a spinner, a clock, a token count, a version
+ * banner. Claude Code's is two — the line it spins on, and the counter along the
+ * right of the row under it. What this must not swallow is bigger by a factor of
+ * ten, so there is a lot of room between the two: a question that agent puts on
+ * the screen redraws the frame it sits in, thirty rows and up.
+ */
+const STATUS_ROWS = 2;
+
+/**
+ * The alternate screen, in each of the ways a program asks for it. 1049 is what
+ * everything written this century sends; the other two are what it grew out of.
+ */
+const SCREEN_MODES = new Set([47, 1047, 1049]);
+const PRIVATE_MODE = /\x1b\[\?([0-9;]*)([hl])/g;
+
 /** The next thing that is not a printable character. */
 const PLAIN = /[\x00-\x1f\x7f]/g;
 
@@ -98,6 +117,24 @@ function hashRow(cells, cols) {
   for (let x = 0; x < cols; x++) {
     const cell = cells[x];
     hash = mix(hash, cell === UNWRITTEN ? SPACE : cell);
+  }
+  return hash;
+}
+
+/**
+ * What an empty row of this width hashes to.
+ *
+ * Which is the same as a row of spaces, by the paragraph above, and is how a
+ * snapshot tells a line that is there from a line that is not — see isNews.
+ * Memoised because there are only ever a handful of widths on a desktop.
+ */
+const BLANK_ROWS = new Map();
+
+function blankHash(cols) {
+  let hash = BLANK_ROWS.get(cols);
+  if (hash === undefined) {
+    hash = hashRow(new Array(cols).fill(UNWRITTEN), cols);
+    BLANK_ROWS.set(cols, hash);
   }
   return hash;
 }
@@ -198,6 +235,28 @@ export class Screen {
   /** A number that changes when the characters on the screen change. */
   digest() {
     return `${this.grid === this.alt ? 'alt' : 'main'}:${this.grid.digest()}`;
+  }
+
+  /**
+   * The screen as one hash per row, to be compared against a later one.
+   *
+   * `digest` says whether the screen changed. This says *which lines*, which is
+   * the difference between a program drawing something and a program saying how
+   * many tokens it has spent — see isNews. It costs a digest and no more: the
+   * row hashes are the ones the digest is already made of.
+   */
+  snapshot() {
+    const rows = new Array(this.rows);
+    for (let y = 0; y < this.rows; y++) {
+      if (this.grid.hashes[y] == null) this.grid.hashes[y] = hashRow(this.grid.row(y), this.cols);
+      rows[y] = this.grid.hashes[y];
+    }
+    return {
+      grid: this.grid === this.alt ? 'alt' : 'main',
+      cols: this.cols,
+      rows,
+      blank: blankHash(this.cols),
+    };
   }
 
   /**
@@ -875,4 +934,77 @@ export class Screen {
 function clamp(value, low, high) {
   const number = Number.isFinite(value) ? value : low;
   return Math.max(low, Math.min(high, Math.trunc(number)));
+}
+
+/**
+ * Is what is on the screen now something to read, next to what was seen?
+ *
+ * The same screen is not news, whatever it cost in bytes: that is what this file
+ * was written for, and it settles the version check at the top of it — two
+ * frames, and the second one puts the footer back. What it does not settle is
+ * the other half of an idle agent's footer, the lines that change and *stay*
+ * changed. Claude Code rotates a hint through the bottom right of its frame, and
+ * installs a new version and says so there until it is restarted. Off tab
+ * 2a8cf0cb4d38 on 24 August, a conversation nobody had touched for half an hour:
+ *
+ *   row 53   255556 token
+ *   row 53   new task? /clear to save 256.6k tokens
+ *
+ * One line, rewritten where a line already was, on a screen that had not moved
+ * underneath it. Nothing was said to anybody; a status line is a program talking
+ * about itself.
+ *
+ * So the question asked here is what the screen *gained*. A line where there was
+ * none, a line gone from where there was one, or the whole screen moved: that is
+ * content, and somebody has not read it. A line or two rewritten in place, and
+ * nothing else on the screen touched, is a spinner, a clock, a token count or a
+ * version banner — see STATUS_ROWS, and note that the seen screen is *not*
+ * updated for one of these. The baseline stays what a person last looked at, so
+ * a screen that walks away from it one line per burst is news by the third line
+ * rather than never.
+ *
+ * Held against every recording on this desktop on 24 August: of 20,354 changed
+ * screens, 18,893 changed one row and 295 changed two, and every question or
+ * permission prompt among them changed more than thirty.
+ */
+export function isNews(seen, now) {
+  if (!seen || !now) return true;
+  // A different screen entirely: the alternate one, or the same one at another
+  // size. Nothing about the rows of one is comparable with the rows of the other.
+  if (seen.grid !== now.grid || seen.cols !== now.cols || seen.rows.length !== now.rows.length) {
+    return true;
+  }
+  let rewritten = 0;
+  for (let y = 0; y < now.rows.length; y++) {
+    if (seen.rows[y] === now.rows[y]) continue;
+    if (seen.rows[y] === seen.blank || now.rows[y] === now.blank) return true;
+    if (++rewritten > STATUS_ROWS) return true;
+  }
+  return false;
+}
+
+/**
+ * Where this output borrowed the whole screen, or gave it back.
+ *
+ * The last of either, and how far into the output it is — everything before that
+ * point belongs to the screen that was there first, and everything after it to
+ * the screen the program is drawing on. That is what makes a recording of a tab
+ * with an agent in it two recordings; see Session.append, which is the one place
+ * that needs to know.
+ *
+ * Answered with a pattern rather than by the model above, because the model
+ * knows the state and this has to know the *offset*. They agree on which modes
+ * these are, and that is the whole of what they share.
+ */
+export function lastScreenSwap(text) {
+  if (!text || !text.includes('\x1b[?')) return null;
+  PRIVATE_MODE.lastIndex = 0;
+  let swap = null;
+  for (let found; (found = PRIVATE_MODE.exec(text)); ) {
+    // One sequence can set several modes at once, and only some of them are
+    // this one: `\e[?1049;1000h` borrows the screen and turns the mouse on.
+    if (!found[1].split(';').some((mode) => SCREEN_MODES.has(parseInt(mode, 10)))) continue;
+    swap = { at: found.index + found[0].length, borrowed: found[2] === 'h' };
+  }
+  return swap;
 }

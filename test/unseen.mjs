@@ -23,8 +23,9 @@ import { spawn, execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import WebSocket from 'ws';
 
-import { Screen } from '../src/daemon/screen.js';
+import { Screen, isNews, lastScreenSwap } from '../src/daemon/screen.js';
 import { drawsSomething } from '../src/daemon/output.js';
+import { Session } from '../src/daemon/session.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -145,6 +146,85 @@ function screenTests() {
   check('the alternate screen is a different screen', alt.digest() !== beneath);
   alt.write('\x1b[?1049l');
   check('and leaving it puts back the one that was underneath', alt.digest() === beneath);
+
+  /*
+   * The other half of an idle agent's footer: the lines that change and stay
+   * changed.
+   *
+   * The version check above is a pair that cancels, and a digest is enough for
+   * it. This is the half a digest cannot answer — Claude Code rotates a hint
+   * through the same cells, and once it has installed a new version it says so
+   * there until it is restarted. Off tab 2a8cf0cb4d38 on 24 August, half an hour
+   * after anybody last touched it. See isNews.
+   */
+  const idle = new Screen({ cols: 120, rows: 24 });
+  idle.write('\x1b[H\x1b[2J\x1b[20;1H  the last thing it said\x1b[22;100H255556 token\x1b[24;1H❯ ');
+  const looked = idle.snapshot();
+  const wasOnIt = idle.digest();
+  idle.write('\x1b[22;100H            \x1b[22;60Hnew task? /clear to save 256.6k tokens');
+  check('a footer rewritten where a footer already was is not news', !isNews(looked, idle.snapshot()));
+  check('though the screen really did change, and stayed changed', idle.digest() !== wasOnIt);
+
+  idle.write('\x1b[21;1H  and then it said something');
+  check('a line where there was no line is news', isNews(looked, idle.snapshot()));
+
+  // What a status line is allowed: two rows. And the seen screen stays what
+  // somebody looked at, so a screen walking away from it one row at a time gets
+  // there in the end rather than never.
+  const creep = new Screen({ cols: 80, rows: 10 });
+  creep.write('\x1b[H\x1b[2Jone\r\ntwo\r\nthree\r\nfour');
+  const start = creep.snapshot();
+  creep.write('\x1b[1;1H1st');
+  check('one row rewritten in place is a status line', !isNews(start, creep.snapshot()));
+  creep.write('\x1b[2;1H2nd');
+  check('two rows rewritten in place is a status block', !isNews(start, creep.snapshot()));
+  creep.write('\x1b[3;1H3rd  ');
+  check('three is a program drawing', isNews(start, creep.snapshot()));
+
+  /*
+   * And the price of that, said out loud.
+   *
+   * A program that overwrites one line with something worth reading — a progress
+   * line replaced by its own result — is not news either. Nearly everything ends
+   * its line, and a line that is ended scrolls the screen or fills a blank row,
+   * both of which are news; this is the one shape that does not, and it is the
+   * shape a status line has. Of the two ways to be wrong, a desktop that stays
+   * quiet about a line somebody will see the moment they look is better than one
+   * that lights up twice an hour about a token count.
+   */
+  const inPlace = new Screen({ cols: 80, rows: 10 });
+  inPlace.write('\x1b[H\x1b[2Jdownloading… 99%');
+  const during = inPlace.snapshot();
+  inPlace.write('\r\x1b[Kdone: saved to the file');
+  check('a line overwritten where a line already was is not news either', !isNews(during, inPlace.snapshot()));
+
+  // A line taken away is as much news as a line arriving: a program that clears
+  // its own question has changed what there is to read.
+  const erased = new Screen({ cols: 80, rows: 10 });
+  erased.write('\x1b[H\x1b[2Jkept\r\ngoing away');
+  const both = erased.snapshot();
+  erased.write('\x1b[2;1H\x1b[K');
+  check('a line gone from where there was one is news', isNews(both, erased.snapshot()));
+
+  // And the screen moving under it, which is what everything real does.
+  const scrolled = new Screen({ cols: 80, rows: 6 });
+  scrolled.write('\x1b[H\x1b[2Ja\r\nb\r\nc\r\nd\r\ne\r\nf');
+  const before = scrolled.snapshot();
+  scrolled.write('\r\ng');
+  check('a screen that has scrolled is news', isNews(before, scrolled.snapshot()));
+
+  // The screen being borrowed outright: not the same screen, so not comparable.
+  const borrowed = new Screen({ cols: 80, rows: 10 });
+  borrowed.write('\x1b[H\x1b[2Jat the prompt');
+  const under = borrowed.snapshot();
+  borrowed.write('\x1b[?1049h\x1b[H\x1b[2Jat the prompt');
+  check('the same text on the alternate screen is still news', isNews(under, borrowed.snapshot()));
+
+  // Where a recording is two recordings; see Session.append.
+  check('the swap is found in a mode list', lastScreenSwap('x\x1b[?1049;1000h').borrowed);
+  check('and in the two forms that came before it', lastScreenSwap('\x1b[?47h').borrowed && !lastScreenSwap('\x1b[?1047l').borrowed);
+  check('the last of them is the one that counts', !lastScreenSwap('\x1b[?1049h\x1b[2J\x1b[?1049l').borrowed);
+  check('a tab that never borrowed the screen has none', lastScreenSwap('\x1b[?25l\x1b[H hello \x1b[?25h') === null);
 }
 
 /* ------------------------------------------- the same bytes in a real terminal */
@@ -214,23 +294,7 @@ async function terminalTests() {
     const model = new Screen({ cols, rows });
     for (let i = 0; i < recording.length; i += 64) model.write(recording.slice(i, i + 64));
 
-    const real = await page.evaluate(
-      async ({ text, cols, rows }) => {
-        const host = document.getElementById('screen');
-        host.innerHTML = '';
-        const term = new window.Terminal({ cols, rows, scrollback: 200 });
-        term.open(host);
-        await new Promise((resolve) => term.write(text, resolve));
-        const buffer = term.buffer.active;
-        const lines = [];
-        for (let y = 0; y < rows; y++) {
-          const line = buffer.getLine(buffer.viewportY + y);
-          lines.push((line ? line.translateToString(false) : '').replace(/\s+$/, ''));
-        }
-        return lines;
-      },
-      { text: recording, cols, rows },
-    );
+    const real = await drawn(page, recording, cols, rows);
 
     const ours = model.text();
     const off = [];
@@ -242,7 +306,120 @@ async function terminalTests() {
     );
   }
 
+  /*
+   * And what a terminal does when a program gives back a screen it was never
+   * told about.
+   *
+   * A window opening on a tab is handed the recording and writes it into a new
+   * xterm, so what the recording says is what that terminal believes. Lose the
+   * sequence that borrowed the screen — trimmed off the front, which is what
+   * happened to ten of the sixteen agent tabs on this desktop by 24 August — and
+   * the agent's frame is painted onto the ordinary screen instead. The `?1049l`
+   * on its way out then has nothing to give back: the frame stays where it is,
+   * and the shell prints its prompt through it. That is the overlap, and this is
+   * the difference the split buffer makes. See Session.append.
+   */
+  const beneath = '\x1b[H\x1b[2Jmiles@ptah:~/core3 [master]\r\n$ claude\r\n';
+  const swap = '\x1b7\x1b[?1049h\x1b[2J\x1b[H';
+  const frame = "\x1b[H  a line of the conversation\x1b[10;1H❯ typed here\x1b[12;1H✻ Sautéed for 5m 23s";
+  const leaving = '\x1b[?1049l\x1b[?25h\r\nResume this session with: claude --resume 1234\r\n$ ';
+
+  const kept = await drawn(page, beneath + swap + frame + leaving, cols, rows);
+  check(
+    'a program that gives the screen back leaves the command that started it',
+    kept.some((line) => line.includes('$ claude')) && !kept.some((line) => line.includes('a line of the conversation')),
+    JSON.stringify(kept.filter(Boolean).slice(0, 4)),
+  );
+
+  const lost = await drawn(page, frame + leaving, cols, rows);
+  check(
+    'and without the swap in the recording its frame is still on the screen',
+    lost.some((line) => line.includes('a line of the conversation')),
+    JSON.stringify(lost.filter(Boolean).slice(0, 4)),
+  );
+
   await browser.close();
+}
+
+/** A recording written into a real terminal, as a row of text per line. */
+function drawn(page, recording, cols, rows) {
+  return page.evaluate(
+    async ({ text, cols, rows }) => {
+      const host = document.getElementById('screen');
+      host.innerHTML = '';
+      const term = new window.Terminal({ cols, rows, scrollback: 200 });
+      term.open(host);
+      await new Promise((resolve) => term.write(text, resolve));
+      const buffer = term.buffer.active;
+      const lines = [];
+      for (let y = 0; y < rows; y++) {
+        const line = buffer.getLine(buffer.viewportY + y);
+        lines.push((line ? line.translateToString(false) : '').replace(/\s+$/, ''));
+      }
+      return lines;
+    },
+    { text: recording, cols, rows },
+  );
+}
+
+/* ------------------------------------------------------- the recording itself */
+
+/*
+ * Half a megabyte of it, and what has to survive being trimmed.
+ *
+ * An agent tab writes a screenful a second all day, so everything a window
+ * replays is the tail of what it wrote — except the one thing that is not on the
+ * tail at all: the sequence where the program borrowed the screen, which
+ * happened when it started and is the first thing dropped. The recording is two
+ * recordings for exactly that reason.
+ */
+function recordingTests() {
+  console.log('\n3. the recording, once there is more of it than fits');
+
+  const prompt = '\x1b[32mmiles@ptah:\x1b[33m~/core3\x1b[0m [master]\r\r\n$ claude\r\n';
+  const session = new Session({ id: 'recording' });
+  session.append(prompt);
+  session.append('\x1b[?2004l\r\n\x1b7\x1b[r\x1b8\x1b[?1049h\x1b[2J\x1b[H\x1b[?1000h');
+  check('the screen underneath is set aside the moment it is borrowed', session.underneath.length > 0);
+
+  for (let i = 0; i < 12000; i++) {
+    session.append(`\x1b[?25l\x1b[H\r\x1b[60C\x1b[19B${250000 + i} tokens\x1b[24;1H\x1b[22;3H\x1b[?25h`);
+  }
+  const recording = session.scrollback();
+  check('a tab that has written far too much is trimmed as ever', Buffer.byteLength(recording) <= 512 * 1024);
+  check('the newest frames are what is kept', recording.includes('261999 tokens'));
+  check('and the oldest are gone', !recording.includes('250000 tokens'));
+  check('but the swap is still in it', recording.includes('\x1b[?1049h'));
+  check('and so is the command that caused it', recording.includes('$ claude'));
+
+  // Given back, the two are one recording again and the whole of it is scrollback.
+  session.append('\x1b[?1049l\x1b[?25h\r\nback at the prompt\r\n$ ');
+  check('giving the screen back joins them up', session.underneath.length === 0);
+  check('and what was underneath is still there to be read', session.scrollback().includes('$ claude'));
+  for (let i = 0; i < 12000; i++) session.append(`line ${i} of something ordinary\r\n`);
+  check('after which it is trimmed like anything else', !session.scrollback().includes('$ claude'));
+
+  // A tab that never borrows anything: exactly as it always was.
+  const plain = new Session({ id: 'plain' });
+  plain.append('the first thing it said\r\n');
+  for (let i = 0; i < 30000; i++) plain.append(`line ${i} of a build\r\n`);
+  check('a tab with nothing borrowed keeps nothing back', plain.underneath.length === 0);
+  check('and drops its oldest output', !plain.scrollback().includes('the first thing it said'));
+
+  /*
+   * And across a restart, where the recording comes back off the disk as one
+   * chunk. Seeded without the split, the swap is on the front of that chunk and
+   * the next trim drops it — which is the same tab in the same state, one reboot
+   * later.
+   */
+  const seeded = new Session({ id: 'seeded' });
+  seeded.seedScrollback(recording);
+  check('a recording read back off the disk is split where it was written', seeded.underneath.length > 0);
+  for (let i = 0; i < 12000; i++) {
+    seeded.append(`\x1b[?25l\x1b[H\r\x1b[60C\x1b[19B${350000 + i} tokens\x1b[24;1H\x1b[22;3H\x1b[?25h`);
+  }
+  check('so the swap survives the next trim too', seeded.scrollback().includes('\x1b[?1049h'));
+  check('and the command with it', seeded.scrollback().includes('$ claude'));
 }
 
 /* ---------------------------------------------------------------- the daemon */
@@ -382,7 +559,7 @@ class Client {
 async function daemonTests() {
   const fixture = join(ROOT, 'test', 'fixtures', 'footer');
 
-  console.log(`\n3. a tab nobody is looking at    (sandbox at ${TMP})`);
+  console.log(`\n4. a tab nobody is looking at    (sandbox at ${TMP})`);
   const info = await startDaemon();
   let client = new Client(info, '0ff1ce00');
   await client.connect();
@@ -420,6 +597,15 @@ async function daemonTests() {
   check('a repaint that puts the screen back does not turn the tab red', !client.red(painting.id));
   check('and it never went red in the meantime either', !client.everRed.has(painting.id));
 
+  // The hint moving on: visible text, once, and it stays. A different screen
+  // from the one somebody last looked at, and still nothing to read.
+  client.send({ t: 'input', id: painting.id, data: 'h' });
+  await sleep(2500);
+  client.send({ t: 'input', id: painting.id, data: 'h' });
+  await sleep(2500);
+  check('a footer that changes and stays changed does not turn it red either',
+    !client.red(painting.id) && !client.everRed.has(painting.id));
+
   // Then something worth knowing about.
   client.send({ t: 'input', id: painting.id, data: 'n' });
   await sleep(2500);
@@ -438,7 +624,7 @@ async function daemonTests() {
    * again. Which, on a desktop where reloading is how new code arrives, is every
    * time anybody touches clio.
    */
-  console.log('\n4. and after a reload, on a screen this daemon never saw');
+  console.log('\n5. and after a reload, on a screen this daemon never saw');
   // Past the scrollback flush, so the successor reads a recording that includes
   // everything above rather than depending on lucky timing.
   await sleep(3500);
@@ -479,7 +665,7 @@ async function daemonTests() {
    * away with it — so the flag has to be settled on the way out, or the
    * successor inherits a screen it takes to have been seen and the line is lost.
    */
-  console.log('\n5. output that arrives just as the daemon is standing down');
+  console.log('\n6. output that arrives just as the daemon is standing down');
   client.send({ t: 'focus', id: painting.id });
   await sleep(400);
   client.send({ t: 'focus', id: other.id });
@@ -510,7 +696,7 @@ async function daemonTests() {
    * 22 August the row was red before anybody had opened a window, which is the
    * flag saying "something in here to read" about thirteen tabs at once.
    */
-  console.log('\n6. a restart, and the tabs that come back from it');
+  console.log('\n7. a restart, and the tabs that come back from it');
   // The state on disk is what a restore is built from, so let the daemon flush
   // before it is taken away.
   await sleep(3500);
@@ -574,6 +760,7 @@ process.on('exit', stop);
 async function main() {
   screenTests();
   await terminalTests();
+  recordingTests();
   await daemonTests();
   report();
 }

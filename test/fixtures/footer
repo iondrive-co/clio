@@ -7,26 +7,51 @@
  * for a network round trip, and then paint the footer back the way it was. Two
  * frames of visible text and a net change of nothing.
  *
+ * And the half of the same footer that does not put itself back: a hint rotated
+ * through a line that already had one, which is what that agent does along the
+ * bottom of its frame — a token count, then an invitation to start a new
+ * conversation, then the count again. Each of those is a real change to the
+ * screen that stays changed, and none of them is anything to read. It has a row
+ * of its own so that the version check above still cancels exactly, which is
+ * what that half is there to test.
+ *
  * On demand rather than on a timer, so a test can say when: `v` for the version
- * check, `n` for a line worth reading. The widths of the wipe come from the
- * strings it is wiping, because a wipe one column short is a screen that really
- * did change — and the lines are numbered, because writing the same words into
- * the same cells twice is not a changed screen either, and a test asking for
- * news has to ask for something new.
+ * check, `h` for the hint moving on, `n` for a line worth reading. The widths of
+ * the wipe come from the strings it is wiping, because a wipe one column short is
+ * a screen that really did change.
+ *
+ * `n` puts each line on a row of its own, and is numbered besides. Both for the
+ * same reason: something a program has to say arrives as a line that was not
+ * there before — it ends its line, and the next one goes underneath or the screen
+ * moves up to make room. Writing over the line you wrote last is what a status
+ * line does, and that is what `h` is for.
  */
 const write = (text) => process.stdout.write(text);
 
 /** How many times it has had something to say. */
 let said = 0;
 
+/** Which hint is in the footer; see `h`. */
+let hint = 0;
+
 const CURRENT = 'current: 1.2.3 - latest: 1.2.3';
 const CHECKING = 'Checking for update';
 
+/*
+ * The hints it rotates between, padded to each other's width so that each one
+ * wipes the last.
+ */
+const HINTS = ['283539 tokens', 'new task? /clear to save 283.5k'];
+const HINT_WIDTH = Math.max(...HINTS.map((text) => text.length));
+
 /** Row 10, column 20, the way a full-screen program addresses its own footer. */
 const at = (body) => `\x1b[?25l\x1b[H\r\x1b[19C\x1b[9B${body}\x1b[24;1H\x1b[?25h`;
+/** The row below it, where the hint lives. */
+const under = (body) => `\x1b[?25l\x1b[H\r\x1b[2C\x1b[10B${body}\x1b[24;1H\x1b[?25h`;
 
-// The screen as somebody left it.
-write('\x1b[H\x1b[2J\x1b[10;1Hworking on it');
+// The screen as somebody left it, hint and all: a footer that appears where
+// there was nothing is a line arriving, and that is news in anybody's book.
+write(`\x1b[H\x1b[2J\x1b[10;1Hworking on it${under(HINTS[hint++ % HINTS.length].padEnd(HINT_WIDTH))}`);
 
 if (process.stdin.isTTY) process.stdin.setRawMode(true);
 process.stdin.on('data', (data) => {
@@ -34,8 +59,10 @@ process.stdin.on('data', (data) => {
   if (typed.includes('v')) {
     write(at(`\x1b[38;5;244m${CURRENT}\x1b[52G${CHECKING}\x1b[39m`));
     setTimeout(() => write(at(`${' '.repeat(CURRENT.length)}\x1b[52G${' '.repeat(CHECKING.length)}`)), 500);
+  } else if (typed.includes('h')) {
+    write(under(HINTS[hint++ % HINTS.length].padEnd(HINT_WIDTH)));
   } else if (typed.includes('n')) {
-    write(`\x1b[12;1Hthe build failed (${++said})\r\n`);
+    write(`\x1b[${12 + ++said};1Hthe build failed (${said})\r\n`);
   }
 });
 

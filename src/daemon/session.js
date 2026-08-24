@@ -1,12 +1,34 @@
 import { spawnPty, adoptPty } from './pty.js';
 import { cwdOf, foregroundCommand } from './procinfo.js';
-import { Screen } from './screen.js';
+import { Screen, isNews, lastScreenSwap } from './screen.js';
 import { TitleReader, lastTitleIn } from './termtitle.js';
 import { extensionToState, extensionTitle } from '../extensions/index.js';
 
 // How much raw output we keep per session. This is what gets replayed on
 // reattach and written to disk for the post-reboot fallback.
 const SCROLLBACK_BYTES = 512 * 1024;
+
+/*
+ * How much of that may belong to the screen a program borrowed.
+ *
+ * A full-screen program — an agent, a pager, vim — asks for the alternate
+ * screen, draws on that, and gives it back on the way out, and what it gives
+ * back is whatever was underneath: a prompt, the command somebody typed to start
+ * it, and whatever the tab had been doing before that. Those bytes cannot change
+ * again until the screen is given back, so they are set aside rather than
+ * trimmed, and half the recording is as much as they may have. Usually they are
+ * a prompt and a command line and take none of it.
+ *
+ * Without that, a tab is trimmed from the front like any other and the sequence
+ * that borrowed the screen is the first thing to go: a window opening on it
+ * afterwards paints an agent's frame onto the ordinary screen, and when the
+ * agent exits there is nothing to give back. The frame stays where it was and
+ * the shell prints its prompt through it. Ten of the sixteen agent tabs on this
+ * desktop were in that state on 24 August, which is the whole of why this is
+ * here. See append, and RESET_MODES in ./manager.js for the same wound on the
+ * other side — a program that was killed and never got to give the screen back.
+ */
+const UNDERNEATH_BYTES = SCROLLBACK_BYTES / 2;
 
 /*
  * How long to wait for a new shell to be ready for a line typed into it.
@@ -96,6 +118,28 @@ const ARRIVING_MAX_MS = 120000;
 
 let nextOrder = 0;
 
+/**
+ * The end of a recording, cut where a terminal would not mind.
+ *
+ * A recording is only ever read by writing it into a terminal, so where it
+ * starts matters: half an escape sequence at the front is a line of gibberish at
+ * the top of the tab. A line feed is the clean place to start and is never far
+ * away in anything a shell wrote; an escape will do after that, being at worst
+ * the start of a sequence whose effect was already spent. Failing both, the cut
+ * is where it falls, which is what dropping a chunk has always done.
+ *
+ * `cap` is bytes and the slice is characters, so what comes back is at most that
+ * and can be less. It is a bound, not a measurement.
+ */
+function lastBytesOf(text, cap) {
+  if (Buffer.byteLength(text) <= cap) return text;
+  const from = text.length - cap;
+  const feed = text.indexOf('\n', from);
+  if (feed !== -1) return text.slice(feed + 1);
+  const escape = text.indexOf('\x1b', from);
+  return text.slice(escape === -1 ? from : escape);
+}
+
 export class Session {
   constructor({ id, title = null, order = null, cwd = null, container = null }) {
     this.id = id;
@@ -152,6 +196,18 @@ export class Session {
 
     this.chunks = [];
     this.bytes = 0;
+    /**
+     * The recording of the screen a program borrowed, and how big it is.
+     *
+     * Empty whenever the tab is on its ordinary screen, which is most tabs most
+     * of the time. While something has the alternate screen this holds
+     * everything up to and including the sequence that asked for it, so that
+     * what a window replays is what the terminal really saw: the prompt, the
+     * command, the screen being borrowed, and then the frames. See append and
+     * UNDERNEATH_BYTES.
+     */
+    this.underneath = [];
+    this.underneathBytes = 0;
     this.dirty = false;
     /** Output has arrived since anyone last looked at this session. */
     this.unseenOutput = false;
@@ -505,7 +561,7 @@ export class Session {
    * looking at, so it is the thing the next lot of output has to differ from.
    */
   markSeen() {
-    this.seenScreen = this.screen.digest();
+    this.seenScreen = this.screen.snapshot();
   }
 
   /**
@@ -517,32 +573,86 @@ export class Session {
    * that case (see drawsSomething in ./output.js) and this must not be mistaken
    * for it, in either direction: saying "nothing happened" about a screen this
    * cannot read is how a tab with a question in it sits there quietly.
+   *
+   * What counts as different is isNews, in ./screen.js: not every cell of it,
+   * because a program that rewrites its own status line has told nobody
+   * anything.
    */
   screenIsNew() {
     if (!this.screen.sure || this.seenScreen === null) return null;
-    return this.screen.digest() !== this.seenScreen;
+    return isNews(this.seenScreen, this.screen.snapshot());
   }
 
+  /**
+   * Keep this output, and let go of the oldest once there is too much of it.
+   *
+   * Two recordings, not one, whenever something has borrowed the whole screen:
+   * what was on the screen underneath, which cannot change again until it is
+   * given back, and what the program is drawing on the screen it borrowed. The
+   * first is set aside at the moment of the swap and trimmed no further; the
+   * second is trimmed as ever. See UNDERNEATH_BYTES for what goes wrong when
+   * they are one buffer — which is what they were until 24 August.
+   */
   append(data) {
+    const swap = lastScreenSwap(data);
+
+    if (swap && swap.borrowed && !this.underneath.length) {
+      // Everything up to and including the sequence that asked for the screen,
+      // the rest of this chunk after it. The last of these chunks is the one
+      // holding the swap, and the trim below never takes the last one.
+      const asked = data.slice(0, swap.at);
+      this.underneath = [...this.chunks, asked];
+      this.underneathBytes = this.bytes + Buffer.byteLength(asked);
+      this.chunks = [];
+      this.bytes = 0;
+      while (this.underneathBytes > UNDERNEATH_BYTES && this.underneath.length > 1) {
+        this.underneathBytes -= Buffer.byteLength(this.underneath.shift());
+      }
+      this.keep(data.slice(swap.at));
+      return;
+    }
+
+    if (swap && !swap.borrowed && this.underneath.length) {
+      // The screen has been given back, so the two are one recording again and
+      // the whole of it is ordinary scrollback from here.
+      this.chunks = [...this.underneath, ...this.chunks];
+      this.bytes += this.underneathBytes;
+      this.underneath = [];
+      this.underneathBytes = 0;
+    }
+
+    this.keep(data);
+  }
+
+  /** One chunk onto the live recording, and the front of it dropped to fit. */
+  keep(data) {
+    this.dirty = true;
+    if (!data) return;
     this.chunks.push(data);
     this.bytes += Buffer.byteLength(data);
-    this.dirty = true;
 
-    while (this.bytes > SCROLLBACK_BYTES && this.chunks.length > 1) {
+    // What is set aside for the screen underneath comes out of the same
+    // half-megabyte, so a tab's recording costs what it always did.
+    const room = SCROLLBACK_BYTES - this.underneathBytes;
+    while (this.bytes > room && this.chunks.length > 1) {
       const dropped = this.chunks.shift();
       this.bytes -= Buffer.byteLength(dropped);
     }
   }
 
   scrollback() {
-    return this.chunks.join('');
+    return this.underneath.join('') + this.chunks.join('');
   }
 
   /** What is on the line the cursor is on, with the escapes taken out. */
   cursorLine() {
     let tail = '';
-    for (let i = this.chunks.length - 1; i >= 0 && tail.length < TAIL_BYTES; i--) {
-      tail = this.chunks[i] + tail;
+    // The live recording first and the borrowed screen behind it, which is the
+    // order they happened in: a tab whose program has just taken the screen has
+    // almost nothing in the first of them.
+    const parts = [...this.underneath, ...this.chunks];
+    for (let i = parts.length - 1; i >= 0 && tail.length < TAIL_BYTES; i--) {
+      tail = parts[i] + tail;
     }
     const text = tail.slice(-TAIL_BYTES).replace(OSC, '').replace(CSI, '').replace(SHORT_ESCAPE, '');
     const line = text.slice(text.lastIndexOf('\n') + 1);
@@ -580,10 +690,24 @@ export class Session {
     return line.length > 0 && /[:?]$/.test(line);
   }
 
-  /** Seed the buffer from disk when reconstructing a session after a reboot. */
+  /**
+   * Seed the buffer from disk when reconstructing a session after a reboot.
+   *
+   * Split where it was split when it was written, if it was: a recording that
+   * ends with a program still holding the screen has a screen underneath it, and
+   * arriving as one chunk is not a reason to lose it the next time this tab is
+   * trimmed. See append.
+   */
   seedScrollback(text) {
-    this.chunks = text ? [text] : [];
-    this.bytes = text ? Buffer.byteLength(text) : 0;
+    const swap = text ? lastScreenSwap(text) : null;
+    const at = swap && swap.borrowed ? swap.at : 0;
+    const under = at ? lastBytesOf(text.slice(0, at), UNDERNEATH_BYTES) : '';
+    const live = at ? text.slice(at) : text;
+
+    this.underneath = under ? [under] : [];
+    this.underneathBytes = under ? Buffer.byteLength(under) : 0;
+    this.chunks = live ? [live] : [];
+    this.bytes = live ? Buffer.byteLength(live) : 0;
     // The buffer is a recording of everything the program wrote, the titles it
     // set included, so the last one it announced is in there to be found. That
     // is what keeps a tab's name across a reload and a restart, instead of it
