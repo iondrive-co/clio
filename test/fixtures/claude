@@ -14,11 +14,22 @@
  * the one case where the conversation in a tab changes without the process
  * changing with it.
  *
+ * `--resume` with no id is the other awkward one: Claude Code opens its own
+ * list and a person picks a conversation out of it, so nothing on the command
+ * line says which, and the id the children are holding is one allocated before
+ * the choice was made and then abandoned. The stand-in does the same — it holds
+ * an id that never becomes a file, and opens whatever $CLAUDE_TEST_PICK names,
+ * which is this test's way of pressing Enter on a line in that list.
+ *
+ * Both of them are found the way the real one is found: by name. Every
+ * conversation here writes an `ai-title` into its transcript and puts the same
+ * name in the terminal title, which is what Claude Code does.
+ *
  * Started through a node shebang on purpose: that is how an npm-installed
  * claude appears in /proc — `node .../claude` rather than a program of its own
  * — so the adapter's match is being tested and not just a filename.
  */
-import { mkdirSync, appendFileSync } from 'node:fs';
+import { mkdirSync, appendFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
@@ -56,18 +67,42 @@ function hold(id) {
   );
 }
 
+/** What a conversation is called, which is the same in the file and in the tab. */
+const nameOf = (id) => `conversation ${id.slice(0, 8)}`;
+
 let sessionId = null;
-function open(id, what) {
+function open(id, what, { holding = id } = {}) {
   sessionId = id;
   appendFileSync(
     join(dir, `${sessionId}.jsonl`),
-    `${JSON.stringify({ type: 'turn', sessionId, timestamp: new Date().toISOString() })}\n`,
+    `${[
+      JSON.stringify({ type: 'turn', sessionId, timestamp: new Date().toISOString() }),
+      JSON.stringify({ type: 'ai-title', aiTitle: nameOf(sessionId), sessionId }),
+    ].join('\n')}\n`,
   );
-  hold(sessionId);
+  hold(holding);
   process.stdout.write(`${what} ${sessionId}\r\n`);
+  announce('✳');
 }
 
-open(resuming || randomUUID(), resuming ? 'RESUMED' : 'STARTED');
+/*
+ * Which conversation a person picked out of the list. $CLAUDE_TEST_PICK names
+ * it; without one, the oldest in the directory, so that "the newest file" —
+ * which is what a guess takes — is never the answer by accident.
+ */
+function chosen() {
+  const asked = process.env.CLAUDE_TEST_PICK;
+  if (asked) return asked;
+  const files = readdirSync(dir)
+    .filter((f) => f.endsWith('.jsonl'))
+    .map((f) => ({ id: f.slice(0, -'.jsonl'.length), at: statSync(join(dir, f)).mtimeMs }))
+    .sort((a, b) => a.at - b.at);
+  return files.length ? files[0].id : randomUUID();
+}
+
+// `--resume` with an id is clio bringing a tab back; `--resume` on its own is
+// somebody at the keyboard choosing from the list.
+const picking = !resuming && argv.some((arg) => arg === '--resume' || arg === '-r');
 
 /*
  * Titles, the way Claude Code writes them: a spinner into the terminal title
@@ -83,7 +118,7 @@ const SPINNER = ['◐', '◑'];
 const FRAME_MS = 300;
 const WORK_MS = 2400;
 
-const announce = (glyph) => process.stdout.write(`\x1b]0;${glyph} a stand-in\x07`);
+const announce = (glyph) => process.stdout.write(`\x1b]0;${glyph} ${nameOf(sessionId)}\x07`);
 let spinning = null;
 
 function stop() {
@@ -91,7 +126,14 @@ function stop() {
   spinning = null;
   announce('✳');
 }
-stop();
+
+if (picking) {
+  // The id the children hold is the one from before the choice, and nothing
+  // ever writes a file under it — see the header.
+  open(chosen(), 'PICKED', { holding: randomUUID() });
+} else {
+  open(resuming || randomUUID(), resuming ? 'RESUMED' : 'STARTED');
+}
 
 // Anything typed at it is a turn, except the one thing that is a change of
 // conversation. Not raw mode, on purpose: Ctrl-C has to go on killing this the

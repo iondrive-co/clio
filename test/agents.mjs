@@ -574,6 +574,64 @@ async function main() {
     `${heldBy(cleared.id)} vs ${after}`,
   );
 
+  console.log('\n11. a conversation picked out of the list by hand');
+  /*
+   * `claude --resume` with no id: Claude Code shows its own list, somebody
+   * picks a line out of it, and nothing the daemon can see says which one. Not
+   * the command line, which names no id. Not the children either — the id they
+   * carry was allocated before the choice was made and abandoned when it was,
+   * so it never becomes a file at all.
+   *
+   * Which is how, on 26 August, an ~/ops tab that had just been put back on a
+   * conversation by hand was written down as the api-server-errors conversation
+   * from the tab beside it: the one it was really showing was already claimed,
+   * so the guess underneath took the newest thing that was not, and a restart
+   * would then have typed *that* into the tab — undoing the repair by doing
+   * exactly what it was told.
+   *
+   * So this is that shape. A conversation open in one tab, the same one picked
+   * by hand in another, and something newer loose in the directory for a guess
+   * to reach for. The tab that cannot prove it must come away with nothing
+   * rather than with the loose one, and the tab that can must keep it.
+   */
+  const holder = await agentIn(last);
+  check('a conversation open in a tab', !!holder.conversation, holder.detail);
+  if (!holder.conversation) return report();
+
+  const byHand = await newTab(last);
+  check('and a tab to pick it in', !!byHand);
+  if (!byHand) return report();
+
+  await sleep(800);
+  const before = (last.output.get(byHand) || '').length;
+  last.send({
+    t: 'input',
+    id: byHand,
+    data: `CLAUDE_TEST_PICK=${holder.conversation} claude --resume\n`,
+  });
+  await sleep(6000);
+  const picked = (last.output.get(byHand) || '').slice(before);
+  check(
+    'it comes back on it with nothing on the command line to say so',
+    picked.includes(`PICKED ${holder.conversation}`),
+    JSON.stringify(picked.slice(-200)),
+  );
+
+  const decoy = writeTranscript(newId(), 'cli'); // newer, nameless, claimed by nobody
+  await sleep(RECAPTURE_MS);
+  check(
+    'the tab that cannot prove it takes nothing, and not the loose conversation',
+    heldBy(byHand) === null,
+    `${heldBy(byHand)} — the loose one was ${decoy}, the picked one ${holder.conversation}`,
+  );
+  check(
+    'and the tab that can prove it keeps what it has',
+    heldBy(holder.id) === holder.conversation,
+    `${heldBy(holder.id)} vs ${holder.conversation}`,
+  );
+
+  last.send({ t: 'close', id: byHand });
+  last.send({ t: 'close', id: holder.id });
   last.send({ t: 'close', id: cleared.id });
   last.send({ t: 'close', id: flash });
   last.send({ t: 'close', id: seven.id });

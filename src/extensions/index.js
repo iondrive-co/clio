@@ -161,7 +161,10 @@ export function extensionIdentity(record) {
  * Look at what is running in a tab and decide what to remember about it.
  *
  * `foreground` is the process that owns the terminal, or null when the shell is
- * sitting at its prompt. `taken` are the identities *other* tabs have claimed.
+ * sitting at its prompt. `title` is what the program in the tab last called
+ * itself, which the daemon is holding anyway and which an adapter may know how
+ * to read — src/agents/claude.js does, because a conversation's name is in
+ * there. `taken` are the identities *other* tabs have claimed.
  * Working out which of them are other tabs is the daemon's job and cannot be
  * done from here: this tab's own claim and the same claim held by the tab next
  * to it are the same string, and only the caller holding both records can tell
@@ -176,7 +179,7 @@ export function extensionIdentity(record) {
  * its process is gone — which is also the moment somebody who typed `exit`
  * meant, and their tab must not resurrect itself after a reboot.
  */
-export function observeExtension(record, { foreground = null, taken = new Set(), now = Date.now() } = {}) {
+export function observeExtension(record, { foreground = null, taken = new Set(), title = null, now = Date.now() } = {}) {
   const adapter = foreground ? ADAPTERS.find((a) => safely(() => a.matches(foreground), false)) : null;
 
   if (adapter) {
@@ -189,6 +192,7 @@ export function observeExtension(record, { foreground = null, taken = new Set(),
           ...foreground,
           previous: known ? record.state : null,
           taken: claims(adapter, taken),
+          title,
         }),
       known ? record.state : null,
     );

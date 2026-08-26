@@ -1144,6 +1144,11 @@ export class SessionManager extends EventEmitter {
           },
         },
         taken: claimed,
+        // The name the program in this tab last gave itself. Already in hand
+        // for the flash below, and for an agent it is the name of the
+        // conversation on screen — which is the only thing that says which one
+        // a person picked out of `claude --resume` by hand.
+        title: session.termTitle,
       });
 
       session.ext = record;

@@ -27,14 +27,27 @@
  * servers and tool shells hold the proof that its own environment cannot.
  * Neither of those can name a conversation belonging to the tab next door.
  *
- * What is left for the guess is a conversation that has written a file and
- * proved nothing — an agent with no MCP servers that has not run a tool yet.
- * Two things still narrow it there. The registry says which ids other tabs have
- * already claimed. And each transcript says which Claude Code wrote it, so the
- * desktop app's and a script's are not mistaken for a tab's — see TERMINAL.
+ * Neither of them says anything about the one way a person picks a conversation
+ * by hand: `claude --resume` with no id, which opens Claude Code's own list. The
+ * command line names nothing, and the id in the children is one allocated at
+ * startup and then abandoned when the conversation is chosen — it never becomes
+ * a transcript at all, which is how the ~/ops tab that was put back on the
+ * Hetzner comparison by hand came to be written down as the api-server-errors
+ * conversation from the tab beside it. So there is a third thing, and it comes
+ * from the tab rather than from the process: Claude Code puts the conversation's
+ * own name in the terminal title, and the same name is in the transcript as
+ * `ai-title`. A title that answers to exactly one conversation in this
+ * directory is not a guess either. See `spoken` and `conversationName`.
+ *
+ * What is left for the guess is a conversation that has written a file, proved
+ * nothing, and has no name yet — a fresh one, in its first turn, in a directory
+ * with another tab in it. Two things still narrow it there. The registry says
+ * which ids other tabs have already claimed. And each transcript says which
+ * Claude Code wrote it, so the desktop app's and a script's are not mistaken
+ * for a tab's — see TERMINAL.
  */
 
-import { readdirSync, statSync, existsSync, openSync, readSync, closeSync } from 'node:fs';
+import { readdirSync, statSync, fstatSync, existsSync, openSync, readSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -87,6 +100,16 @@ const SESSION_ENV = 'CLAUDE_CODE_SESSION_ID';
  * thirty tabs open.
  */
 const HEAD_BYTES = 64 * 1024;
+
+/*
+ * How much of a transcript to read to find out what it is called.
+ *
+ * The name is written again every turn, so the last one is at the end of the
+ * file and this reads backwards from there. The same size as the head read and
+ * for the same reason: a transcript runs to megabytes, this is asked on a poll,
+ * and it is only asked at all when nothing cheaper has answered.
+ */
+const TAIL_BYTES = 64 * 1024;
 
 /*
  * The glyphs Claude Code puts in front of the terminal title while it is
@@ -213,6 +236,67 @@ function writtenBy(file) {
   } finally {
     if (fd !== null) closeSync(fd);
   }
+}
+
+/**
+ * What Claude Code calls this conversation, or null if it has not named it yet.
+ *
+ * The name is the `ai-title` entry, which is rewritten every turn, so the last
+ * one in the file is the current one and the tail is where it lives. Parsed a
+ * line at a time rather than searched for as text, for the same reason as
+ * writtenBy: a conversation *about* ai-titles has the words in it too.
+ *
+ * A conversation nobody has said anything in has no name, and neither does one
+ * whose last name has scrolled past the tail read of a very long turn. Both are
+ * null, which is "this does not answer to anything" and not "this answers to
+ * nothing".
+ */
+function conversationName(file) {
+  let fd = null;
+  try {
+    fd = openSync(file, 'r');
+    const { size } = fstatSync(fd);
+    const from = Math.max(0, size - TAIL_BYTES);
+    const buffer = Buffer.allocUnsafe(Math.min(size, TAIL_BYTES));
+    const read = readSync(fd, buffer, 0, buffer.length, from);
+    const lines = buffer.toString('utf8', 0, read).split('\n');
+    // The first line is cut in half whenever the read started mid-file.
+    if (from > 0) lines.shift();
+    let name = null;
+    for (const line of lines) {
+      if (!line.includes('"ai-title"')) continue;
+      try {
+        const entry = JSON.parse(line);
+        if (typeof entry?.aiTitle === 'string' && entry.aiTitle.trim()) name = entry.aiTitle.trim();
+      } catch {
+        /* not an entry, or not a whole one: the next line will do */
+      }
+    }
+    return name;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+/**
+ * The name in a tab's title, without the glyph Claude Code draws in front of it.
+ *
+ * The title is `◐ Some conversation` while it works and `✳ Some conversation`
+ * when it stops, and the part after the glyph is the conversation's own name —
+ * the same string the transcript carries. One codepoint is taken off the front
+ * and only if it is not a letter or a digit, so a conversation whose name starts
+ * with a word keeps all of it, and a title that is not Claude Code's at all —
+ * a shell's `~/ops`, the `claude · resume` of the picker itself — comes back as
+ * something no transcript will answer to, which is the right answer.
+ */
+function spoken(title) {
+  const text = String(title || '').trim();
+  if (!text) return null;
+  const [first] = [...text];
+  const rest = /[\p{L}\p{N}]/u.test(first) ? text : text.slice(first.length).trim();
+  return rest || null;
 }
 
 /**
@@ -365,12 +449,14 @@ export default {
     startedAt = 0,
     env = null,
     children = [],
+    title = null,
     previous = null,
     taken = new Set(),
   }) {
     const dir = projectDir(cwd, env);
     const mine = previous?.sessionId || null;
     const owned = ownedBy(argv, children);
+    const named = spoken(title);
 
     if (dir) {
       const since = Math.max(0, (startedAt || 0) - CLOCK_SLACK_MS);
@@ -385,11 +471,35 @@ export default {
       const proven = seen.find((t) => owned.has(t.id));
       if (proven) return { v: 1, sessionId: proven.id, cwd, at: Math.round(proven.mtimeMs) };
 
-      // No proof, but this tab's own claim is still being written, so it is
-      // still true and is not revised — not for a newer file, which is the tab
-      // next door, and not for anything else in a directory this one shares.
-      // Taken at its word without a file being opened: it is the answer on
-      // almost every poll.
+      /*
+       * No proof from the process, so ask the tab. The title is the
+       * conversation's own name and the transcript carries the same one, so a
+       * title that exactly one conversation here answers to says which it is —
+       * and it is the only thing that does for a conversation picked by hand
+       * from `claude --resume`, which names nothing on the command line and
+       * whose children carry an id that never becomes a file.
+       *
+       * Answered even when the name is another tab's, and answered with
+       * nothing: two tabs showing one conversation is somebody's mistake to
+       * make, and the tab that can prove it keeps it — but writing down a
+       * third conversation that this tab is demonstrably not showing is how a
+       * restore types the wrong one into it later. Nothing is the honest
+       * record, and it comes back saying what was here instead of running it.
+       */
+      if (named) {
+        const answering = seen.filter((t) => conversationName(join(dir, `${t.id}.jsonl`)) === named);
+        if (answering.length === 1) {
+          const [only] = answering;
+          if (taken.has(only.id)) return { v: 1, sessionId: null, cwd, at: null };
+          return { v: 1, sessionId: only.id, cwd, at: Math.round(only.mtimeMs) };
+        }
+      }
+
+      // Nothing proved and nothing named, but this tab's own claim is still
+      // being written, so it is still true and is not revised — not for a newer
+      // file, which is the tab next door, and not for anything else in a
+      // directory this one shares. Taken at its word without a file being
+      // opened: it is the answer on almost every poll.
       //
       // Unless somebody else has the same claim, which is the one case where
       // giving it up is right: two tabs on one conversation is one of them
@@ -409,8 +519,8 @@ export default {
     // Nothing written yet — a conversation opened a moment ago, or a resume
     // whose transcript is in a directory this cannot see. What the process
     // names is still the conversation it is showing.
-    const [named] = owned;
-    if (named) return { v: 1, sessionId: named, cwd, at: null };
+    const [asked] = owned;
+    if (asked) return { v: 1, sessionId: asked, cwd, at: null };
 
     return previous || { v: 1, sessionId: null, cwd, at: null };
   },
