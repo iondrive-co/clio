@@ -375,8 +375,20 @@ addEventListener('pagehide', () => {
  */
 function setDev(dev) {
   if (el.devbadge) el.devbadge.toggleAttribute('hidden', !dev);
-  const title = dev ? 'clio (dev)' : 'clio';
-  if (document.title !== title) document.title = title;
+  showTitle(dev ? 'clio (dev)' : 'clio');
+}
+
+/**
+ * The window's title, unless it is wearing a name somebody else needs.
+ *
+ * A window that cannot get back to its own monitor is called something the
+ * daemon chose for a second or two, because from outside the title is the only
+ * thing that tells one clio window from another — so while that is on, nothing
+ * else may write over it. See askToBePlaced.
+ */
+function showTitle(text) {
+  if (placeMark) return;
+  if (document.title !== text) document.title = text;
 }
 
 function handle(msg) {
@@ -396,7 +408,7 @@ function handle(msg) {
       // onto, and again if it takes on another window's from the picker.
       if (!picking && placedFor !== containerId) {
         placedFor = containerId;
-        applyGeometry(msg.geometry);
+        applyGeometry(msg.geometry, msg.mark);
       }
       syncSessions(msg.sessions, msg.home);
       refreshTitle();
@@ -428,6 +440,14 @@ function handle(msg) {
           'Nothing in these tabs was lost; the shells kept running throughout.',
         12000,
       );
+      break;
+
+    // The daemon has finished having this window moved, or has found that it
+    // cannot. Either way this window is no longer being looked for by name and
+    // can have its own title back; where it ended up is what it reports from
+    // here on.
+    case 'placed':
+      donePlacing();
       break;
 
     // The UI files on disk changed. Nothing here is compiled or cached, so the
@@ -1045,11 +1065,11 @@ function activate(id) {
  */
 function refreshTitle() {
   if (picking) {
-    document.title = 'clio — open a window';
+    showTitle('clio — open a window');
     return;
   }
   const where = windowName ? `${windowName} · clio` : 'clio';
-  document.title = activeId ? `${tabLabel(sessions.get(activeId))} — ${where}` : where;
+  showTitle(activeId ? `${tabLabel(sessions.get(activeId))} — ${where}` : where);
 }
 
 /** Resize a pane to its container, ignoring proposals from an unlaid-out pane. */
@@ -2157,9 +2177,17 @@ const GEOMETRY_POLL_MS = 1000;
 /** Differences smaller than this are not moves; a window manager may round. */
 const GEOMETRY_SLACK = 2;
 
+/** How long to wait for the daemon to say a window has been moved. */
+const PLACE_WAIT_MS = 8000;
+
 /** Which container this page has already put itself in place for. */
 let placedFor = null;
-/** The last position reported, so a still window is silent. */
+/** Where the daemon says this window belongs, once it has said. */
+let wanted = null;
+/** The name this window is wearing while the daemon looks for it, if any. */
+let placeMark = null;
+let placeTimer = null;
+/** Where this window was when the clock last came round. */
 let lastGeometry = null;
 
 /**
@@ -2191,8 +2219,18 @@ function moved(a, b) {
  * ordinary window of that size. It looks the same and is not the same, and there
  * is no way for a page to ask whether it was maximised — so that is as close as
  * this gets.
+ *
+ * The one place it can get no closer on its own is another monitor. A browser
+ * answers a move that would take a window off the display it is on by moving it
+ * as far as that display allows and stopping there, so a window whose place is
+ * on the next screen along ends up the right size against the wrong edge. That
+ * is the one case worth handing outwards; see askToBePlaced.
  */
-function applyGeometry(saved) {
+function applyGeometry(saved, mark) {
+  // Kept whether or not there is anywhere to go: it is what stops this window
+  // from reporting the place the browser put it as though it were a choice
+  // somebody made. See reportGeometry.
+  wanted = saved || null;
   const now = currentGeometry();
   if (!saved || !now || !moved(now, saved)) return;
   // A window on Wayland can neither move itself nor read where it is; both calls
@@ -2206,16 +2244,78 @@ function applyGeometry(saved) {
   // tab pulled out low on the screen into a window the size of the one it left.
   window.resizeTo(saved.width, saved.height);
   window.moveTo(saved.x, saved.y);
+  // The browser has already decided: a move it will not make it makes as far as
+  // it can and reports straight away, so what this reads is the answer rather
+  // than a guess at one. Still somewhere else means the rest of the way is over
+  // a monitor edge, which only the window manager can cross.
+  const landed = currentGeometry();
+  if (mark && landed && moved(landed, saved)) askToBePlaced(mark);
+}
+
+/**
+ * Ask the daemon to have this window moved from outside.
+ *
+ * The title is the whole mechanism. Every clio window is the same browser, the
+ * same class and the same process, and from out there the name in the title bar
+ * is the only thing that separates them — so this window is called what the
+ * daemon told it to be called for as long as the move takes, and nothing else
+ * may write over that in the meantime. Where to go is not sent: the daemon
+ * wrote that down and is the one that just said it.
+ */
+function askToBePlaced(mark) {
+  placeMark = mark;
+  document.title = mark;
+  send({ t: 'place' });
+  // A daemon that never answers must not leave the window called this for the
+  // rest of the day.
+  clearTimeout(placeTimer);
+  placeTimer = setTimeout(donePlacing, PLACE_WAIT_MS);
+}
+
+/** Done being looked for, however it turned out. */
+function donePlacing() {
+  clearTimeout(placeTimer);
+  if (!placeMark) return;
+  placeMark = null;
+  refreshTitle();
 }
 
 /** Tell the daemon where we are, when that changes. */
 function reportGeometry() {
   // A window still on the picker has not become anything yet, and where an empty
   // frame happens to be is not worth remembering against the tabs it may adopt.
-  if (picking) return;
+  // Nor has one that has not been told which tabs it is showing, and so has not
+  // had its chance to go where they were.
+  if (picking || placedFor !== containerId) return;
   const now = currentGeometry();
-  if (!now || (lastGeometry && !moved(lastGeometry, now))) return;
+  if (!now) return;
+  const before = lastGeometry;
   lastGeometry = now;
+
+  /*
+   * Only a window that has moved since the last look, and the first look is not
+   * a move.
+   *
+   * Where a window opens is the browser's doing and not anybody's choice: every
+   * window after the first of the day is put wherever Chrome likes, and one that
+   * asked for another monitor and was refused is sitting at the edge it was
+   * refused at. Reporting either would write over the only record of where this
+   * window belongs with the place it is trying to leave — and then the next
+   * restore would land there too, which is how a desktop quietly collapses onto
+   * one screen.
+   *
+   * A window with nothing saved for it is the other way round: wherever it
+   * opened is all there is to know about it, so that much is said once, here.
+   */
+  if (!before) {
+    if (!wanted) sendGeometry(now);
+    return;
+  }
+  if (!moved(before, now)) return;
+  sendGeometry(now);
+}
+
+function sendGeometry(now) {
   // Deliberately not through send(): this is chatter rather than something
   // somebody clicked, and a window whose daemon is down has been told so by
   // everything else already. It must not raise a banner of its own.

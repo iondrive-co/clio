@@ -14,7 +14,7 @@ const BROWSERS = [
   'brave-browser',
 ];
 
-function onPath(name, env) {
+export function onPath(name, env = process.env) {
   for (const dir of String(env.PATH || '').split(':')) {
     if (!dir) continue;
     const candidate = join(dir, name);

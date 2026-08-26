@@ -135,6 +135,17 @@ async function status() {
 }
 
 /**
+ * A page saying it is on its way out, the way a real one does — sendBeacon to
+ * /gone as it is taken apart. It is the whole of the difference between a window
+ * somebody closed and a page that was killed, so a test about that difference
+ * has to be able to say it.
+ */
+async function goodbye(container) {
+  const { port, token } = handshake();
+  await fetch(`http://127.0.0.1:${port}/gone?c=${container}&token=${token}`, { method: 'POST' });
+}
+
+/**
  * A second view of one window's tabs, which is how this test plays the part of a
  * page without opening one.
  */
@@ -319,6 +330,180 @@ placed.forEach((was, i) => {
     `${now ? `${now.x},${now.y} ${now.w}x${now.h}` : 'missing'} vs ${was.x},${was.y} ${was.w}x${was.h}`,
   );
 });
+
+/* ------------------------- 5. a place the window cannot get to on its own */
+
+/*
+ * The monitor a window was on is the half of "where it was" that a page cannot
+ * do anything about. A browser answers a move that would take a window off the
+ * display it is on by moving it as far as that display allows and stopping
+ * there — so a window whose place is on the next screen along comes back the
+ * right size against the wrong edge, and then reports that edge as though
+ * somebody had chosen it, which is how a desktop collapses onto one monitor a
+ * restore at a time.
+ *
+ * One display is all a test machine has, so the stand-in for another monitor is
+ * a position on this one that a page is refused in exactly the same way: half
+ * off the right-hand edge. Nothing the page can do puts a window there. The
+ * daemon can, through the window manager, and that is what this checks.
+ */
+console.log('\n5. a window comes back somewhere its page could never move it');
+
+const overhang = { x: 1500, y: 300, w: 700, h: 480 };
+check(
+  'the target really is out of the page\u2019s reach',
+  overhang.x + overhang.w > 1920,
+  `${overhang.x} + ${overhang.w} against a 1920-wide screen`,
+);
+
+const onScreen = windows();
+wmctrl('-i', '-r', onScreen[0].id, '-e', `0,${overhang.x},${overhang.y},${overhang.w},${overhang.h}`);
+await sleep(3500);
+const hanging = windows().find((win) => Math.abs(win.x - overhang.x) <= 4);
+check('it is hanging off the edge now', !!hanging, JSON.stringify(windows()));
+const savedOverhang = savedState().containers.find((c) => c.geometry && Math.abs(c.geometry.x - overhang.x) <= 4);
+check('and the daemon wrote that down', !!savedOverhang, JSON.stringify(savedState().containers.map((c) => c.geometry)));
+
+process.kill(handshake().pid, 'SIGKILL');
+await sleep(2000);
+for (const win of windows()) wmctrl('-i', '-c', win.id);
+await sleep(2000);
+clio('start');
+await sleep(1500);
+clio();
+await sleep(14000);
+
+const afterOverhang = windows();
+const overhangBack = afterOverhang.find((win) => Math.abs(win.x - overhang.x) <= 6);
+check(
+  'it came back where it was, off the edge and all',
+  !!overhangBack,
+  JSON.stringify(afterOverhang),
+);
+check(
+  'no window is left wearing the name the daemon looked for it by',
+  !wmctrl('-l').includes('putting this window back'),
+  wmctrl('-l').trim(),
+);
+// The point of the whole exercise: what is on file is still where the window
+// belongs, not the edge the browser would only let it get to.
+const overhangOnFile = savedState().containers.find((c) => c.geometry && Math.abs(c.geometry.x - overhang.x) <= 6);
+check('and the position on file was not overwritten on the way', !!overhangOnFile, JSON.stringify(savedState().containers.map((c) => c.geometry)));
+
+/* --------------------------- 6. what the picker is for, and what it is not */
+
+/*
+ * A window that was closed and a window whose page was killed leave the daemon
+ * in the same position — a socket gone and nothing coming back — and need
+ * opposite answers. One is somebody putting a window away, and belongs in the
+ * list `clio` offers by name. The other is a window nobody closed, and the only
+ * right answer is to put it back the way it was.
+ *
+ * The difference is the goodbye a page sends as it is taken apart, and these two
+ * sections are the difference: same socket dropping, one with it and one
+ * without.
+ */
+console.log('\n6. a page that was killed is still a window that is open');
+
+const killedPage = await connect('');
+await sleep(500);
+killedPage.send({ t: 'create', cwd: process.env.HOME, cols: 80, rows: 24 });
+await sleep(1500);
+const killedId = killedPage.container;
+// No goodbye: this is a renderer the system took, with nothing left of it to
+// say anything.
+killedPage.ws.close();
+await sleep(12000);
+
+let listed = (await status()).containers.find((c) => c.id === killedId);
+check('it is not offered as one of the closed windows', listed && !listed.saved, JSON.stringify(listed));
+check('so clio has nothing to ask about', clio('windows').includes('No closed windows'), clio('windows').trim());
+
+console.log('\n7. a window somebody closed is offered by name, as before');
+
+const closedPage = await connect('');
+await sleep(500);
+closedPage.send({ t: 'create', cwd: process.env.HOME, cols: 80, rows: 24 });
+await sleep(1500);
+const closedId = closedPage.container;
+await goodbye(closedId);
+closedPage.ws.close();
+await sleep(12000);
+
+listed = (await status()).containers.find((c) => c.id === closedId);
+check('it is in the list', listed && listed.saved, JSON.stringify(listed));
+
+/* ------------------------------ 8. the browser going down under all of them */
+
+/*
+ * Every clio window is a page in one browser process. When that process goes —
+ * a crash, an update restarting it, the desktop being shut down under it —
+ * every window is taken apart at once, and each says goodbye on the way out
+ * exactly as it would if somebody had clicked its close button. Nobody closed
+ * any of them, and this is the event that used to turn a reboot into a list of
+ * names to choose from: four windows, four goodbyes, four entries in the picker.
+ *
+ * One at a time they cannot be told apart from a close. Together they can.
+ */
+console.log('\n8. every window going at once is the browser, not a decision');
+
+const together = [];
+for (const _ of [1, 2]) {
+  const client = await connect('');
+  await sleep(500);
+  client.send({ t: 'create', cwd: process.env.HOME, cols: 80, rows: 24 });
+  await sleep(1500);
+  together.push(client);
+}
+// Both at once, the way a browser being taken down does it.
+for (const client of together) await goodbye(client.container);
+for (const client of together) client.ws.close();
+await sleep(12000);
+
+const afterBrowser = await status();
+for (const [index, client] of together.entries()) {
+  const seen = afterBrowser.containers.find((c) => c.id === client.container);
+  check(
+    `window ${index + 1} of the pair was left open, not put away`,
+    seen && !seen.saved && seen.sessions.length > 0,
+    JSON.stringify(seen),
+  );
+}
+/* ------------------------------- 9. the desktop going down under a window */
+
+/*
+ * The second half of the same thing, from the other side: a close that is still
+ * inside its grace period when the daemon is told to stop. Nothing about it has
+ * been decided, and the way out of the process is not the place to decide it —
+ * so it is left as a window that was open, and `clio` puts it back.
+ *
+ * A close that had already run its course is untouched, which is the other half
+ * of the check.
+ */
+console.log('\n9. a shutdown keeps what was still undecided');
+
+const goingDown = await connect('');
+await sleep(500);
+goingDown.send({ t: 'create', cwd: process.env.HOME, cols: 80, rows: 24 });
+await sleep(1500);
+const goingId = goingDown.container;
+await goodbye(goingId);
+goingDown.ws.close();
+await sleep(1000);
+clio('stop');
+await sleep(3000);
+
+const onDisk = savedState().containers;
+check(
+  'a close still in its grace period is left open, so clio puts it back',
+  onDisk.find((c) => c.id === goingId)?.closedAt === null,
+  JSON.stringify(onDisk.find((c) => c.id === goingId)),
+);
+check(
+  'and one closed long enough ago to have settled stays closed',
+  onDisk.find((c) => c.id === closedId)?.closedAt !== null,
+  JSON.stringify(onDisk.find((c) => c.id === closedId)),
+);
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

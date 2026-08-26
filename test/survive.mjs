@@ -93,7 +93,24 @@ class Client {
     return null;
   }
 
-  close() {
+  /**
+   * The socket goes, the way it does when a window is closed or reloaded — with
+   * the goodbye a real page sends as it is taken apart.
+   *
+   * It has to be said. To the daemon a socket that drops in silence is a page
+   * that was killed, and a window nobody closed is one it puts back by itself
+   * rather than offers by name — so a stand-in for a page that says nothing is
+   * standing in for the wrong thing. See the pagehide handler in src/ui/app.js.
+   */
+  close({ goodbye = true } = {}) {
+    if (goodbye && this.container) {
+      fetch(
+        `http://127.0.0.1:${this.info.port}/gone?c=${this.container}&token=${this.info.token}`,
+        { method: 'POST' },
+      ).catch(() => {
+        /* the daemon has gone; there is nobody left to tell */
+      });
+    }
     this.ws.close();
   }
 }

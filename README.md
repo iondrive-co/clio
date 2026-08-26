@@ -52,6 +52,28 @@ Text size can be increased and decreased via arrows at the right end
 of the tab row, and changes will be saved. New windows are opened
 with the plus button after the arrows.
 
+## Where the windows were
+
+Every window that was on screen comes back on its own — after a reboot, a crash,
+an out-of-memory kill, the browser going down under it, or `clio stop` — with
+its tabs, its scrollback, its size, and on the monitor it was on. Nothing is
+asked about any of it.
+
+The windows clio does ask about are the ones you closed yourself. Those are kept
+under a name and offered when there is nothing else to put back (`clio windows`
+lists them from a terminal, `clio open NAME` opens one). It can tell the
+difference: a page says goodbye as it is taken apart, so a window whose page went
+in silence was killed rather than closed — and every clio window is a page in one
+browser, so when they all say goodbye in the same instant what went was the
+browser, not four decisions about four windows.
+
+The monitor is the one part a page cannot manage alone. A browser will not move a
+window from one screen to another — a move that would leave the screen it is on
+is quietly stopped at the edge — so clio asks the window manager instead, through
+`wmctrl`, or `xdotool` where that is what is installed. With neither, windows
+still come back the size they were, together on whichever monitor the browser
+opened them on, and `clio log` says so.
+
 ## When a window loses its page
 
 A window whose page Chrome has replaced with an error page — `Aw, Snap!`, or

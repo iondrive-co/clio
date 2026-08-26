@@ -12,6 +12,7 @@ import { locate, spool, quote, searchBudget, MAX_SPOOL_BYTES } from './drops.js'
 import { SessionManager } from './manager.js';
 import { drawsSomething } from './output.js';
 import { openBrowserWindow, openUrl, browserChoices, notifyDesktop } from './window.js';
+import { placeWindow } from './place.js';
 
 const ENTRY = fileURLToPath(import.meta.url);
 const HERE = dirname(ENTRY);
@@ -150,6 +151,23 @@ const KILLED_COALESCE_MS = 750;
 // the grace period is up. Anything older is a window that went without leaving
 // any tabs behind, and nothing is ever going to come and collect it.
 const GOODBYE_TTL_MS = 60000;
+
+/*
+ * Goodbyes this close together are not people closing windows.
+ *
+ * Every clio window is a page in one browser process, so when that process goes
+ * — a crash, an update restarting it, or the desktop being shut down under it —
+ * every window is taken apart at the same moment, and each one says goodbye on
+ * the way out exactly as it would if somebody had clicked its close button.
+ * Nobody closed any of them, and putting them all away is what turns a reboot
+ * into a list of names to choose from instead of the desktop that was there.
+ *
+ * One at a time they are indistinguishable. Together they are unmistakable: the
+ * thing they were all in went down. Long enough to cover a browser closing four
+ * windows in turn, short enough that closing one and then another a few seconds
+ * later is still two windows closed.
+ */
+const BROWSER_GONE_MS = 4000;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -328,6 +346,17 @@ export function runningDaemon() {
 function readHandover() {
   const path = process.env.CLIO_HANDOVER;
   if (!path) return null;
+  // Ours, or somebody else's. The daemon puts this in the environment of the
+  // successor it spawns, which means every shell in every tab inherits it too —
+  // so a second clio started from inside a tab, a sandbox above all, comes up
+  // believing it is the replacement for the daemon holding that tab. It is not:
+  // the descriptors that manifest describes are not in this process, and taking
+  // its word for them would end the shells it was written to save. A handover
+  // only ever happens within one runtime directory, so that is the test.
+  if (path !== HANDOVER_FILE) {
+    console.log(`[clio] ignoring a handover manifest belonging to another clio (${path})`);
+    return null;
+  }
   try {
     const manifest = JSON.parse(readFileSync(path, 'utf8'));
     if (!manifest || !Array.isArray(manifest.sessions)) return null;
@@ -412,6 +441,10 @@ async function main() {
   scrubInheritedEnv();
 
   const handover = readHandover();
+  // Read once and then gone, for the same reason as the markers above: it is
+  // about this process's own startup, and a tab that inherits it is a tab whose
+  // shells can start a clio that thinks it is replacing something.
+  delete process.env.CLIO_HANDOVER;
 
   const existing = runningDaemon();
   // The daemon we are replacing is still up while it hands over — that one is
@@ -664,10 +697,66 @@ async function main() {
   /** Windows whose page was killed, against when we worked that out. */
   const killed = new Map();
 
-  function saidGoodbye(id) {
+  /**
+   * When each window's page left, whether or not it said anything on the way.
+   *
+   * One page going and every page going at once are different events, and one
+   * window at a time they look identical — so the times are kept and compared.
+   * See departedTogether.
+   */
+  const departures = new Map();
+
+  /**
+   * Did this window's page say it was going? Asked without settling anything,
+   * because a window in the middle of its grace period is asked about twice:
+   * once by whatever `clio` is deciding about it now, and once when the period
+   * runs out.
+   */
+  function goodbyeStanding(id) {
     const when = goodbyes.get(id);
-    goodbyes.delete(id);
     return when !== undefined && Date.now() - when < GOODBYE_TTL_MS;
+  }
+
+  function saidGoodbye(id) {
+    const standing = goodbyeStanding(id);
+    goodbyes.delete(id);
+    return standing;
+  }
+
+  /**
+   * Did this window's page leave in company?
+   *
+   * Not consumed the way a goodbye is: a window whose grace period runs out
+   * last has to be able to see the ones that went with it, and each of them has
+   * already been decided by then.
+   */
+  function departedTogether(id) {
+    const mine = departures.get(id);
+    if (mine === undefined) return false;
+    let together = 0;
+    for (const when of departures.values()) {
+      if (Math.abs(when - mine) <= BROWSER_GONE_MS) together++;
+    }
+    return together > 1;
+  }
+
+  /**
+   * Is this a window somebody closed — the one thing the picker is for?
+   *
+   * Two things have to hold. Its page said it was going, because a page that
+   * said nothing was killed and nobody closes a window by killing its renderer.
+   * And it went on its own: a goodbye with company is every window in the
+   * browser saying it at once, which is the browser or the desktop going down
+   * and not a decision about any of these tabs. Everything else comes back the
+   * way it was, without being asked about.
+   */
+  function closedOnPurpose(id) {
+    return goodbyeStanding(id) && !departedTogether(id);
+  }
+
+  /** A close still inside its grace period that will end in the picker. */
+  function closingOnPurpose(id) {
+    return closing.has(id) && closedOnPurpose(id);
   }
 
   /**
@@ -687,32 +776,68 @@ async function main() {
 
   /**
    * A window's page has gone. Give it WINDOW_GRACE_MS to come back — a reload
-   * takes well under a second — and if it does not, the window is not showing
-   * these tabs any more, so they are put away under a name and wait there to be
-   * opened again.
+   * takes well under a second — and if it does not, decide which of three
+   * things happened.
+   *
+   * Somebody closed it: put away under a name, waiting in the picker to be
+   * opened again. Its page was killed: nobody closed anything, so it stays a
+   * window that is open. Or it went with every other window at once, which is
+   * the browser or the desktop going down and not a decision about any of them:
+   * open as well. Only the first is a window anybody has to be asked about;
+   * `clio` puts the other two back the way they were.
+   *
+   * The goodbye is what tells the first two apart, and the company it arrives in
+   * tells the first from the third. See the pagehide handler in ../ui/app.js,
+   * closedOnPurpose, and departedTogether.
    */
   function scheduleContainerClose(id) {
     if (!id || closing.has(id) || containerHasClient(id)) return;
     if (!manager.sessionsIn(id).length) return;
 
+    // When it went, for the pages that went with it to be counted against. A
+    // page that comes back never left; see cancelContainerClose.
+    const stale = Date.now() - GOODBYE_TTL_MS;
+    for (const [was, when] of departures) if (when < stale) departures.delete(was);
+    departures.set(id, Date.now());
+
     const timer = setTimeout(() => {
       closing.delete(id);
       if (containerHasClient(id)) return; // it made it back with nothing to spare
-      const count = manager.parkContainer(id);
-      const name = manager.getContainer(id)?.name;
-      const closed = saidGoodbye(id);
-      if (count && closed) {
-        console.log(`[clio] window closed — ${count} shell(s) kept as “${name}”`);
-      } else if (count) {
-        // Nothing said goodbye, so nothing was there to: the page was killed
-        // and its window is still on screen showing Chrome's error page.
-        killed.set(id, Date.now());
-        console.log(
-          `[clio] a window's page was killed — ${count} shell(s) kept as “${name}”; ` +
-            'Ctrl+R in that window brings them back, or clio if the window went too',
-        );
-        announceKilled(name);
+      const sessions = manager.sessionsIn(id);
+      if (!sessions.length) return;
+
+      const goodbye = saidGoodbye(id);
+      if (goodbye && !departedTogether(id)) {
+        const count = manager.parkContainer(id);
+        const name = manager.getContainer(id)?.name;
+        if (count) console.log(`[clio] window closed — ${count} shell(s) kept as “${name}”`);
+        return;
       }
+
+      // Nothing decided about this window: either its page said nothing at all,
+      // which means it was killed rather than closed, or it said goodbye along
+      // with every other window in the browser, which means the browser or the
+      // desktop went down and took the lot. Left open either way — a window
+      // nobody closed is a window that was open, and `clio` puts it back as it
+      // was rather than offering it as a choice.
+      const container = manager.getContainer(id);
+      // Named only for the saying of it. A window that is coming back on its
+      // own must not come back wearing a name it never had.
+      const name = container?.name || manager.suggestName(sessions, id);
+      if (goodbye) {
+        console.log(
+          `[clio] a window went with every other one — ${sessions.length} shell(s) left as ` +
+            `they were in “${name}”; clio puts the desktop back rather than asking`,
+        );
+        return;
+      }
+
+      killed.set(id, Date.now());
+      console.log(
+        `[clio] a window's page was killed — ${sessions.length} shell(s) still running in ` +
+          `“${name}”; Ctrl+R in that window brings them back, or clio if the window went too`,
+      );
+      announceKilled(name);
     }, WINDOW_GRACE_MS);
 
     timer.unref?.();
@@ -1034,8 +1159,11 @@ async function main() {
   /** The window came back. Whatever it was, it was not a close. */
   function cancelContainerClose(id) {
     // A page that said goodbye and then came back was reloading, and the next
-    // socket to drop here has to be judged on its own.
+    // socket to drop here has to be judged on its own — including against the
+    // other windows that went at the same time, which this one turns out not to
+    // have done.
     goodbyes.delete(id);
+    departures.delete(id);
     const timer = closing.get(id);
     if (!timer) return;
     clearTimeout(timer);
@@ -1043,18 +1171,25 @@ async function main() {
   }
 
   /**
-   * Settle every pending close now, on the way out of the process.
+   * Drop every pending close on the way out of the process, deciding none of
+   * them.
    *
-   * Windows still on screen are deliberately left alone: they were open when
-   * the daemon went down, and `clio` puts those back by itself. Only the ones
-   * whose page had already gone are put away, so that a window closed a second
-   * before a reboot is still a closed window afterwards.
+   * A page whose socket dropped a moment ago and a daemon being told to stop
+   * are, on a machine that is shutting down, the same event: the browser goes
+   * first and the daemon follows a second later, and every window on the
+   * desktop is in this list by the time we get here. Putting those away is what
+   * made a reboot come back to a list of names to choose from instead of the
+   * desktop that was there before it — so nothing is put away here. They were
+   * open when the daemon stopped being able to show them, and `clio` puts every
+   * one of them back.
+   *
+   * A window closed long enough ago to have finished closing is untouched: it
+   * was put away when its grace period ran out, and stays put away. The only
+   * thing given the benefit of the doubt is a close still in the ten seconds
+   * nobody could have decided anything about.
    */
   function flushContainerCloses() {
-    for (const [id, timer] of closing) {
-      clearTimeout(timer);
-      if (!containerHasClient(id)) manager.parkContainer(id);
-    }
+    for (const timer of closing.values()) clearTimeout(timer);
     closing.clear();
   }
 
@@ -1062,18 +1197,22 @@ async function main() {
    * A window `clio` should put back on screen without being asked.
    *
    * These are windows that were open when the daemon stopped being able to show
-   * them — a reboot, a crash, `clio stop`. Nothing was decided about them, so
-   * they come back the way the desktop was left, which is what every browser
-   * does with the tabs you had open.
+   * them — a reboot, a crash, `clio stop` — and windows whose page was killed
+   * under them. Nothing was decided about any of them, so they come back the
+   * way the desktop was left, which is what every browser does with the tabs
+   * you had open.
    *
    * A window somebody closed is not one of these. It is in the picker instead,
-   * under its name, and comes back when it is chosen.
+   * under its name, and comes back when it is chosen. That is the only thing
+   * the picker is for now: the windows you put away yourself.
    */
   function adoptable(container) {
     return (
       manager.sessionsIn(container.id).length &&
       !containerHasClient(container.id) &&
-      !closing.has(container.id) &&
+      // Still inside its grace period and on its way to the picker: a window
+      // being closed, or one reloading, and either way not ours to reopen yet.
+      !closingOnPurpose(container.id) &&
       container.closedAt === null
     );
   }
@@ -1081,16 +1220,18 @@ async function main() {
   /**
    * A window that was closed and kept — what the picker offers.
    *
-   * Windows inside their grace period count: a page that dropped ten seconds
-   * ago is on its way to being one of these, and leaving it out is exactly the
-   * gap that makes typing `clio` straight after closing a window feel like the
-   * tabs were thrown away.
+   * Windows inside their grace period count, so long as their page said it was
+   * going: one closed ten seconds ago is on its way to being one of these, and
+   * leaving it out is exactly the gap that makes typing `clio` straight after
+   * closing a window feel like the tabs were thrown away. A page that said
+   * nothing was killed rather than closed, and belongs to the list above
+   * instead — from the moment it goes quiet, not ten seconds later.
    */
   function saved(container) {
     return (
       manager.sessionsIn(container.id).length &&
       !containerHasClient(container.id) &&
-      (container.closedAt !== null || closing.has(container.id))
+      (container.closedAt !== null || closingOnPurpose(container.id))
     );
   }
 
@@ -1112,6 +1253,40 @@ async function main() {
     };
   }
 
+  /*
+   * What a window calls itself while somebody outside is looking for it.
+   *
+   * From out here every clio window is the same browser, the same class and the
+   * same process: the title is the only thing that tells one from another. So a
+   * window that cannot get back to its own monitor wears this until it has been
+   * moved, and puts its own title back afterwards. A sentence rather than a
+   * code, because a placement interrupted half way through leaves it on screen,
+   * and something a person can read is the least bad thing to find there. The
+   * container id is in it because two windows can be asking at once.
+   */
+  function placeMark(containerId) {
+    return `clio — putting this window back (${containerId})`;
+  }
+
+  /*
+   * What to install, said once.
+   *
+   * Once, because it is the same sentence for every window on the desktop and
+   * stays true until somebody acts on it — and the log is the only place the
+   * reason a window came back on the wrong monitor can be read. Everything else
+   * about the restore worked, so nothing is going to look broken enough to send
+   * anybody looking.
+   */
+  let toldHowToPlace = false;
+  function noteHowToPlace() {
+    if (toldHowToPlace) return;
+    toldHowToPlace = true;
+    console.log(
+      '[clio] install wmctrl (or xdotool) and windows will come back on the monitor they ' +
+        'were on; without one they come back the size they were, wherever the browser opens them',
+    );
+  }
+
   function sessionsPayload(containerId) {
     const container = manager.getContainer(containerId);
     return {
@@ -1126,6 +1301,10 @@ async function main() {
       // see openBrowserWindow — and because a window that arrives at the picker
       // and then takes on somebody else's tabs should go where *they* were.
       geometry: container?.geometry || null,
+      // The name to wear if it turns out it cannot get there on its own, which
+      // is what happens when where it belongs is another monitor. See placeMark
+      // above and the 'place' message below.
+      mark: placeMark(containerId),
       sessions: manager.sessionsIn(containerId).map((s) => s.toJSON()),
       home: process.env.HOME || '',
       // A sandbox window says so in the tab row. Two clios on screen look
@@ -1801,6 +1980,45 @@ async function main() {
           manager.setGeometry(client.container, msg);
           break;
 
+        /*
+         * This window cannot put itself back where it belongs.
+         *
+         * Which means one thing only: where it belongs is another monitor, and
+         * a browser will not move a window to one. The window manager will, and
+         * out here is where anything can ask it. Nothing about where to go
+         * comes from the page — the daemon has that written down, and is the
+         * one that told this window about it a moment ago.
+         *
+         * The page is wearing the name from that message while this runs, which
+         * is how the right window is found; it is told either way, so that it
+         * can have its own title back. See placeMark and ./place.js.
+         */
+        case 'place': {
+          const geometry = manager.getContainer(client.container)?.geometry;
+          if (!geometry) {
+            send({ t: 'placed', ok: false });
+            break;
+          }
+          placeWindow(placeMark(client.container), geometry, {
+            ...process.env,
+            ...launchOverrides,
+          })
+            .then((outcome) => {
+              send({ t: 'placed', ok: outcome.moved });
+              if (outcome.moved) {
+                console.log(`[clio] a window was put back where it was by ${outcome.tool}`);
+                return;
+              }
+              console.log(`[clio] a window could not be put back where it was: ${outcome.why}`);
+              if (outcome.install) noteHowToPlace();
+            })
+            .catch((err) => {
+              send({ t: 'placed', ok: false });
+              console.error('[clio] could not put a window back:', err.message);
+            });
+          break;
+        }
+
         // This window is going, from a page with no sendBeacon to send it with.
         // The road it normally takes is /gone, which survives the page being
         // taken apart around it; this one may not arrive at all, and a goodbye
@@ -2031,7 +2249,9 @@ async function main() {
   // The receipt the predecessor is waiting on: the shells are ours, it can go.
   if (handover) {
     try {
-      unlinkSync(process.env.CLIO_HANDOVER);
+      // The path readHandover accepted, which is this instance's own; the
+      // variable that named it is gone by now, on purpose.
+      unlinkSync(HANDOVER_FILE);
     } catch {
       /* it will time out instead */
     }

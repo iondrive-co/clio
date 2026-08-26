@@ -553,6 +553,10 @@ async function main() {
   await sleep(1200);
   away.ws.send(JSON.stringify({ t: 'renamewindow', name: 'parked for the picker' }));
   await sleep(600);
+  // The goodbye a page sends as it is taken apart, which is what tells the
+  // daemon this window was closed rather than killed: a killed one is put back
+  // by itself and never reaches the picker at all.
+  await fetch(`${origin}/gone?c=${parked}&token=${info.token}`, { method: 'POST' });
   away.ws.close();
   // Past the grace period the daemon allows for a page that is only reloading.
   await sleep(13000);
