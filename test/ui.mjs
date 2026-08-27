@@ -498,7 +498,7 @@ async function main() {
   check('menu opened on right-click', await page.locator('#ctxmenu').isVisible());
   await page.screenshot({ path: join(SHOTS, '04-context-menu.png') });
   const menuItems = await page.locator('#ctxmenu .item').allInnerTexts();
-  check('menu has entries', menuItems.length === 7, menuItems.join(' | '));
+  check('menu has entries', menuItems.length === 6, menuItems.join(' | '));
   check(
     'menu offers to close the other tabs',
     menuItems.some((t) => t.startsWith('Close Other Tab')),
@@ -516,11 +516,22 @@ async function main() {
   // difference between finding a window again and reading a list of
   // directories.
   console.log('\n7b. naming this window');
-  const naming = page.locator('#ctxmenu .item', { hasText: 'Name This Window' });
+  // On the window, not in a tab's context menu: that menu is about a tab, and
+  // an entry in it that renames the window is picked by mistake.
+  const naming = page.locator('#windowname');
 
   await page.locator('.pane.active .xterm-screen').click({ button: 'right' });
   await page.waitForTimeout(400);
-  check('the menu offers to name the window', (await naming.count()) === 1);
+  const paneMenu = await page.locator('#ctxmenu .item').allInnerTexts();
+  check(
+    'a tab menu does not offer to name the window',
+    !paneMenu.some((t) => t.includes('Name This Window')),
+    paneMenu.join(' | '),
+  );
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(200);
+
+  check('the window says it has no name yet', (await naming.innerText()) === 'name this window');
 
   await naming.click();
   await page.waitForTimeout(300);
@@ -539,6 +550,10 @@ async function main() {
     'and the window says so in its title',
     (await page.title()).includes('the window under test'),
     await page.title(),
+  );
+  check(
+    'and wears it on the window',
+    (await page.locator('#windowname').innerText()) === 'the window under test',
   );
 
   // ---- the picker --------------------------------------------------------

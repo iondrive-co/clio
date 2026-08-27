@@ -294,6 +294,39 @@ body {
   border-left: 1px solid var(--border);
 }
 
+/* Reads as the window saying what it is called, and only incidentally as the
+   way to change that. Capped so a long name cannot push the tabs off the
+   strip; an unnamed window is quieter still, but never invisible. */
+#windowname {
+  max-width: 22ch;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  padding: 2px 8px;
+  margin-right: 4px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: none;
+  color: var(--fg-dim);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+/* A name somebody chose reads as information; the invitation on a window
+   nobody has named reads as a control, in the same dim the rest of this bar
+   uses. Told apart by colour and not by fading one of them out: below about
+   0.9 opacity this stops being legible, and test/ui.mjs's contrast sweep
+   stops scoring it, which is how a 2.6:1 label would get past. */
+#windowname:not(.unnamed) {
+  color: var(--fg);
+}
+
+#windowname:hover {
+  color: var(--fg);
+  border-color: var(--border);
+}
+
 #newwindow {
   display: flex;
   align-items: center;

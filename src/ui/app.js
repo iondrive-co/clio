@@ -83,6 +83,7 @@ const el = {
   tabs: document.getElementById('tabs'),
   newtab: document.getElementById('newtab'),
   newwindow: document.getElementById('newwindow'),
+  windowname: document.getElementById('windowname'),
   panes: document.getElementById('panes'),
   status: document.getElementById('status'),
   ctxmenu: document.getElementById('ctxmenu'),
@@ -1060,16 +1061,49 @@ function activate(id) {
 }
 
 /**
- * A named window says so in its title, which is all the desktop's window list
- * and alt-tab have to go on when six of these are open at once.
+ * A named window is called what it was named, and nothing else.
+ *
+ * The desktop's window list and alt-tab are the whole reason a window gets a
+ * name, and both of them cut a title short — so a name that comes after the
+ * active tab's label is a name nobody ever reads. Naming a window is somebody
+ * saying what the window is; the tab labels are already on screen, in the
+ * strip, and do not need saying again out there.
+ *
+ * A window nobody has named still says what is in it, because the tab it is
+ * showing is the only thing it can be told apart by.
  */
 function refreshTitle() {
+  showWindowName();
   if (picking) {
     showTitle('clio — open a window');
     return;
   }
-  const where = windowName ? `${windowName} · clio` : 'clio';
-  showTitle(activeId ? `${tabLabel(sessions.get(activeId))} — ${where}` : where);
+  if (windowName) {
+    showTitle(windowName);
+    return;
+  }
+  showTitle(activeId ? `${tabLabel(sessions.get(activeId))} — clio` : 'clio');
+}
+
+/**
+ * What this window is called, on the window.
+ *
+ * Naming a window used to be a line in a tab's context menu, one under Rename
+ * Tab: a menu about a tab, offering to name something that is not the tab. The
+ * two were told apart by reading carefully, which is not a thing a menu may ask
+ * for. So the name lives on the window's own end of the strip, next to the
+ * button that opens another window, and that is the only place it is set from.
+ *
+ * A window nobody has named says so and stays clickable, rather than hiding:
+ * an option that appears only once it has been used is not an option anybody
+ * finds.
+ */
+function showWindowName() {
+  const label = el.windowname;
+  if (!label) return;
+  label.textContent = windowName || 'name this window';
+  label.classList.toggle('unnamed', !windowName);
+  label.title = windowName ? `Rename this window (“${windowName}”)` : 'Name this window';
 }
 
 /** Resize a pane to its container, ignoring proposals from an unlaid-out pane. */
@@ -1664,12 +1698,6 @@ function buildMenu(id, link) {
       disabled: !others,
       run: () => confirmCloseOthers(id, others),
     },
-    { sep: true },
-    // Closing this window keeps its tabs under a name, and this is where that
-    // name is chosen rather than guessed from what happens to be in the first
-    // tab. Naming it before it is put away is the difference between finding it
-    // again and reading a list of directories.
-    { label: 'Name This Window…', run: renameWindowMenu },
   );
 
   return entries;
@@ -2372,6 +2400,14 @@ function hideStatus() {
 wireStrip();
 
 el.newtab.onclick = newTab;
+// Naming the window, from the window. The menu opens under the name it is
+// changing, rather than wherever the pointer last right-clicked.
+el.windowname.onclick = (event) => {
+  const box = event.currentTarget.getBoundingClientRect();
+  menuAt = { x: box.left, y: box.bottom + 2 };
+  renameWindowMenu();
+};
+
 el.newwindow.onclick = () => {
   newWindow();
   panes.get(activeId)?.term.focus();

@@ -309,8 +309,15 @@ console.log(`\n5. two windows on display ${display}, dragged with a real mouse`)
 const xdotool = (...args) => execFileSync('xdotool', args, { encoding: 'utf8', env: process.env });
 const wmctrl = (...args) => execFileSync('wmctrl', args, { encoding: 'utf8', env: process.env });
 const windowCount = () => wmctrl('-l').trim().split('\n').filter(Boolean).length;
+// `wmctrl -l` is id, desktop, client machine, then the title — and a named
+// window's title is exactly its name, so the title is compared whole rather
+// than searched. A substring would find `left` in this test's own window.
 const windowNamed = (name) =>
-  wmctrl('-l').trim().split('\n').find((line) => line.includes(`${name} · clio`))?.split(/\s+/)[0] || null;
+  wmctrl('-l')
+    .trim()
+    .split('\n')
+    .find((line) => line.split(/\s+/).slice(3).join(' ') === name)
+    ?.split(/\s+/)[0] || null;
 
 /*
  * Both windows are put where this test wants them, at a size it chose.
