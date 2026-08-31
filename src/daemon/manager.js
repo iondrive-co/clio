@@ -1108,6 +1108,32 @@ export class SessionManager extends EventEmitter {
 
     let changed = false;
     for (const session of sessions) {
+      /*
+       * A tab with no shell in it yet is not a tab whose process has gone.
+       *
+       * It is one waiting its turn in a restore — the lead is still in its
+       * profile and this one has not been reopened yet, which is a wait of up
+       * to RESTORE_LEAD_MS and, down a chain of tabs that each stop to ask
+       * something, of a good deal longer than that. What it is holding for the
+       * whole of that wait is the record read off the disk, and that record is
+       * the only reason its conversation comes back.
+       *
+       * Asked anyway, the question has one answer and it is the wrong one:
+       * there is no foreground process to identify, no pid to find alive, and
+       * nothing that was resumed a moment ago, so the record is read as a
+       * conversation that has exited and is thrown away — and, worse, written
+       * away, because a change here schedules a save. That is 30 August: 70
+       * tabs restored, the first one reopened before the first poll and back on
+       * its conversation, and every one of the other seventeen agents cleared
+       * by the poll two seconds later and rebuilt saying `claude … was running
+       * here and was not restarted`.
+       *
+       * Its claim stays counted — the pass above holds it before this loop
+       * starts — so a tab that is about to be resumed onto a conversation does
+       * not have it guessed away by a tab that is already running.
+       */
+      if (!session.pty) continue;
+
       const fg = session.foreground;
 
       // Everything anybody *else* is holding, which is this tab's own claim put

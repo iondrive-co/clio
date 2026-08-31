@@ -75,6 +75,9 @@ const env = {
   DISPLAY: undefined,
   WAYLAND_DISPLAY: undefined,
   HOME,
+  // Section 12's profile is a .bashrc, so the shell has to be one that reads
+  // one. Whatever the machine running this test uses is not the subject.
+  SHELL: '/bin/bash',
   PATH: `${BIN}:${dirname(process.execPath)}:/usr/local/bin:/usr/bin:/bin`,
   XDG_RUNTIME_DIR: RUN,
   XDG_STATE_HOME: STATE,
@@ -638,7 +641,91 @@ async function main() {
   last.send({ t: 'close', id: one });
   last.send({ t: 'close', id: two });
   await sleep(600);
+
+  // ---- 30 August ---------------------------------------------------------
+  console.log('\n12. a tab that is not the first one back');
+  /*
+   * Every restore above has had the agent in the tab that goes first, and that
+   * is the one tab the proc poll cannot reach: it is reopened inside
+   * restoreFromDisk, before the daemon has ticked once. Every other tab waits —
+   * for the lead's profile, and behind a profile that stops to ask something,
+   * for as long as it takes somebody to answer it — and it waits holding the
+   * record its own resume is going to be built out of.
+   *
+   * On 30 August that wait was two seconds too long. The poll came round,
+   * found a tab with no shell in it, read that as the conversation having
+   * exited, and cleared the record — for all sixty-nine tabs behind the lead,
+   * saving the cleared version over the good one on the way past. One tab came
+   * back on its conversation and seventeen came back saying `claude … was
+   * running here and was not restarted`.
+   *
+   * So: an agent in a tab that is not the first one, and a profile with three
+   * seconds of nothing in it, which is what the lead's keychain looks like from
+   * here. The question is whether the second tab still knows what it was
+   * holding by the time its turn comes.
+   */
+  const lead = await newTab(last);
+  const behind = await agentIn(last);
+  check('a tab, and an agent in the tab after it', !!lead && !!behind.conversation, behind.detail);
+  if (!lead || !behind.conversation) return report();
+
+  // The whole point of the section, so it is checked rather than assumed: a
+  // day when these come back in the other order is a day this tests nothing.
+  check(
+    'the agent is not the tab that goes first',
+    savedState().sessions[0]?.id === lead,
+    `${savedState().sessions[0]?.id} goes first, agent is ${behind.id}`,
+  );
+
   last.close();
+  daemon.kill('SIGKILL');
+  await sleep(700);
+
+  // Written now rather than at the top of the file: what is being slowed down
+  // is the restore, and the shells above had no reason to wait for anything.
+  writeFileSync(join(HOME, '.bashrc'), 'sleep 3\n');
+
+  const info4 = await startDaemon();
+  check('the daemon came back a third time', !!info4.pid);
+
+  const later = new Client(info4, win);
+  await later.connect();
+  await later.await((m) => m.t === 'sessions');
+
+  /*
+   * Watched rather than checked at the end, because by the end it is too late
+   * to see: the tab's own shell recaptures the conversation as soon as the
+   * resume lands, so a record cleared while the tab was waiting would be back
+   * before anybody looked. What is being tested is the wait itself.
+   */
+  let heldThroughout = true;
+  await until(() => {
+    if (heldBy(behind.id) !== behind.conversation) heldThroughout = false;
+    return !!later.tab(behind.id)?.pid;
+  }, 30000);
+  check(
+    'the tab keeps what it was holding while it waits for its turn',
+    heldThroughout && heldBy(behind.id) === behind.conversation,
+    `${heldBy(behind.id)} vs ${behind.conversation}`,
+  );
+
+  later.send({ t: 'attach', id: behind.id, cols: 80, rows: 24 });
+  const waited = (await later.await((m) => m.t === 'attached' && m.id === behind.id))?.scrollback || '';
+  check(
+    'and comes back on the conversation, not on a line about it',
+    waited.includes('resuming the Claude Code conversation') && !waited.includes('was not restarted'),
+    JSON.stringify(waited.slice(-300)),
+  );
+  check(
+    'and the agent itself says which conversation it came back on',
+    await until(() => (later.output.get(behind.id) || '').includes(`RESUMED ${behind.conversation}`), 30000),
+    JSON.stringify((later.output.get(behind.id) || '').slice(-300)),
+  );
+
+  later.send({ t: 'close', id: behind.id });
+  later.send({ t: 'close', id: lead });
+  await sleep(600);
+  later.close();
 
   report();
 }
