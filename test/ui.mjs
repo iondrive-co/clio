@@ -801,6 +801,40 @@ async function main() {
   await page.waitForTimeout(1000);
   check('close button removed a tab', (await page.locator('.tab').count()) === n - 1);
 
+  // Closing the tab you are watching lands on the one to its left, not back at
+  // the front of the row. Needs three tabs to tell the two apart: with two, the
+  // left neighbour is the first tab and either rule looks right.
+  //
+  // Every tab this closes is one it opened, so the row is the length the
+  // sections below expect by the time they run.
+  await page.locator('.pane.active .xterm-screen').click();
+  const wasRow = await page.locator('.tab').count();
+  do {
+    await page.keyboard.press('Control+Shift+T');
+    await page.waitForTimeout(1200);
+  } while ((await page.locator('.tab').count()) < 3);
+  const row = await page.locator('.tab').count();
+  await page.locator('.tab').nth(row - 1).click();
+  await page.waitForTimeout(400);
+  await page.locator('.tab').nth(row - 1).hover();
+  await page.locator('.tab').nth(row - 1).locator('.tab-close').click();
+  await page.waitForTimeout(1000);
+  const landedOn = await page.evaluate(() =>
+    [...document.querySelectorAll('#tabs .tab')].findIndex((t) => t.classList.contains('active')),
+  );
+  check(
+    'closing a tab moves to the one on its left',
+    landedOn === row - 2,
+    `landed on tab ${landedOn}, wanted ${row - 2}`,
+  );
+  while ((await page.locator('.tab').count()) > wasRow) {
+    const last = await page.locator('.tab').count();
+    await page.locator('.tab').nth(last - 1).hover();
+    await page.locator('.tab').nth(last - 1).locator('.tab-close').click();
+    await page.waitForTimeout(800);
+  }
+  check('the row is back to the length it was', (await page.locator('.tab').count()) === wasRow);
+
   // ---- real keyboard shortcuts ------------------------------------------
   console.log('\n9. keyboard shortcuts');
   await page.locator('.pane.active .xterm-screen').click();

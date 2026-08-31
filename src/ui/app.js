@@ -1034,9 +1034,32 @@ function removePane(id) {
 
   if (activeId === id) {
     activeId = null;
-    const next = order.find((other) => other !== id && sessions.has(other));
+    const next = neighbour(id);
     if (next) activate(next);
   }
+}
+
+/**
+ * The tab to fall back on when the active one goes away: the one to its left,
+ * and only the one to its right when there was nothing to the left.
+ *
+ * Where the eye is when a tab closes is the gap it left, so its neighbour is
+ * what the window should land on. Jumping to the first tab instead moves the
+ * work somewhere nobody was looking, and closing a run of tabs from the right
+ * then walks the window backwards through the row a tab at a time.
+ *
+ * The row is `order`, which is still the row as drawn — the tab being removed
+ * is in it, in the place it had, and its session may or may not be gone yet
+ * depending on which of the two close paths got here. Skipping it by id covers
+ * both, and the second skip drops tabs whose sessions have already gone.
+ */
+function neighbour(id) {
+  const alive = (other) => other !== id && sessions.has(other);
+  const at = order.indexOf(id);
+  if (at < 0) return order.find(alive);
+  for (let i = at - 1; i >= 0; i -= 1) if (alive(order[i])) return order[i];
+  for (let i = at + 1; i < order.length; i += 1) if (alive(order[i])) return order[i];
+  return null;
 }
 
 function activate(id) {
