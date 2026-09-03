@@ -410,7 +410,44 @@ export function notifyDesktop(summary, body, env = process.env) {
  */
 const DEFAULT_WINDOW_SIZE = '1100,700';
 
+/*
+ * The profile a window's browser uses: one for every display.
+ *
+ * A chrome-family browser started with a --user-data-dir that another process
+ * already holds does not open a window itself. It hands the request to that
+ * process and exits, and the window comes up wherever *that* process is — on
+ * the display it was started on, which is not necessarily the one being asked
+ * for. A profile per display is therefore a browser per display, and a window
+ * asked for on :10 can no longer appear on :0, or nowhere at all.
+ *
+ * Nowhere at all is not hypothetical. An autostart entry ran clio at boot,
+ * seventeen minutes before the session's X server existed; the browser it
+ * spawned had no display, did not exit, and held no X connection — and every
+ * window asked for afterwards was handed to it and never seen. The refusal
+ * below stops that browser being started; this stops one like it, however it
+ * came about, from swallowing the windows that come after.
+ */
+function profileFor(env) {
+  // Both names, not the first one that happens to be set: this desktop is an
+  // X11 session that also has a live wayland-0 socket, and which of the two a
+  // browser attaches to is the browser's decision, not something to guess at.
+  // The pair is the address. Two launches with the same pair share a browser,
+  // which is what makes a second window appear beside the first; two launches
+  // with different pairs never do.
+  const key = [env.DISPLAY, env.WAYLAND_DISPLAY].filter(Boolean).join('+').replace(/^:/, '');
+  const slug = key.replace(/[^A-Za-z0-9._+-]/g, '_');
+  return slug ? `${BROWSER_PROFILE_DIR}-${slug}` : BROWSER_PROFILE_DIR;
+}
+
 export function openBrowserWindow(url, env = process.env, { geometry = null } = {}) {
+  // A window has to have somewhere to be. Asked for one with no display, the
+  // honest answer is that there is none — not a browser spawned into nothing.
+  if (!env.DISPLAY && !env.WAYLAND_DISPLAY) {
+    const err = new Error('no display to put a window on (DISPLAY and WAYLAND_DISPLAY are both unset)');
+    err.fatal = true;
+    throw err;
+  }
+
   const browser = findBrowser(env);
   if (!browser) {
     const err = new Error(`no Chrome-family browser found (tried ${BROWSERS.join(', ')})`);
@@ -425,13 +462,30 @@ export function openBrowserWindow(url, env = process.env, { geometry = null } = 
       browser,
       [
         `--app=${url}`,
-        `--user-data-dir=${BROWSER_PROFILE_DIR}`,
+        `--user-data-dir=${profileFor(env)}`,
         '--class=clio',
         `--window-size=${geometry ? `${geometry.width},${geometry.height}` : DEFAULT_WINDOW_SIZE}`,
         ...(geometry ? [`--window-position=${geometry.x},${geometry.y}`] : []),
         '--no-first-run',
         '--no-default-browser-check',
         '--disable-features=Translate,MediaRouter',
+        // Never ask the desktop's keyring for anything.
+        //
+        // A chrome-family browser with a profile on disk encrypts what it
+        // stores with a key it fetches from the OS keyring over D-Bus, and that
+        // fetch has no timeout: on a machine whose login keyring is locked —
+        // waiting on a prompt nobody has answered, or one that cannot be shown
+        // — it never returns. Every request the browser makes waits behind it,
+        // which is a blank window and a daemon reporting that no window
+        // appeared, with nothing anywhere to say why. It is not a hypothetical:
+        // a Kicksecure desktop with gcr-prompter waiting did exactly this, and
+        // the netlog showed the connection to clio's own port made and the GET
+        // never sent.
+        //
+        // There is nothing in this profile that wants a keyring. It is clio's
+        // own, it is mode 700, and the single thing in it is a cookie holding a
+        // token that is already on disk in the handshake file next to it.
+        '--password-store=basic',
       ],
       { detached: true, stdio: 'ignore', env },
     );

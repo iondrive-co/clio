@@ -163,11 +163,21 @@ const GOODBYE_TTL_MS = 60000;
  * into a list of names to choose from instead of the desktop that was there.
  *
  * One at a time they are indistinguishable. Together they are unmistakable: the
- * thing they were all in went down. Long enough to cover a browser closing four
- * windows in turn, short enough that closing one and then another a few seconds
- * later is still two windows closed.
+ * thing they were all in went down.
+ *
+ * How long "together" is has to be measured against the two things being told
+ * apart, and they are not close. A browser going down takes its pages apart in
+ * one teardown — the sockets close in the same instant, which is why one kill
+ * is coalesced over 750ms in KILLED_COALESCE_MS. A person closing windows moves
+ * a mouse to the next close button between them, which is the best part of a
+ * second at speed.
+ *
+ * This was four seconds, and four seconds is the wrong side of that line: it
+ * covered somebody closing their windows one at a time and then pressing the
+ * icon, who got every one of them back rather than the list of names they had
+ * just made. It is now the instant it claims to be.
  */
-const BROWSER_GONE_MS = 4000;
+const BROWSER_GONE_MS = 750;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -733,6 +743,11 @@ async function main() {
   function departedTogether(id) {
     const mine = departures.get(id);
     if (mine === undefined) return false;
+    // A page still on screen anywhere is a browser that did not go anywhere,
+    // and settles it without any measuring: whatever took this window, it was
+    // not the thing every window is inside. Closing one of two windows is a
+    // decision about that window, however fast it followed the last one.
+    if (clients.size) return false;
     let together = 0;
     for (const when of departures.values()) {
       if (Math.abs(when - mine) <= BROWSER_GONE_MS) together++;

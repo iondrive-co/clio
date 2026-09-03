@@ -4,6 +4,17 @@ import { Screen, isNews, lastScreenSwap } from './screen.js';
 import { TitleReader, lastTitleIn } from './termtitle.js';
 import { extensionToState, extensionTitle } from '../extensions/index.js';
 
+/*
+ * The shell a tab runs.
+ *
+ * Bash, and not $SHELL: what somebody logs in with is one decision and what a
+ * terminal opens is another, and clio's answer to the second is the same on
+ * every machine — so a tab here behaves the same way whatever /etc/passwd
+ * happens to say. An explicit shell still wins, which is how a caller asks for
+ * something else.
+ */
+const TAB_SHELL = '/bin/bash';
+
 // How much raw output we keep per session. This is what gets replayed on
 // reattach and written to disk for the post-reboot fallback.
 const SCROLLBACK_BYTES = 512 * 1024;
@@ -309,7 +320,7 @@ export class Session {
    * and everything built on it, silently has nowhere to open anything.
    */
   spawn({ cwd = this.cwd, cols = this.cols, rows = this.rows, shell = null, env = {} } = {}) {
-    const file = shell || process.env.SHELL || '/bin/bash';
+    const file = shell || TAB_SHELL;
     this.cols = cols;
     this.rows = rows;
     this.cwd = cwd;
