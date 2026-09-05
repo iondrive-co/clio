@@ -196,6 +196,30 @@ let daemonReplaced = false;
 let lastTabsSignature = null;
 let renaming = false;
 /**
+ * When each tab last *became* waiting, so the pulse can be a burst rather than
+ * a permanent state.
+ *
+ * The pulse exists to catch an eye at the moment an agent stops. Left running
+ * it is a CSS animation on opacity, which Chrome hands to the compositor and
+ * then ticks every vsync for as long as it is on the page — 60 frames a second,
+ * for as long as anything is waiting, whether or not the window is focused or
+ * even on top. On a box where clio sits open for days with a row of agents in
+ * it, something is nearly always waiting, so that is simply always. It is the
+ * heaviest thing this page does and it does it while nobody is looking.
+ *
+ * So: pulse for PULSE_MS after the tab enters waiting, then hold the colour.
+ * That is the same bargain the reduced-motion rule already strikes in the CSS,
+ * where colour alone is accepted as saying it.
+ *
+ * Keyed by id and held here rather than on the element because renderTabs
+ * rebuilds the strip on any change, and an animation restarted by every
+ * unrelated redraw would never finish.
+ */
+const waitingSince = new Map();
+const PULSE_MS = 8000;
+/** Pending redraw for the moment a pulse runs out; see schedulePulseEnd. */
+let pulseTimer = null;
+/**
  * The browsers this machine has, as the daemon found them. Names to show and
  * ids to ask back for; the page never learns how any of them is started.
  */
@@ -413,6 +437,7 @@ function handle(msg) {
       }
       syncSessions(msg.sessions, msg.home);
       refreshTitle();
+      answeringCheck();
       break;
 
     // The windows that were closed and kept, for a window that has not been
@@ -1223,6 +1248,43 @@ function truncate(text, max) {
 }
 
 /**
+ * Is this tab still inside the burst of pulsing that follows it going quiet?
+ *
+ * Tabs the daemon has stopped flagging are forgotten here, so a tab that goes
+ * back to waiting later gets a fresh pulse rather than an expired one.
+ */
+function pulsing(id, meta, now) {
+  if (!meta.waiting || id === activeId) {
+    waitingSince.delete(id);
+    return false;
+  }
+  if (!waitingSince.has(id)) waitingSince.set(id, now);
+  return now - waitingSince.get(id) < PULSE_MS;
+}
+
+/**
+ * Redraw once more when the oldest pulse runs out.
+ *
+ * Nothing else would: the daemon's next broadcast may say exactly what the last
+ * one did, and the strip is only rebuilt when its signature changes. Without
+ * this the class would sit there animating until something unrelated happened.
+ */
+function schedulePulseEnd(now) {
+  if (pulseTimer) clearTimeout(pulseTimer);
+  pulseTimer = null;
+  let soonest = Infinity;
+  for (const [id, since] of waitingSince) {
+    if (!order.includes(id)) {
+      waitingSince.delete(id);
+      continue;
+    }
+    const left = since + PULSE_MS - now;
+    if (left > 0 && left < soonest) soonest = left;
+  }
+  if (soonest !== Infinity) pulseTimer = setTimeout(() => renderTabs(), soonest + 20);
+}
+
+/**
  * Rebuild the tab strip, but only when it would actually look different.
  *
  * Every rebuild throws away the elements the mouse is currently interacting
@@ -1234,11 +1296,22 @@ function truncate(text, max) {
 function renderTabs(force = false) {
   if (renaming && !force) return;
 
+  const now = Date.now();
   const signature = JSON.stringify(
     order.map((id) => {
       const meta = sessions.get(id);
       return meta
-        ? [id, tabLabel(meta), meta.status, meta.unseenOutput, meta.waiting, id === activeId]
+        ? [
+            id,
+            tabLabel(meta),
+            meta.status,
+            meta.unseenOutput,
+            meta.waiting,
+            id === activeId,
+            // In the signature so that a pulse ending is itself a change worth
+            // redrawing for.
+            pulsing(id, meta, now),
+          ]
         : null;
     }),
   );
@@ -1260,7 +1333,10 @@ function renderTabs(force = false) {
       // tab that is open: the daemon will not flag one anybody is looking at,
       // and this says so again here, so that clicking a flashing tab stops it
       // on the spot rather than when the next broadcast comes round.
-      (meta.waiting && id !== activeId ? ' waiting' : '');
+      (meta.waiting && id !== activeId ? ' waiting' : '') +
+      // Only the first few seconds of it move; after that .waiting keeps the
+      // colour on its own. See waitingSince.
+      (pulsing(id, meta, now) ? ' pulsing' : '');
     tab.draggable = true;
     tab.dataset.id = id;
     // The label is often elided, so keep the full text reachable on hover.
@@ -1307,6 +1383,8 @@ function renderTabs(force = false) {
   // Sits immediately after the last tab and scrolls with them, rather than
   // being pinned to the far edge of the window.
   el.tabs.append(el.newtab);
+
+  schedulePulseEnd(now);
 }
 
 function startRename(tab, id) {
@@ -2416,6 +2494,43 @@ function showStatus(text, timeout = 0) {
 
 function hideStatus() {
   el.status.hidden = true;
+  quietSaid = false;
+}
+
+/*
+ * Say when the tab on screen has been typed into and nothing has answered.
+ *
+ * The one thing a person cannot tell by looking at a terminal: whether what
+ * they typed went nowhere, or went in and is sitting unread because the program
+ * stopped running for a moment. A full-screen program turns echo off and draws
+ * its own input line, so a stalled one shows exactly nothing — the same nothing
+ * as a window that is not being given the keyboard. clio is the only thing in
+ * the chain that knows the difference, because it is what wrote the characters.
+ *
+ * Which makes the silence informative too: type into a tab that has gone quiet
+ * and this appears within a few seconds, and if it does not appear, the
+ * keystrokes never reached clio at all and the trouble is above it.
+ */
+let quietSaid = false;
+
+function answeringCheck() {
+  const meta = sessions.get(activeId);
+  const quiet = meta && meta.unanswered > 0 && meta.unansweredFor >= 3;
+  if (quiet) {
+    const chars = meta.unanswered === 1 ? '1 character' : `${meta.unanswered} characters`;
+    // No elapsed time in the message: it would come from the last broadcast
+    // rather than from now, and a number that has stopped moving reads as a
+    // second thing having gone wrong.
+    showStatus(
+      `${chars} typed here, and nothing in this tab has answered — the program ` +
+        'in it is not reading. What you typed is in the terminal, not lost.',
+    );
+    quietSaid = true;
+    return;
+  }
+  // Only take down what this put up: a status line about anything else is not
+  // ours to clear.
+  if (quietSaid) hideStatus();
 }
 
 // ---------------------------------------------------------------------- boot

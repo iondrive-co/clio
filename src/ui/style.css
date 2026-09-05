@@ -150,13 +150,28 @@ body {
 .tab.waiting .tab-title {
   color: var(--waiting);
   font-weight: 600;
+}
+
+/*
+ * The pulse is a burst, not a state — it runs for a few seconds after the tab
+ * goes quiet and then stops, leaving the colour above to keep saying it.
+ *
+ * Not because the motion stops being useful, but because it never stops
+ * costing: an opacity animation runs on Chrome's compositor, which ticks it
+ * every vsync for as long as it is on the page, focused or not, on top or not.
+ * With a row of agents in a window somebody leaves open all day, "while
+ * anything is waiting" is indistinguishable from "always", and this page ends
+ * up holding a 60 Hz compositor open around the clock to fade one word in and
+ * out at nobody. See waitingSince in app.js, which decides how long it lasts.
+ */
+.tab.waiting.pulsing .tab-title {
   animation: tab-waiting 1.3s ease-in-out infinite;
 }
 
 /* Somebody who has asked the desktop for less motion is not asking for less
    news: keep the colour, drop the pulse. */
 @media (prefers-reduced-motion: reduce) {
-  .tab.waiting .tab-title {
+  .tab.waiting.pulsing .tab-title {
     animation: none;
   }
 }

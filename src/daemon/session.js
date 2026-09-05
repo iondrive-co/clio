@@ -207,6 +207,9 @@ export class Session {
     this.pending = null;
     /** Typed at this tab before it had a shell to type into; see write. */
     this.typed = '';
+    /** Characters typed in here that nothing has answered yet, and since when. */
+    this.unanswered = 0;
+    this.typedAt = null;
 
     /**
      * What the program in this tab last said it was doing — the terminal title
@@ -455,6 +458,10 @@ export class Session {
       // byte rather than the first, for the same reason SHELL_SETTLE_MS is, and
       // never past the cap set when it started coming back.
       if (this.arriving()) this.arrivingUntil = Date.now() + ARRIVING_QUIET_MS;
+      // Anything at all coming back means the program is reading again, and
+      // what was typed has landed wherever it was going.
+      this.unanswered = 0;
+      this.typedAt = null;
       this.noteTitle(data);
       this.screen.write(data);
       this.append(data);
@@ -830,6 +837,25 @@ export class Session {
    * arrives.
    */
   write(data) {
+    /*
+     * What has been typed in here that nothing has answered.
+     *
+     * A program that has stopped reading looks exactly like a terminal that has
+     * stopped working. A full-screen one turns echo off and draws its own input
+     * line, so while it is not running, typing produces nothing on screen at
+     * all — the same nothing as a window that is not being given the keyboard.
+     * Nobody looking at the tab can tell those apart, and the difference is the
+     * whole diagnosis. clio can tell: it is the thing that wrote the characters.
+     *
+     * Only real typing counts. Anything beginning with an escape is the window
+     * answering a question the program asked — focus reports, mouse positions,
+     * device attributes — and a program that asked for mouse movement and drew
+     * nothing back has not stopped.
+     */
+    if (data && !data.startsWith('\x1b')) {
+      if (!this.unanswered) this.typedAt = Date.now();
+      this.unanswered += data.length;
+    }
     if (this.pty) {
       this.pty.write(data);
       return;
@@ -963,6 +989,11 @@ export class Session {
       status: this.status,
       exitCode: this.exitCode,
       unseenOutput: this.unseenOutput,
+      // Typed in here and unanswered — see write(). In seconds, because a
+      // window that has been asleep should not do arithmetic on a clock it did
+      // not read.
+      unanswered: this.unanswered,
+      unansweredFor: this.typedAt ? Math.round((Date.now() - this.typedAt) / 1000) : 0,
       // Whatever is in here has stopped and is waiting to be answered. The row
       // flashes the tab; see .tab.waiting in src/ui/style.css.
       waiting: this.waiting,

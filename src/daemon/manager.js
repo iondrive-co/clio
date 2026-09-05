@@ -50,6 +50,13 @@ const SLOW_WRITE_MS = 1000;
 const SLOW_WRITE_REPORT_MS = 30000;
 
 /*
+ * How long a tab may be typed into without answering before its window says so.
+ * Long enough that a command's own thinking time does not raise it, short enough
+ * to appear while somebody is still wondering why nothing happened.
+ */
+const NOT_ANSWERING_MS = 3000;
+
+/*
  * How long the first rebuilt shell gets to itself before the rest follow. The
  * argument for the lead is in restoreFromDisk; this is only the number.
  *
@@ -1060,6 +1067,18 @@ export class SessionManager extends EventEmitter {
     let changed = false;
     let moved = false;
     for (const session of this.sessions.values()) {
+      // A tab that has been typed into and has answered nothing for a few
+      // seconds is worth telling its window about: from the outside it is
+      // indistinguishable from a terminal that has stopped working. Movement
+      // rather than change — it says nothing about what belongs on disk.
+      const quiet =
+        session.unanswered > 0 &&
+        session.typedAt !== null &&
+        Date.now() - session.typedAt >= NOT_ANSWERING_MS;
+      if (quiet !== !!session.wasQuiet) {
+        session.wasQuiet = quiet;
+        moved = true;
+      }
       if (session.refreshProcInfo()) changed = true;
       // A title belongs to a running process and is never written down, so it is
       // worth telling the windows about and not worth a trip to the disk.
