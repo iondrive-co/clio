@@ -498,16 +498,196 @@ async function main() {
   check('menu opened on right-click', await page.locator('#ctxmenu').isVisible());
   await page.screenshot({ path: join(SHOTS, '04-context-menu.png') });
   const menuItems = await page.locator('#ctxmenu .item').allInnerTexts();
-  check('menu has entries', menuItems.length === 6, menuItems.join(' | '));
+  check('menu has entries', menuItems.length === 7, menuItems.join(' | '));
   check(
     'menu offers to close the other tabs',
     menuItems.some((t) => t.startsWith('Close Other Tab')),
+    menuItems.join(' | '),
+  );
+  // The two entries somebody arriving with a mouse and no shortcuts is looking
+  // for. They are the reason the menu exists at all, and a menu without them
+  // reads as a terminal that cannot copy.
+  check(
+    'menu offers Copy and Paste',
+    menuItems.some((t) => t.startsWith('Copy')) && menuItems.some((t) => t.startsWith('Paste')),
     menuItems.join(' | '),
   );
   await sweepContrast(page, 'context menu');
   await page.keyboard.press('Escape');
   await page.mouse.click(550, 400);
   await page.waitForTimeout(300);
+
+  // ---- copy and paste, including where the browser will not allow it ------
+  //
+  // The thing this section is here for: navigator.clipboard.readText(), in a
+  // Chrome --app window on a profile that has not already granted
+  // clipboard-read, returns a promise that is never settled either way. The
+  // permission it is waiting on is asked for in a bubble hung off an address
+  // bar an --app window does not have. A Paste that awaited it did nothing at
+  // all — no text, no error, nothing to tell it from an empty clipboard — and
+  // over RDP that is every window, because a display of its own means a
+  // browser profile of its own.
+  //
+  // So everything below runs with the clipboard broken in exactly that way,
+  // and expects copy and paste to work through it anyway.
+  console.log('\n7a. copy and paste');
+
+  /** Which tab this section starts on, to come back to after visiting another. */
+  const homeTab = await page.locator('.tab.active').getAttribute('data-id');
+  const marker = `clip-${randomBytes(3).toString('hex')}`;
+  await page.locator('.pane.active .xterm-screen').click();
+  // A click has to land before the terminal has the keyboard, and the Escape
+  // that closed the menu above went to the shell, where it is the start of a
+  // key sequence. The wait is for the first, the Ctrl+C for the second.
+  await page.waitForTimeout(400);
+  await page.keyboard.press('Control+C');
+  await page.waitForTimeout(400);
+  await page.keyboard.type(`printf '${marker}\\n'`);
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(1000);
+
+  // Where that word was printed, in real page coordinates: selecting it means
+  // dragging across those pixels, which is what a person does.
+  const markerAt = await page.evaluate((word) => {
+    const rows = [...document.querySelectorAll('.pane.active .xterm-rows > div')];
+    const row = rows.find((r) => r.textContent.includes(word) && !r.textContent.includes('printf'));
+    const span = row && [...row.children].find((c) => c.textContent.includes(word));
+    if (!span) return null;
+    const rect = span.getBoundingClientRect();
+    return { x1: rect.x + 1, x2: rect.x + rect.width - 1, y: rect.y + rect.height / 2 };
+  }, marker);
+  check('the word to copy is on screen', !!markerAt);
+  const markerSpot = markerAt || { x1: 100, x2: 200, y: 300 };
+
+  const selectMarker = async () => {
+    await page.mouse.move(markerSpot.x1, markerSpot.y);
+    await page.mouse.down();
+    await page.mouse.move(markerSpot.x2, markerSpot.y, { steps: 8 });
+    await page.mouse.up();
+    await page.waitForTimeout(300);
+  };
+
+  await selectMarker();
+  await page.locator('.pane.active .xterm-screen').click({ button: 'right' });
+  await page.waitForTimeout(400);
+  check(
+    'a drag selects, so Copy is offered rather than greyed out',
+    !(await page
+      .locator('#ctxmenu .item')
+      .filter({ hasText: 'Copy' })
+      .first()
+      .evaluate((e) => e.classList.contains('disabled'))),
+  );
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(200);
+
+  /*
+   * The clipboard a window over RDP actually has: calls that are never
+   * answered rather than calls that fail. A promise that rejects was always
+   * caught; one that never settles is what was not.
+   */
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: () => new Promise(() => {}), readText: () => new Promise(() => {}) },
+    });
+  });
+
+  // The daemon is the only thing every window shares — they are separate
+  // browser processes on separate profiles with nothing else in common — so
+  // this is what makes a copy here a paste in a window somewhere else. Listening
+  // starts before the copy: a window is told what the daemon is holding the
+  // moment it connects, in the same breath as its tab list.
+  const listener = await windowOnto(`${testWindow}-clipboard`);
+  let relayed = null;
+  listener.ws.on('message', (raw) => {
+    const msg = JSON.parse(raw);
+    if (msg.t === 'clipboard') relayed = msg.text;
+  });
+
+  await selectMarker();
+  const copyStarted = Date.now();
+  await page.keyboard.press('Control+Insert');
+  await page.waitForTimeout(1200);
+  check('Ctrl+Insert copies without waiting on the browser', Date.now() - copyStarted < 3000);
+  listener.ws.close();
+  check('and the daemon holds it for every other window', relayed === marker, JSON.stringify(relayed));
+
+  // Into a different tab, which is the point of copying at all.
+  await page.locator('.tab').nth(1).click();
+  await page.waitForTimeout(500);
+  await page.locator('.pane.active .xterm-screen').click();
+  await page.waitForTimeout(400);
+  const pasteStarted = Date.now();
+  await page.keyboard.press('Control+Shift+V');
+  await page.waitForTimeout(1500);
+  const pastedIn = Date.now() - pasteStarted;
+  const pasted = await page.locator('.pane.active').innerText();
+  check(
+    'and it pastes into another tab with the browser clipboard hung',
+    pasted.includes(marker),
+    JSON.stringify(pasted.slice(-120)),
+  );
+  check('and the paste does not sit there waiting on it', pastedIn < 3000, `${pastedIn}ms`);
+
+  // What was pasted is sitting at a prompt unexecuted; the line goes back to
+  // empty before anything else types there.
+  await page.keyboard.press('Control+C');
+  await page.waitForTimeout(400);
+  await page.locator(`.tab[data-id="${homeTab}"]`).click();
+  await page.waitForTimeout(400);
+  await page.locator('.pane.active .xterm-screen').click({ position: { x: 5, y: 5 } });
+  await page.waitForTimeout(600);
+  // Switching tabs focuses the pane on its own a moment after the click that
+  // did it, and a keystroke in flight while that happens is lost. One Enter,
+  // whose loss costs nothing, settles it before anything that is checked below.
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(600);
+
+  /*
+   * Ctrl+C copies what is selected, and interrupts when nothing is. Both halves
+   * are checked, because a terminal whose Ctrl+C stopped interrupting would be
+   * a far worse trade than one that could not copy.
+   *
+   * Whether the line survived is the tell, and it is counted rather than looked
+   * for: an interrupted command is still on the screen where it was typed, so
+   * the word appearing once means it was typed and dropped, and twice means it
+   * was typed and run.
+   */
+  const seen = (text, word) => (text.match(new RegExp(word, 'g')) || []).length;
+
+  const kept = `kept-${randomBytes(3).toString('hex')}`;
+  await page.keyboard.type(`echo ${kept}`);
+  await selectMarker();
+  await page.keyboard.press('Control+C');
+  await page.waitForTimeout(400);
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(1200);
+  const keptText = await page.locator('.pane.active').innerText();
+  check(
+    'Ctrl+C on a selection copies it and leaves the line alone',
+    seen(keptText, kept) >= 2,
+    JSON.stringify(keptText.slice(-160)),
+  );
+
+  const dropped = `dropped-${randomBytes(3).toString('hex')}`;
+  await page.keyboard.type(`echo ${dropped}`);
+  await page.waitForTimeout(400);
+  await page.keyboard.press('Control+C');
+  await page.waitForTimeout(400);
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(1200);
+  const droppedText = await page.locator('.pane.active').innerText();
+  check(
+    'and the copy took the selection with it, so the next one interrupts',
+    seen(droppedText, dropped) === 1,
+    JSON.stringify(droppedText.slice(-160)),
+  );
+
+  // The browser's own clipboard back for every section after this one.
+  await page.evaluate(() => {
+    delete navigator.clipboard;
+  });
 
   // ---- naming this window -------------------------------------------------
   //

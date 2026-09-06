@@ -32,8 +32,9 @@ bin/clio install
 | `Ctrl+Shift+W` / `Ctrl+Shift+D` | Close tab |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
 | `Alt+1`…`Alt+9` | Jump to tab |
-| `Ctrl+Shift+C` | Copy selection |
-| `Ctrl+Shift+V` / `Ctrl+V` | Paste |
+| `Ctrl+Insert` / `Ctrl+Shift+C` | Copy selection |
+| `Shift+Insert` / `Ctrl+Shift+V` / `Ctrl+V` | Paste |
+| `Ctrl+C` | Copy, when something is selected; otherwise the shell's, as always |
 
 | Mouse | Action |
 | --- | --- |
@@ -46,11 +47,42 @@ bin/clio install
 | `Ctrl`+click a link | Open it wherever the desktop sends links |
 | Right-click a link | Open it in a browser you pick by name |
 
-`Ctrl+C`, `Ctrl+D`, `Ctrl+Z` and friends go to the shell untouched — `Ctrl+R`
-included, so reverse search works as it does anywhere else.
+`Ctrl+D`, `Ctrl+Z` and friends go to the shell untouched — `Ctrl+R` included, so
+reverse search works as it does anywhere else. `Ctrl+C` does too, with one
+exception: when there is a selection on screen it copies it and clears it, so
+the next `Ctrl+C` is an interrupt again. Nothing is ever selected while you are
+only typing, so nothing changes for anyone who never reaches for the mouse.
+
 Text size can be increased and decreased via arrows at the right end 
 of the tab row, and changes will be saved. New windows are opened
 with the plus button after the arrows.
+
+## Copy and paste, and the clipboard that will not answer
+
+Every window is a Chrome `--app` window on a profile of its own, and reading the
+system clipboard from one needs a permission Chrome asks for in a bubble hung
+off an address bar that is not there. On a profile where it has not been granted
+— which over RDP is every profile, because that is a display of its own and so a
+profile of its own — `navigator.clipboard.readText()` returns a promise that is
+never settled either way. A window cannot even find out that it has been
+refused.
+
+So clio asks the browser first, gives it a fraction of a second to answer, and
+keeps its own copy of everything it has been asked to copy. That copy lives in
+the daemon rather than in any one window, because windows are separate browser
+processes sharing nothing else — which is what makes copy in one tab and paste
+in another work between windows too, and go on working where the browser has
+closed the clipboard to clio entirely. When the browser does answer it wins, so
+text copied out of a web page still pastes into a shell.
+
+`Shift+Insert` is the one paste that never needed any of this: it is the
+browser's own, it asks no permission, and it is what to reach for if a paste
+from somewhere outside clio ever comes up empty.
+
+A program that asked for the mouse — claude, vim, less, tmux — is handed every
+drag in the window, so dragging across one selects nothing to copy. Hold
+`Shift` and the selection is clio's again. The right-click menu says so, in the
+tabs where it applies.
 
 ## Where the windows were
 
@@ -66,6 +98,14 @@ difference: a page says goodbye as it is taken apart, so a window whose page wen
 in silence was killed rather than closed — and every clio window is a page in one
 browser, so when they all say goodbye in the same instant what went was the
 browser, not four decisions about four windows.
+
+A desktop can be logged in twice at once — at the machine and over RDP, say —
+and then only one of the two sessions has somebody in front of it. Whichever came
+up first has the windows, which at boot is the local one, seconds before anybody
+has connected; so `clio` in the other session brings them over, with their tabs,
+their scrollback and their shells, and takes the frames off the screen nobody is
+at. Nothing is restarted and nothing is asked. `clio status` says which display
+each window is on when it is not the one you are asking from.
 
 The monitor is the one part a page cannot manage alone. A browser will not move a
 window from one screen to another — a move that would leave the screen it is on

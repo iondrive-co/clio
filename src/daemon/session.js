@@ -111,6 +111,13 @@ const ANSWER_POLL_MS = 1000;
 const UNTYPED_BYTES = 4096;
 
 /*
+ * What a program that asked for bracketed paste is sent ahead of pasted text,
+ * so that it can tell a paste from somebody typing very fast. See write, which
+ * has to tell the same two things apart for the opposite reason.
+ */
+const BRACKETED_PASTE_START = '\x1b[200~';
+
+/*
  * How much of the end of the output is read to find the line the cursor is on.
  * A question that does not fit in this is not one anybody could read either.
  */
@@ -851,8 +858,13 @@ export class Session {
      * answering a question the program asked — focus reports, mouse positions,
      * device attributes — and a program that asked for mouse movement and drew
      * nothing back has not stopped.
+     *
+     * A paste is the exception to that rule: a program that asked for bracketed
+     * paste is sent the text wrapped in \x1b[200~ … \x1b[201~, so it begins with
+     * an escape and is nonetheless the plainest kind of typing there is. It is
+     * also the typing most worth catching here, being the most of it at once.
      */
-    if (data && !data.startsWith('\x1b')) {
+    if (data && (!data.startsWith('\x1b') || data.startsWith(BRACKETED_PASTE_START))) {
       if (!this.unanswered) this.typedAt = Date.now();
       this.unanswered += data.length;
     }

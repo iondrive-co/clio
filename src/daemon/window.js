@@ -410,6 +410,28 @@ export function notifyDesktop(summary, body, env = process.env) {
  */
 const DEFAULT_WINDOW_SIZE = '1100,700';
 
+/**
+ * What to call the display a window is on, in one word.
+ *
+ * Both names, not the first one that happens to be set: this desktop is an X11
+ * session that also has a live wayland-0 socket, and which of the two a browser
+ * attaches to is the browser's decision, not something to guess at. The pair is
+ * the address. Two launches with the same pair share a browser, which is what
+ * makes a second window appear beside the first; two launches with different
+ * pairs never do.
+ *
+ * Used as a path and as a URL, so it is written to be safe as either: it names
+ * the profile below, and it travels in a window's own address so that the
+ * window can say afterwards which display it came up on. That is what lets a
+ * second session — somebody arriving over RDP to a desktop that is also logged
+ * in locally — be told apart from the one that opened the window. See
+ * displayOfClient in ../daemon/index.js.
+ */
+export function displayKey(env = process.env) {
+  const key = [env.DISPLAY, env.WAYLAND_DISPLAY].filter(Boolean).join('+').replace(/^:/, '');
+  return key.replace(/[^A-Za-z0-9._+-]/g, '_');
+}
+
 /*
  * The profile a window's browser uses: one for every display.
  *
@@ -428,14 +450,7 @@ const DEFAULT_WINDOW_SIZE = '1100,700';
  * came about, from swallowing the windows that come after.
  */
 function profileFor(env) {
-  // Both names, not the first one that happens to be set: this desktop is an
-  // X11 session that also has a live wayland-0 socket, and which of the two a
-  // browser attaches to is the browser's decision, not something to guess at.
-  // The pair is the address. Two launches with the same pair share a browser,
-  // which is what makes a second window appear beside the first; two launches
-  // with different pairs never do.
-  const key = [env.DISPLAY, env.WAYLAND_DISPLAY].filter(Boolean).join('+').replace(/^:/, '');
-  const slug = key.replace(/[^A-Za-z0-9._+-]/g, '_');
+  const slug = displayKey(env);
   return slug ? `${BROWSER_PROFILE_DIR}-${slug}` : BROWSER_PROFILE_DIR;
 }
 

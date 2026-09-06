@@ -11,7 +11,13 @@ import { isAlive, cwdOf } from './procinfo.js';
 import { locate, spool, quote, searchBudget, MAX_SPOOL_BYTES } from './drops.js';
 import { SessionManager } from './manager.js';
 import { drawsSomething } from './output.js';
-import { openBrowserWindow, openUrl, browserChoices, notifyDesktop } from './window.js';
+import {
+  openBrowserWindow,
+  openUrl,
+  browserChoices,
+  notifyDesktop,
+  displayKey,
+} from './window.js';
 import { placeWindow } from './place.js';
 
 const ENTRY = fileURLToPath(import.meta.url);
@@ -100,6 +106,12 @@ const MAX_DROP_FILES = 20;
 // mid-drag, or a file that went away under it. The drop finishes with whatever
 // did arrive rather than being left half-done for the life of the daemon.
 const DROP_WAIT_MS = 30000;
+
+// A ceiling on the clipboard the daemon keeps for the windows (see `clipboard`
+// below). Selecting a day's scrollback and copying it is a real thing to do;
+// holding an unbounded amount of it in the daemon for the rest of the session
+// is not. Comfortably more than anything anyone pastes into a shell.
+const MAX_CLIPBOARD_CHARS = 4_000_000;
 
 // A sandbox instance: started with XDG_RUNTIME_DIR and XDG_STATE_HOME pointed
 // somewhere disposable, so it has its own port, state and browser profile and
@@ -269,16 +281,84 @@ const LAUNCH_ENV_KEYS = [
 
 const launchOverrides = {};
 
+/*
+ * The same, kept per display rather than only for whichever session spoke last.
+ *
+ * Two sessions on one desktop each have their own DISPLAY — and their own
+ * XAUTHORITY and D-Bus address with it, which is why a display cannot be
+ * reconstructed from its name. So each one's is kept as it arrives, and a window
+ * asked for by a window on that display is opened with it. Without this, a new
+ * tab's window, or a tab dragged out into one of its own, would come up in
+ * whichever session had most recently run `clio` — which is the same bug as the
+ * one openWindows is about, one gesture further down.
+ */
+const launchEnvs = new Map();
+
 function rememberLaunchEnv(env) {
   if (!env || typeof env !== 'object') return false;
-  let changed = false;
+
+  const arriving = {};
   for (const key of LAUNCH_ENV_KEYS) {
-    if (typeof env[key] === 'string' && env[key] && launchOverrides[key] !== env[key]) {
-      launchOverrides[key] = env[key];
-      changed = true;
-    }
+    if (typeof env[key] === 'string' && env[key]) arriving[key] = env[key];
   }
+  // Nothing in it about a display: a `clio reload` from an ssh shell, a script
+  // or an agent. No reason to forget where the windows go, and no session here
+  // to take as a set — whatever it did bring is taken one key at a time, which
+  // is what every launch did before there was more than one session to tell
+  // apart.
+  if (!arriving.DISPLAY && !arriving.WAYLAND_DISPLAY) {
+    let merged = false;
+    for (const [key, value] of Object.entries(arriving)) {
+      if (launchOverrides[key] === value) continue;
+      launchOverrides[key] = value;
+      merged = true;
+    }
+    return merged;
+  }
+
+  /*
+   * Taken as a set, not merged key by key.
+   *
+   * These five describe one session, and half of one session mixed with half of
+   * another is not a session anywhere: an X11 login over RDP sends DISPLAY and
+   * no WAYLAND_DISPLAY, and merging left the local session's wayland socket
+   * standing beside it. A browser handed both picks for itself, so a window
+   * asked for over RDP could come up on the screen at the machine — while every
+   * variable involved agreed that it had not. Which is the same bug as the one
+   * openWindows is about, arriving by a different road.
+   */
+  const changed = LAUNCH_ENV_KEYS.some((key) => launchOverrides[key] !== arriving[key]);
+  for (const key of LAUNCH_ENV_KEYS) delete launchOverrides[key];
+  Object.assign(launchOverrides, arriving);
+  launchEnvs.set(displayKey(arriving), { ...arriving });
   return changed;
+}
+
+/**
+ * The environment a window is opened into: what the launcher last said, over
+ * what we inherited — or, for a window being opened on a named display, what
+ * that display's own session last said.
+ */
+function windowEnv(display = null) {
+  const session = (display ? launchEnvs.get(display) : null) || launchOverrides;
+  // Nothing has said where windows go yet — a daemon nobody has run a launcher
+  // against. What it inherited is all there is to go on.
+  if (!session.DISPLAY && !session.WAYLAND_DISPLAY) return { ...process.env };
+
+  // The session's own values, and none of what this process was started with:
+  // a daemon that came up in the local session at boot is still carrying that
+  // session's display, and a window for another one must not be handed it.
+  const env = { ...process.env };
+  for (const key of LAUNCH_ENV_KEYS) delete env[key];
+  return { ...env, ...session };
+}
+
+/**
+ * The display clio is putting windows on now — the session the launcher last
+ * ran in, which is the session of whoever last asked for anything.
+ */
+function displayHere() {
+  return displayKey(windowEnv());
 }
 
 function escapeHtml(text) {
@@ -549,6 +629,11 @@ async function main() {
             // instead of opening them by itself.
             saved: saved(container),
             onScreen: containerHasClient(container.id),
+            // Which session it is on screen in. Two sessions on one desktop —
+            // a local login and an RDP one — is the case this answers: a
+            // window can be open and still be nowhere the person asking can
+            // see it.
+            display: displaysShowing(container.id),
             closing: closing.has(container.id),
             // Its window is still on screen, with Chrome's error page in it
             // where the terminal used to be. Ctrl+R there brings it all back.
@@ -679,11 +764,80 @@ async function main() {
 
   const clients = new Set();
 
+  /*
+   * What clio last copied, so that a paste has something to put in even where
+   * the browser will not hand its clipboard over.
+   *
+   * Every window is a Chrome --app window on a profile of its own, and reading
+   * the system clipboard from one needs a permission that is asked for in a
+   * bubble hung off an address bar an --app window does not have. Over RDP, on
+   * a profile where it has not already been granted, navigator.clipboard
+   * .readText() returns a promise that is never settled either way — so a
+   * window cannot even find out that it has been refused.
+   *
+   * The daemon is the one thing all the windows share, so it holds the text
+   * itself. The browser is still asked first and still wins when it answers,
+   * which is what keeps a copy out of a web page pasting into a shell; this is
+   * what is left when it does not. Never logged and never written to disk: it
+   * is a selection out of somebody's terminal.
+   */
+  let clipboard = '';
+
   function containerHasClient(id) {
     for (const client of clients) {
       if (client.container === id) return true;
     }
     return false;
+  }
+
+  /** Every window showing this container's tabs, wherever on the desktop it is. */
+  function clientsFor(id) {
+    return [...clients].filter((client) => client.container === id);
+  }
+
+  /*
+   * Which session a window is in, and why that is a question at all.
+   *
+   * A desktop can have more than one at a time: this one is logged in locally
+   * and reached over RDP, which is two displays, two desktop sessions and two
+   * autostart entries, with somebody in front of exactly one of them. Whichever
+   * session came up first got the windows — at boot that is the local one,
+   * seconds before anybody has connected — and `clio` in the other session used
+   * to find every window already on screen, conclude there was nothing to put
+   * back, and offer the picker or an empty window while a day's shells sat on a
+   * display nobody was at. On screen is not enough; on screen *here* is the
+   * question.
+   *
+   * A window carries the display it was opened on in its own address and hands
+   * it back on every connection, which is what makes this answerable at all:
+   * that survives a reload, a `clio reload` and a daemon that went down and came
+   * up again, because all three keep the page and its URL. See query() in
+   * ../ui/app.js.
+   */
+  function onThisDisplay(client) {
+    // A window opened by a clio from before windows carried their display says
+    // nothing, and nothing counts as here. Leaving a window where it is when
+    // somebody may be looking at it is a nuisance; opening a second window onto
+    // tabs that are already in front of them is worse.
+    return !client.display || client.display === displayHere();
+  }
+
+  /** Windows showing these tabs somewhere other than the display asking. */
+  function clientsElsewhere(id) {
+    return clientsFor(id).filter((client) => !onThisDisplay(client));
+  }
+
+  /** Are these tabs on screen in the session clio was last run from? */
+  function shownHere(id) {
+    return clientsFor(id).some((client) => onThisDisplay(client));
+  }
+
+  /** The displays these tabs are being shown on, for `clio status` to report. */
+  function displaysShowing(id) {
+    const named = clientsFor(id)
+      .map((client) => client.display)
+      .filter(Boolean);
+    return [...new Set(named)].join(', ') || null;
   }
 
   /** Windows whose page has gone, against the timer that will put their tabs away. */
@@ -1233,6 +1387,24 @@ async function main() {
   }
 
   /**
+   * A window that is open, but open in somebody else's session.
+   *
+   * It has the same standing as an adoptable window as far as the display
+   * asking is concerned: nobody decided to put it away, it simply is not on
+   * this screen. What happens to it is different — a window comes up here and
+   * the one over there is closed, rather than a window coming up onto tabs
+   * nothing was showing. See evictElsewhere.
+   */
+  function strandedElsewhere(container) {
+    return (
+      manager.sessionsIn(container.id).length &&
+      container.closedAt === null &&
+      !shownHere(container.id) &&
+      clientsElsewhere(container.id).length > 0
+    );
+  }
+
+  /**
    * A window that was closed and kept — what the picker offers.
    *
    * Windows inside their grace period count, so long as their page said it was
@@ -1394,8 +1566,18 @@ async function main() {
    * another — and "does this container have a window?" would go back to false
    * mid-wait and put a second browser on the desktop.
    */
-  async function showWindow(containerId, { pick = false } = {}) {
-    const url = `${origin}/?token=${token}&c=${containerId}${pick ? '&pick=1' : ''}`;
+  async function showWindow(containerId, { pick = false, display = null } = {}) {
+    // Which session this window is for. Given by the window that asked for it,
+    // where a window asked; otherwise the session the launcher last ran in,
+    // which is the one whoever is typing is sitting in.
+    const where = display || displayHere();
+    const env = windowEnv(where);
+    // The display goes into the address so the window can say later which
+    // session it came up in — the one thing nothing else here can work out
+    // about a window that is already on a screen. See onThisDisplay.
+    const url =
+      `${origin}/?token=${token}&c=${containerId}` +
+      `${where ? `&d=${encodeURIComponent(where)}` : ''}${pick ? '&pick=1' : ''}`;
     const before = arrivals.get(containerId) || 0;
     const arrived = () => (arrivals.get(containerId) || 0) > before;
 
@@ -1404,7 +1586,7 @@ async function main() {
         // Where this window was last time, if it has been on screen before. The
         // browser is only half-reliable about honouring it; the page it loads
         // finishes the job. See openBrowserWindow.
-        await openBrowserWindow(url, { ...process.env, ...launchOverrides }, {
+        await openBrowserWindow(url, env, {
           geometry: manager.getContainer(containerId)?.geometry || null,
         });
       } catch (err) {
@@ -1423,11 +1605,53 @@ async function main() {
   }
 
   /**
+   * Take a window off the display it was on, now that its tabs are on this one.
+   *
+   * Said only after the new window is up and connected. If no browser can be
+   * started on this display the tabs have to stay exactly where they are: a
+   * window taken off one screen and put on none is the one outcome worse than
+   * a window on the wrong screen.
+   *
+   * Nothing is destroyed and no shell is touched. The tabs are already on
+   * screen in the new window by the time this runs — the daemon holds the
+   * shells, and a window is only ever a view of them — so all that is left over
+   * there is a frame, which is told to close itself. Its socket dropping must
+   * not be read as somebody closing a window, or the tabs it is no longer
+   * showing would be put away under a name; see left() and the 'moved' case in
+   * ../ui/app.js.
+   */
+  function evictElsewhere(id, leaving) {
+    const where = displayHere();
+    const from =
+      [...new Set(leaving.map((client) => client.display).filter(Boolean))].join(', ') ||
+      'another display';
+
+    for (const client of leaving) {
+      client.moving = true;
+      client.attached.clear();
+      client.focused = null;
+      if (client.ws.readyState === client.ws.OPEN) {
+        client.ws.send(JSON.stringify({ t: 'moved', display: where }));
+      }
+    }
+
+    const container = manager.getContainer(id);
+    const name = container?.name || manager.suggestName(manager.sessionsIn(id), id);
+    console.log(
+      `[clio] “${name}” brought over from ${from} to ${where} — ` +
+        `${manager.sessionsIn(id).length} tab(s), none of them restarted`,
+    );
+  }
+
+  /**
    * What `clio` asks for, in the order the answers matter.
    *
-   * 1. Windows that were open when the daemon stopped: every one of them comes
-   *    back, on its own, as it was. This is the reboot and the crash, and it is
-   *    the reason any of this exists.
+   * 1. Windows that were open when the daemon stopped being able to show them:
+   *    every one of them comes back, on its own, as it was. This is the reboot
+   *    and the crash, and it is the reason any of this exists. Windows that are
+   *    open in another session count — they are no more use to whoever typed
+   *    this than a window nobody has open at all — and come over rather than
+   *    being opened twice.
    * 2. Otherwise, if there are windows put away, one window opens onto the
    *    picker so the choice of which — or a new one — is the user's.
    * 3. Otherwise a new window with a shell in it, which is what running a
@@ -1441,12 +1665,17 @@ async function main() {
     if (container) {
       const wanted = findContainer(container);
       if (!wanted) return { opened: [], failed: [{ id: container, error: `no window called “${container}” is waiting` }] };
-      if (containerHasClient(wanted.id)) {
+      // Already open is only already open if it is open where the person
+      // asking can see it. Open in another session is what `clio open` is for
+      // as much as put away is.
+      if (shownHere(wanted.id)) {
         return { opened: [], failed: [{ id: wanted.id, error: 'that window is already open' }] };
       }
       cancelContainerClose(wanted.id);
       manager.reviveContainer(wanted.id);
+      const leaving = clientsElsewhere(wanted.id);
       const one = await showWindow(wanted.id);
+      if (one.ok && leaving.length) evictElsewhere(wanted.id, leaving);
       return {
         opened: one.ok ? [wanted.id] : [],
         failed: one.ok ? [] : [{ id: wanted.id, error: one.error }],
@@ -1454,14 +1683,27 @@ async function main() {
       };
     }
 
-    const orphans = manager.containerList().filter(adoptable).map((c) => c.id);
-    const pick = !orphans.length && savedGroups().length > 0;
+    // Windows nothing is showing, and windows being shown in another session.
+    // Both are the desktop this was asked to put back.
+    const waiting = [
+      ...manager.containerList().filter(adoptable),
+      ...manager.containerList().filter(strandedElsewhere),
+    ].map((c) => c.id);
+    const pick = !waiting.length && savedGroups().length > 0;
 
-    const fresh = orphans.length ? null : newWindowContainer(pick ? null : cwd, { empty: pick });
-    const targets = orphans.length ? orphans : [fresh.id];
+    const fresh = waiting.length ? null : newWindowContainer(pick ? null : cwd, { empty: pick });
+    const targets = waiting.length ? waiting : [fresh.id];
 
     const results = await Promise.all(
-      targets.map(async (id) => ({ id, ...(await showWindow(id, { pick })) })),
+      targets.map(async (id) => {
+        // Read before the window is asked for, not after it arrives: these are
+        // the windows that were showing these tabs when clio was run, and the
+        // new window's own client must never be among them.
+        const leaving = clientsElsewhere(id);
+        const result = await showWindow(id, { pick });
+        if (result.ok && leaving.length) evictElsewhere(id, leaving);
+        return { id, ...result };
+      }),
     );
 
     // Nothing to retry and nothing on screen: take the shell back rather than
@@ -1710,9 +1952,18 @@ async function main() {
       // This window has not chosen which tabs it is showing yet; it is on the
       // picker. Until it does, it is holding an empty container of its own.
       picking: params.get('pick') === '1',
+      // Which session's screen this window is on, in the daemon's spelling of a
+      // display — read back from the address it was opened with, which is the
+      // only thing about a window that outlives the daemon that opened it. Null
+      // for a window from a clio old enough not to have been told. See
+      // onThisDisplay.
+      display: params.get('d') || null,
       // Set when this daemon closes the socket itself to make way for its
       // replacement; see stopListening.
       replaced: false,
+      // Set when these tabs have gone to a window in another session and this
+      // frame is being closed behind them; see evictElsewhere.
+      moving: false,
     };
     clients.add(client);
 
@@ -1854,7 +2105,11 @@ async function main() {
     // What the window offers under Open Link In. Read from disk here rather
     // than in the page, which has no way to look: a browser is a .desktop file
     // on this machine, and only this side of the socket can see one.
-    send({ t: 'browsers', browsers: browserChoices({ ...process.env, ...launchOverrides }) });
+    send({ t: 'browsers', browsers: browserChoices(windowEnv()) });
+
+    // What clio has copied so far, so that a window opened after the copy can
+    // paste it too. See `clipboard` above.
+    if (clipboard) send({ t: 'clipboard', text: clipboard });
 
     // The page that was in this window before this one did not close: it was
     // killed, and what has been sitting here since is Chrome's error page. That
@@ -1898,7 +2153,10 @@ async function main() {
         case 'newwindow': {
           const pick = savedGroups().length > 0;
           const container = newWindowContainer(msg.cwd, { empty: pick });
-          showWindow(container.id, { pick }).then((result) => {
+          // Beside the window that asked, not in whichever session ran clio
+          // last: on a desktop that is logged in twice, those are two different
+          // screens and only one of them has this window on it.
+          showWindow(container.id, { pick, display: client.display }).then((result) => {
             if (result.ok) return;
             if (result.fatal) discardContainer(container.id);
             send({ t: 'window', ok: false, error: result.error });
@@ -1987,6 +2245,20 @@ async function main() {
             send({ t: 'link', ok: false, error: err.message });
           }
           break;
+
+        // A window copied something. Every other window is told, so that a
+        // paste over there has it whether or not that window is allowed to
+        // read the desktop's own clipboard. See `clipboard` above.
+        case 'clipboard': {
+          if (typeof msg.text !== 'string' || !msg.text) break;
+          clipboard = msg.text.slice(0, MAX_CLIPBOARD_CHARS);
+          const payload = JSON.stringify({ t: 'clipboard', text: clipboard });
+          for (const other of clients) {
+            if (other === client || other.ws.readyState !== other.ws.OPEN) continue;
+            other.ws.send(payload);
+          }
+          break;
+        }
 
         // This window has been moved or resized. Only the window knows — the
         // daemon has no connection to the desktop at all — and it is worth
@@ -2215,7 +2487,7 @@ async function main() {
           releaseElsewhere(msg.id);
           console.log(`[clio] a tab was pulled out of ${from} into a window of its own`);
 
-          showWindow(container.id).then((result) => {
+          showWindow(container.id, { display: client.display }).then((result) => {
             if (result.ok) return;
             // No window came up, so the tab is sitting in a container nothing
             // is showing and nothing offers. Give it back rather than leave it
@@ -2243,6 +2515,16 @@ async function main() {
       // A socket the daemon closed on its way out of the way of a replacement.
       // The page is already coming back to whoever is listening now.
       if (client.replaced) return;
+      // A window taken off another session's screen once its tabs came over to
+      // this one. Nothing was closed and nothing is missing a window: they are
+      // on screen here, in the window that asked for them. The goodbye that
+      // page sent on its way out is about the frame, not about the tabs, so it
+      // is dropped rather than left standing where the next thing to happen to
+      // this container would read it as a close.
+      if (client.moving) {
+        cancelContainerClose(client.container);
+        return;
+      }
       scheduleContainerClose(client.container);
       // A window with nothing in it — one closed while still on the picker,
       // most likely — leaves no window behind: there is nothing to put away,

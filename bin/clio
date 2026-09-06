@@ -886,6 +886,15 @@ case "${1:-run}" in
           .then((state) => {
             const shown = state.containers.filter((c) => c.onScreen).length;
             const kept = state.containers.filter((c) => c.saved).length;
+            // The display this shell is in, spelled the way the daemon spells
+            // the one a window is on. A desktop can be logged in twice at once
+            // — locally and over RDP — and a window open in the other session
+            // is one you cannot see from this one.
+            const here = [process.env.DISPLAY, process.env.WAYLAND_DISPLAY]
+              .filter(Boolean)
+              .join("+")
+              .replace(/^:/, "")
+              .replace(/[^A-Za-z0-9._+-]/g, "_");
             console.log(
               `windows:  ${state.containers.length} (${shown} on screen` +
                 (kept ? `, ${kept} closed and kept` : "") + ")",
@@ -894,8 +903,12 @@ case "${1:-run}" in
               // A window with nothing on it was either closed and put away, or
               // left behind by a daemon that went down.
               const name = container.name ? ` “${container.name}”` : "";
+              const elsewhere =
+                container.onScreen && container.display && here && container.display !== here;
               const note = container.onScreen
-                ? ""
+                ? elsewhere
+                  ? `  — on display ${container.display}, not this session (${here}); run clio to bring it here`
+                  : ""
                 : container.killed
                   ? "  — its page was killed; press Ctrl+R in that window, or run clio if it went too"
                   : container.saved

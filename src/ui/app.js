@@ -182,6 +182,19 @@ let containerId = new URLSearchParams(location.search).get('c') || '';
  * waits for that answer.
  */
 let picking = new URLSearchParams(location.search).get('pick') === '1';
+/**
+ * The display this window came up on, in the daemon's spelling of one.
+ *
+ * A page has no way to ask which screen it is on, and the daemon has no way to
+ * ask a window that is already up — so the daemon writes it into the address it
+ * opens the window with, and the window hands it back on every connection. That
+ * is what lets clio tell a window in this session from a window in another one:
+ * a desktop logged in locally and reached over RDP has two of them, with
+ * somebody in front of one. See onThisDisplay in ../daemon/index.js.
+ */
+let windowDisplay = new URLSearchParams(location.search).get('d') || '';
+/** These tabs have gone to a window in another session; this frame is closing. */
+let movedAway = false;
 /** The name this window was given, if it has one. */
 let windowName = null;
 let ws = null;
@@ -246,6 +259,10 @@ function query() {
   // Kept in the address bar as well, so that reloading a window still on the
   // picker comes back to the picker rather than quietly opening a shell.
   if (picking) parts.push('pick=1');
+  // Same reason, for the same length of time: this window is on that display
+  // until it is closed, and a reload — or a daemon that went down and came back
+  // under it — must not lose the one fact nothing else can recover.
+  if (windowDisplay) parts.push(`d=${encodeURIComponent(windowDisplay)}`);
   return parts.length ? `?${parts.join('&')}` : '';
 }
 
@@ -380,6 +397,10 @@ function send(msg) {
  */
 addEventListener('pagehide', () => {
   if (!containerId) return;
+  // Nobody closed anything: these tabs are on screen in another session and
+  // this frame is being cleared away behind them. A goodbye here would read as
+  // a window being put away, which is exactly what did not happen.
+  if (movedAway) return;
   const url = `/gone?c=${encodeURIComponent(containerId)}`;
   if (navigator.sendBeacon?.(url)) return;
   // No sendBeacon: the socket is all there is, and it may still flush.
@@ -468,6 +489,30 @@ function handle(msg) {
       );
       break;
 
+    /*
+     * These tabs are in another window now, in another session.
+     *
+     * clio was run on a display this window is not on — a desktop that is
+     * logged in locally and also reached over RDP has two, and only one of them
+     * has somebody at it — and putting the desktop back there means putting it
+     * back where that person is sitting. The shells never moved; they are in
+     * the daemon and were never told any of this happened. This frame is the
+     * only thing being taken off a screen.
+     */
+    case 'moved':
+      movedAway = true;
+      // Nothing here to come back to: the window that has these tabs is up
+      // already, and reconnecting would be a second window onto them.
+      disowned = true;
+      showMovedScreen(msg.display);
+      try {
+        ws?.close();
+      } catch {
+        /* going anyway */
+      }
+      window.close();
+      break;
+
     // The daemon has finished having this window moved, or has found that it
     // cannot. Either way this window is no longer being looked for by name and
     // can have its own title back; where it ended up is what it reports from
@@ -498,6 +543,13 @@ function handle(msg) {
     // Sent once, when this window connects: what goes under Open Link In.
     case 'browsers':
       browsers = Array.isArray(msg.browsers) ? msg.browsers : [];
+      break;
+
+    // Something was copied — here on connect, or in another window since. Held
+    // so that Paste in this one has it whether or not this window is allowed to
+    // read the desktop's clipboard. See readClipboard.
+    case 'clipboard':
+      if (typeof msg.text === 'string') ownClipboard = msg.text;
       break;
 
     // Same bargain as a window: only ever sent when the click went nowhere. A
@@ -1776,14 +1828,40 @@ function buildMenu(id, link) {
     );
   }
 
+  entries.push({
+    label: 'Copy',
+    // The keys named here are the ones that survive the trip: Ctrl+Insert is
+    // sent by every RDP client and grabbed by nothing, which is more than can
+    // be said for Ctrl+Shift+C. Plain Ctrl+C copies too when there is a
+    // selection, but it is not advertised here — it is the shell's key, and a
+    // menu that says otherwise is a menu that says Ctrl+C does not interrupt.
+    key: 'Ctrl+Insert',
+    disabled: !selection,
+    run: () => copySelection(id),
+  });
+
+  /*
+   * A program that asked for the mouse — claude, vim, less, tmux — is handed
+   * every drag in the window, so dragging across it selects nothing and Copy
+   * above is greyed out with no stated reason. The way round is the same one
+   * every terminal has, and this is where somebody looking for it will be.
+   */
+  if (!selection && pane && pane.term.modes?.mouseTrackingMode !== 'none') {
+    entries.push({ label: 'Hold Shift to select here', disabled: true });
+  }
+
   entries.push(
+    { label: 'Paste', key: 'Shift+Insert', run: () => paste(id) },
     {
-      label: 'Copy',
-      key: 'Ctrl+Shift+C',
-      disabled: !selection,
-      run: () => copySelection(id),
+      // The way to copy without a mouse that works, in the tabs where the
+      // mouse is spoken for. Copy is one line up and one keystroke away.
+      label: 'Select All',
+      disabled: !pane,
+      run: () => {
+        pane.term.selectAll();
+        pane.term.focus();
+      },
     },
-    { label: 'Paste', key: 'Ctrl+Shift+V', run: () => paste(id) },
     { sep: true },
     { label: 'New Tab', key: 'Ctrl+Shift+T', run: newTab },
     {
@@ -2015,24 +2093,147 @@ window.addEventListener('blur', closeContextMenu);
 
 // ----------------------------------------------------------------- clipboard
 
-async function copySelection(id) {
-  const pane = panes.get(id);
-  const text = pane?.term.getSelection();
-  if (!text) return;
+/*
+ * Copy and paste in a window that may not be allowed to touch the clipboard.
+ *
+ * The browser's clipboard API is the good path and the only one that reaches
+ * the rest of the desktop, so it is asked first and it wins when it answers.
+ * It cannot be waited on, though. Reading the clipboard needs a permission,
+ * and a permission is asked for in a bubble hung off an address bar that an
+ * --app window does not have: on a profile where it has not already been
+ * granted — which over RDP is every profile, since that is a display of its
+ * own and so a profile of its own — navigator.clipboard.readText() returns a
+ * promise that is *never settled either way*. Awaiting it, as this did, is a
+ * Paste that does nothing, says nothing, and cannot be told apart from an
+ * empty clipboard.
+ *
+ * So every clipboard call is raced against a clock, and clio keeps its own
+ * copy of the last thing it was asked to copy. That copy lives in the daemon —
+ * windows are separate browser processes on separate profiles and share
+ * nothing else — so copy in one tab and paste in another works between windows
+ * as well, whatever the browser has been told about permissions.
+ */
+
+/** How long the browser gets to answer before it is treated as refusing to. */
+const CLIPBOARD_WAIT_MS = 600;
+
+/** The last thing clio copied anywhere; kept level across windows by the daemon. */
+let ownClipboard = '';
+
+/** The same promise, but one that gives up rather than one that hangs. */
+function beforeLong(promise) {
+  let timer;
+  const clock = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error('the clipboard never answered')), CLIPBOARD_WAIT_MS);
+  });
+  return Promise.race([promise, clock]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Into the system clipboard if the browser allows it, into clio's own either
+ * way. True when the desktop outside this window got it too.
+ */
+async function writeClipboard(text) {
+  if (!text) return false;
+  ownClipboard = text;
+  // Deliberately not through send(): telling the other windows is chatter
+  // alongside the copy rather than the copy itself, and a window whose daemon
+  // is down has been told so by everything else already. It must not raise a
+  // banner over a copy that worked. Same bargain as sendGeometry.
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ t: 'clipboard', text }));
+  }
+
   try {
-    await navigator.clipboard.writeText(text);
+    await beforeLong(navigator.clipboard.writeText(text));
+    return true;
   } catch {
-    showStatus('Clipboard write was blocked by the browser.', 3000);
+    /* refused, or never answered — there is one more way to try */
+  }
+  return execCopy(text);
+}
+
+/*
+ * document.execCommand('copy'): deprecated, and still the only copy that works
+ * when the clipboard API will not. It copies a selection the page already has
+ * rather than writing to the clipboard out of nowhere, so there is no
+ * permission in it to be refused. The field it needs is put where it cannot be
+ * seen and taken away again before the next frame.
+ */
+function execCopy(text) {
+  const held = document.activeElement;
+  const field = document.createElement('textarea');
+  field.value = text;
+  field.setAttribute('aria-hidden', 'true');
+  field.style.cssText = 'position:fixed;top:-1000px;left:-1000px;opacity:0';
+  document.body.append(field);
+  field.focus();
+  field.select();
+  let ok = false;
+  try {
+    ok = document.execCommand('copy');
+  } catch {
+    ok = false;
+  }
+  field.remove();
+  if (held instanceof HTMLElement) held.focus();
+  return ok;
+}
+
+/** The system clipboard if it will say what is in it, clio's own if it will not. */
+async function readClipboard() {
+  if (await mayReadClipboard()) {
+    try {
+      const text = await beforeLong(navigator.clipboard.readText());
+      if (text) return text;
+    } catch {
+      /* refused, or never answered — clio's own copy is what is left */
+    }
+  }
+  return ownClipboard;
+}
+
+/*
+ * Whether reading the clipboard is worth trying, asked of the one call that
+ * answers instead of hanging.
+ *
+ * Granted is the fast path and the whole point of asking. Refused is worth
+ * knowing so that a paste is not made to wait out the clock for an answer that
+ * has already been given. Undecided is still tried: the attempt is what raises
+ * the prompt, and somebody who answers it gets the desktop's clipboard back
+ * from then on — this window only waits the once.
+ */
+async function mayReadClipboard() {
+  try {
+    const status = await beforeLong(navigator.permissions.query({ name: 'clipboard-read' }));
+    return status.state !== 'denied';
+  } catch {
+    // No permissions API, or it does not know this one. Chrome's does; a
+    // browser whose does not is one where the read itself is the only answer.
+    return true;
   }
 }
 
-async function paste(id) {
-  try {
-    const text = await navigator.clipboard.readText();
-    if (text) send({ t: 'input', id, data: text });
-  } catch {
-    showStatus('Clipboard read was blocked — allow clipboard access for this window.', 4000);
+/** True when the copy reached the clipboard; false when there was nothing to copy. */
+async function copySelection(id) {
+  const text = panes.get(id)?.term.getSelection();
+  if (!text) return false;
+  if (!(await writeClipboard(text))) {
+    showStatus('The desktop clipboard is closed to this window — copied within clio only.', 3000);
   }
+  return true;
+}
+
+async function paste(id) {
+  const text = await readClipboard();
+  if (!text) {
+    showStatus('Nothing to paste. Shift+Insert pastes what the desktop is holding.', 4000);
+    return;
+  }
+  // Through the terminal rather than straight down the socket, so that a
+  // program that asked for bracketed paste is told this arrived in one piece.
+  // See pasteInto.
+  pasteInto(id, text);
 }
 
 // ------------------------------------------------------------------ dropping
@@ -2232,7 +2433,23 @@ function isShortcut(event) {
   if (event.ctrlKey && event.shiftKey && !event.altKey) {
     return ['C', 'V', 'T', 'W', 'D', 'Tab'].includes(normalizeKey(event));
   }
-  if (event.ctrlKey && !event.shiftKey && !event.altKey && event.key === 'Tab') return true;
+  if (event.ctrlKey && !event.shiftKey && !event.altKey) {
+    if (event.key === 'Tab') return true;
+    const key = normalizeKey(event);
+    // Ctrl+Insert, the copy that has meant copy since before any of this, and
+    // the one an RDP client is certain to send: Ctrl+Shift+C is a devtools
+    // shortcut in Chrome and Copy in a terminal and is variously eaten by both.
+    // Its opposite, Shift+Insert, is deliberately not here — see below.
+    if (key === 'Insert') return true;
+    // Ctrl+V, which the shell would otherwise take as quoted-insert. Paste is
+    // what nearly everyone means by it, and there is Ctrl+Q for the other.
+    if (key === 'V') return true;
+    // Ctrl+C stays the shell's, unless there is something selected to copy —
+    // the bargain every terminal that ever had a Windows user makes. The
+    // selection is dropped as it is copied, so the very next Ctrl+C interrupts
+    // exactly as it did before.
+    if (key === 'C') return Boolean(activeId && panes.get(activeId)?.term.hasSelection());
+  }
   if (event.altKey && !event.ctrlKey && /^[1-9]$/.test(event.key)) return true;
   return false;
 }
@@ -2273,8 +2490,15 @@ window.addEventListener(
       case 'D':
         if (activeId) closeTab(activeId);
         break;
+      case 'Insert':
       case 'C':
-        if (activeId) copySelection(activeId);
+        if (!activeId) break;
+        copySelection(activeId);
+        // A plain Ctrl+C only got here because something was selected, and the
+        // next one has to be an interrupt again — so the selection goes with
+        // the copy. Ctrl+Shift+C and Ctrl+Insert leave it where it is, the way
+        // a copy anywhere else does.
+        if (key === 'C' && !event.shiftKey) panes.get(activeId)?.term.clearSelection();
         break;
       case 'V':
         if (activeId) paste(activeId);
@@ -2478,6 +2702,37 @@ function showDeadScreen(command = 'clio') {
   const cmd = document.createElement('code');
   cmd.textContent = command;
   card.append(cmd);
+
+  screen.append(card);
+  screen.hidden = false;
+}
+
+/**
+ * Why this window is empty, for the case where it is still here to ask.
+ *
+ * Usually nobody sees this: the window closes itself a moment later. A browser
+ * that refuses to close a window it did not open leaves the frame standing, and
+ * a frame standing there with no tabs in it and no account of why is how a
+ * move that worked perfectly looks like tabs that were lost.
+ */
+function showMovedScreen(display) {
+  hideStatus();
+  const screen = document.getElementById('deadscreen');
+  screen.replaceChildren();
+
+  const card = document.createElement('div');
+  card.className = 'card';
+
+  const heading = document.createElement('h1');
+  heading.textContent = 'These tabs are in another window now';
+  card.append(heading);
+
+  const body = document.createElement('p');
+  body.textContent =
+    `clio was run on ${display ? `display ${display}` : 'another display'}, so these tabs went ` +
+    'to a window there — the screen somebody is at. Nothing was lost and no shell was ' +
+    'restarted; this frame is all that is left here, and it can be closed.';
+  card.append(body);
 
   screen.append(card);
   screen.hidden = false;
