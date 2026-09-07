@@ -1,10 +1,3 @@
-/*
- * End-to-end check of the thing that matters: a process started in a tab must
- * outlive the window that started it, and must be recoverable after the daemon
- * itself is killed outright.
- *
- * Run with the daemon already up:  node test/survive.mjs
- */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -33,13 +26,6 @@ function handshake() {
   return JSON.parse(readFileSync(HANDSHAKE, 'utf8'));
 }
 
-/**
- * A stand-in for a browser window: connects, talks, and can be killed off.
- *
- * The container it names is the window it is: the daemon hands back that
- * window's tabs and nobody else's, and naming the same one again is how a
- * window that was closed — or a daemon that was killed — comes back as itself.
- */
 class Client {
   constructor(info, container = null) {
     this.info = info;
@@ -82,7 +68,6 @@ class Client {
     this.ws.send(JSON.stringify(msg));
   }
 
-  /** Wait for a message matching a predicate. */
   async await(pred, timeout = 4000) {
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
@@ -93,35 +78,18 @@ class Client {
     return null;
   }
 
-  /**
-   * The socket goes, the way it does when a window is closed or reloaded — with
-   * the goodbye a real page sends as it is taken apart.
-   *
-   * It has to be said. To the daemon a socket that drops in silence is a page
-   * that was killed, and a window nobody closed is one it puts back by itself
-   * rather than offers by name — so a stand-in for a page that says nothing is
-   * standing in for the wrong thing. See the pagehide handler in src/ui/app.js.
-   */
   close({ goodbye = true } = {}) {
     if (goodbye && this.container) {
       fetch(
         `http://127.0.0.1:${this.info.port}/gone?c=${this.container}&token=${this.info.token}`,
         { method: 'POST' },
       ).catch(() => {
-        /* the daemon has gone; there is nobody left to tell */
       });
     }
     this.ws.close();
   }
 }
 
-/**
- * Regression: a reloaded window authenticates with the cookie alone.
- *
- * The page strips the token from its URL on load, so if the cookie exchange
- * breaks, a refresh leaves the window connected to nothing — the terminal looks
- * fine but every button silently does nothing.
- */
 async function reloadSurvivesAuth(info) {
   console.log('0. a reloaded window can still authenticate');
   const origin = `http://127.0.0.1:${info.port}`;
@@ -137,7 +105,6 @@ async function reloadSurvivesAuth(info) {
 
   const jar = cookie.split(';')[0];
 
-  // The reload case: no token anywhere in the URL, only the cookie.
   const ws = new WebSocket(`${origin.replace('http', 'ws')}/`, {
     origin,
     headers: { cookie: jar },
@@ -168,13 +135,6 @@ async function reloadSurvivesAuth(info) {
   console.log('');
 }
 
-/**
- * Refuse to run against the clio somebody is working in.
- *
- * This test SIGKILLs the daemon it is pointed at and ends shells inside it. On
- * a sandbox that is the point; on the daemon holding a day's worth of terminals
- * it is not a failing test, it is a lost afternoon.
- */
 async function onlyAgainstASandbox(info) {
   const status = await fetch(`http://127.0.0.1:${info.port}/status?token=${info.token}`)
     .then((res) => res.json())
@@ -199,13 +159,9 @@ async function main() {
 
   await reloadSurvivesAuth(info);
 
-  // Two windows for this run, named up front. Real ids so a rerun cannot
-  // inherit tabs from the last one, and so nothing here can touch a window a
-  // person actually has open.
   const windowA = randomBytes(4).toString('hex');
   const windowB = randomBytes(4).toString('hex');
 
-  // ---- 1. a session runs and produces output -----------------------------
   console.log('1. basic session');
   const win1 = new Client(info, windowA);
   await win1.connect();
@@ -221,24 +177,17 @@ async function main() {
   await sleep(700);
   check('command output came back', (win1.output.get(id) || '').includes('hello-from-clio'));
 
-  // ---- 2. a dropped connection does not touch the processes ---------------
-  //
-  // A page that is reloading drops its socket in exactly the way a window being
-  // closed does, and nothing in the event says which happened. So the shells are
-  // held either way until something comes back for them — which is what makes a
-  // reload, or a browser that restarted itself, survivable. Section 6 is the
-  // other side of it: nothing comes back, so they end.
   console.log('\n2. the connection drops while a process runs');
   win1.send({ t: 'input', id, data: 'sleep 120 & echo started-$!\n' });
   await sleep(800);
 
   win1.send({ t: 'input', id, data: 'sleep 90\n' });
-  await sleep(2500); // let the proc poller notice the foreground job
+  await sleep(2500);
 
   const shellPid = created.session.pid;
   check('shell pid reported', !!shellPid);
 
-  win1.close(); // the socket goes, as it would on a reload
+  win1.close();
   await sleep(1200);
 
   let alive = true;
@@ -253,7 +202,6 @@ async function main() {
     execSync(`pgrep -P ${shellPid} 2>/dev/null || true`, { encoding: 'utf8' }).trim().length > 0;
   check('child process still running too', sleepAlive);
 
-  // ---- 3. the window comes back and picks its tabs up again --------------
   console.log('\n3. the window comes back');
   const win2 = new Client(info, windowA);
   await win2.connect();
@@ -273,8 +221,7 @@ async function main() {
   const attached = await win2.await((m) => m.t === 'attached');
   check('reattach replayed scrollback', (attached?.scrollback || '').includes('hello-from-clio'));
 
-  // the reattached window can still drive the shell
-  win2.send({ t: 'input', id, data: '' }); // Ctrl+C to end `sleep 90`
+  win2.send({ t: 'input', id, data: '' });
   await sleep(600);
   win2.send({ t: 'input', id, data: 'echo second-window-works\n' });
   await sleep(800);
@@ -286,10 +233,6 @@ async function main() {
   win2.send({ t: 'rename', id, title: 'my-tab' });
   await sleep(600);
 
-  // ---- 3b. a second window is a second set of tabs ------------------------
-  //
-  // Not two views of one set. Two windows showing the same shells means a tab
-  // closed in one vanishes out of the other, and typing lands in both.
   console.log('\n3b. a second window has its own tabs');
   const other = new Client(info, windowB);
   await other.connect();
@@ -304,29 +247,21 @@ async function main() {
   check("it does not show the first window's tabs", !other.has(id));
   check("and the first window does not show its tab", !win2.has(otherTab.id));
 
-  // Knowing the id is not enough: a tab belongs to one window.
   other.send({ t: 'attach', id, cols: 80, rows: 24 });
   check('it cannot attach to a tab from the other window',
     !!(await other.await((m) => m.t === 'gone' && m.id === id, 2000)));
 
   other.send({ t: 'input', id: otherTab.id, data: 'echo second-window-mark\n' });
-  await sleep(4000); // past the scrollback flush, so the crash below cannot lose it
+  await sleep(4000);
   other.close();
 
-  // Stand in for a full-screen program by turning on the modes one would: mouse
-  // reporting and the alternate screen. A killed program never turns them off,
-  // and they belong to the terminal, so they are still on when the next shell
-  // arrives unless the daemon puts them back.
   win2.send({ t: 'input', id, data: 'printf "\\033[?1049h\\033[?1003h\\033[?1006h"\n' });
   await sleep(600);
 
-  // Leave something running in the foreground: what the daemon does with it
-  // across a crash is the part people care about.
   win2.send({ t: 'input', id, data: 'sleep 300\n' });
-  await sleep(4000); // past the proc poller, then past the scrollback flush
+  await sleep(4000);
   win2.close();
 
-  // ---- 4. the daemon is killed outright, then restarted ------------------
   console.log('\n4. daemon killed (SIGKILL), then restarted');
   process.kill(info.pid, 9);
   await sleep(600);
@@ -344,8 +279,6 @@ async function main() {
 
   const info2 = handshake();
   check('daemon restarted with a new pid', info2.pid !== info.pid);
-  // Stable across restarts on purpose: a window left open when the daemon died
-  // reconnects to its replacement without being relaunched.
   check('kept the same port', info2.port === info.port, `${info.port} -> ${info2.port}`);
   check('kept the same token', info2.token === info.token);
 
@@ -355,8 +288,6 @@ async function main() {
   const recovered = list2?.sessions.find((s) => s.id === id);
 
   check('tab came back after the crash', !!recovered);
-  // A tab with no pty behind it is a tab that cannot be typed in, so the daemon
-  // opens the shell rather than leaving it to be asked for.
   check('came back with a shell already running', recovered?.status === 'live',
     `got ${recovered?.status}`);
   check('remembers its title', recovered?.title === 'my-tab', `got ${recovered?.title}`);
@@ -366,7 +297,6 @@ async function main() {
   const attached2 = await win3.await((m) => m.t === 'attached');
   const replayed = attached2?.scrollback || '';
   check('saved scrollback survived the crash', replayed.includes('hello-from-clio'));
-  // The old prompt is still up there and must not read as though it were live.
   check('the seam marks where the new shell starts', replayed.includes('new shell'),
     JSON.stringify(replayed.slice(-160)));
   check(
@@ -375,9 +305,6 @@ async function main() {
     JSON.stringify(replayed.slice(-160)),
   );
 
-  // Whatever the dead program left switched on is switched off again ahead of
-  // the seam. Otherwise the new shell inherits mouse reporting and every mouse
-  // move over the window arrives at the prompt as line noise.
   const seamAt = replayed.indexOf('new shell');
   const modeOff = (on, off) => {
     const last = replayed.lastIndexOf(on);
@@ -388,7 +315,6 @@ async function main() {
   check('so is its SGR encoding', modeOff('\x1b[?1006h', '\x1b[?1006l'));
   check('and the alternate screen is left', modeOff('\x1b[?1049h', '\x1b[?1049l'));
 
-  // ---- 5. the recovered tab is usable straight away -----------------------
   console.log('\n5. the recovered tab is usable straight away');
   await sleep(700);
   win3.output.set(id, '');
@@ -408,10 +334,6 @@ async function main() {
     (win3.output.get(id) || '').includes('typed-without-being-asked'),
   );
 
-  // ---- 4b. both windows come back, not just the one -----------------------
-  //
-  // The point of tracking windows at all: two of them open before the crash is
-  // two of them afterwards, each with the tabs that were in it.
   console.log('\n4b. the second window came back too');
   const other2 = new Client(info2, windowB);
   await other2.connect();
@@ -436,12 +358,6 @@ async function main() {
     JSON.stringify(live.containers.map((c) => c.id)));
   check('and has a window open on each', known.every((c) => c.onScreen));
 
-  // ---- 6. a closed window is put away, not ended --------------------------
-  //
-  // The line this whole design draws. Closing a window closes the window: the
-  // shells in it are the work, and they carry on running under a name until
-  // somebody opens them again. Nothing about a frame going away is a decision
-  // to end a build, an ssh session or an editor.
   console.log('\n6. a closed window keeps its shells, under a name');
   const windowC = randomBytes(4).toString('hex');
   const win4 = new Client(info2, windowC);
@@ -455,23 +371,16 @@ async function main() {
 
   const keptPid = kept.session.pid;
   await sleep(700);
-  // A background job as well: what was running in the window is the thing
-  // whose survival actually matters.
   win4.send({ t: 'input', id: kept.id, data: 'sleep 601 &\n' });
   await sleep(800);
   const jobs = () =>
-    // The brackets keep the pattern from matching the shell running the pgrep,
-    // whose own command line contains it verbatim.
     execSync('pgrep -f "sleep 6[0]1" 2>/dev/null || true', { encoding: 'utf8' }).trim();
   check('its background job is running', jobs().length > 0);
 
-  // Name it first, the way somebody who means to come back to it would.
   win4.send({ t: 'renamewindow', name: 'the one with the job in it' });
   await sleep(400);
 
   win4.close();
-  // Long enough to be past the daemon's grace period, which is deliberately
-  // longer than any reload takes.
   await sleep(13000);
 
   let stillThere = true;
@@ -491,8 +400,6 @@ async function main() {
   check('it is marked as closed and kept', !!put?.saved);
   check('under the name it was given', put?.name === 'the one with the job in it', put?.name);
 
-  // Opening it again is the whole point: same shells, same pid, same
-  // scrollback, no new prompt.
   const win5 = new Client(info2, windowC);
   await win5.connect();
   const backAgain = await win5.await((m) => m.t === 'sessions' && m.sessions.length > 0);
@@ -511,14 +418,9 @@ async function main() {
     reopened.containers.find((c) => c.id === windowC)?.saved === false,
   );
 
-  // ---- 6b. being rid of one on purpose ------------------------------------
-  //
-  // Kept windows would otherwise pile up forever, so the picker can end one —
-  // the only place in clio where shells are ended without being closed tab by
-  // tab, and it asks first.
   console.log('\n6b. a kept window can be discarded on purpose');
   win5.close();
-  await sleep(12000); // put away again
+  await sleep(12000);
 
   const win6 = new Client(info2, randomBytes(4).toString('hex'));
   await win6.connect();
@@ -545,14 +447,11 @@ async function main() {
   );
   win6.close();
 
-  // ---- cleanup ------------------------------------------------------------
   win3.send({ t: 'close', id });
   await sleep(400);
   const list3 = await win3.await((m) => m.t === 'sessions' && !m.sessions.some((s) => s.id === id));
   check('closing a tab removes it', !!list3);
 
-  // A window with no tabs left is no longer a window. Leaving these behind
-  // would mean `clio` reopening this test on somebody's desktop tomorrow.
   for (const tab of other2.sessions) other2.send({ t: 'close', id: tab.id });
   await sleep(600);
   const cleaned = await (

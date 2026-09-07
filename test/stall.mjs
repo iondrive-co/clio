@@ -1,32 +1,9 @@
-/*
- * A disk that has stopped answering must not stop a tab taking input.
- *
- * The daemon has one thread. Everything it does for every window in every
- * container happens on it, including — until this test existed — writing half a
- * megabyte of scrollback per busy tab to disk every three seconds, with
- * `writeFileSync`. A write into a warm page cache is a memcpy and costs
- * nothing, which is why nobody noticed. A write on a machine that has just hit
- * the kernel's dirty-page limit costs however long writeback takes, and while it
- * does, that one thread is not reading a pty, not writing to one, and not
- * answering a window. Every tab on the desktop stops dead and then comes back on
- * its own, which is exactly what was reported: some thirty seconds, every time a
- * large commit landed in an IDE on the same disk.
- *
- * So the disk here is made slow on purpose — see test/slowdisk.cjs, preloaded
- * into the daemon — and what is measured is the only thing that matters while it
- * is: how long a keystroke takes to come back from the shell.
- *
- *   node test/stall.mjs
- */
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, existsSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import WebSocket from 'ws';
 
-// A clio of this run's own, before anything can inherit somebody else's. This
-// file starts a daemon and kills it again; the one it must never be pointed at
-// is the one holding a day's real shells. See test/ui.mjs for the long version.
 const SANDBOX = mkdtempSync(join(tmpdir(), 'clio-stall-'));
 process.env.XDG_RUNTIME_DIR = join(SANDBOX, 'run');
 process.env.XDG_STATE_HOME = join(SANDBOX, 'state');
@@ -34,8 +11,6 @@ process.env.CLIO_DEV = '1';
 mkdirSync(process.env.XDG_RUNTIME_DIR, { recursive: true });
 mkdirSync(process.env.XDG_STATE_HOME, { recursive: true });
 
-// The delay is worth more than one flush interval, so that a keystroke arriving
-// at any moment in the cycle has a real chance of landing mid-write.
 const WRITE_MS = 1500;
 const SCROLLBACK_DIR = join(process.env.XDG_STATE_HOME, 'clio', 'scrollback');
 process.env.NODE_OPTIONS = `${process.env.NODE_OPTIONS || ''} --require ${resolve('test/slowdisk.cjs')}`.trim();
@@ -49,12 +24,10 @@ process.on('exit', () => {
   try {
     execSync('./bin/clio stop', { stdio: 'ignore' });
   } catch {
-    /* it never started, or it is already down */
   }
   try {
     rmSync(SANDBOX, { recursive: true, force: true });
   } catch {
-    /* leave it, it is in /tmp */
   }
 });
 
@@ -70,7 +43,6 @@ function check(label, ok, detail = '') {
   }
 }
 
-/** A stand-in for a window: connect, open a tab, type into it. */
 class Window {
   constructor(info) {
     this.info = info;
@@ -114,13 +86,6 @@ class Window {
     throw new Error('the daemon never opened a tab');
   }
 
-  /**
-   * Type something and time how long the shell takes to say it back.
-   *
-   * A `#` so that whatever is typed is a comment: this runs a few dozen times
-   * and none of it should ever be a command. Nothing is entered, and the line is
-   * abandoned at the end.
-   */
   async probe(n) {
     const marker = `#${n}z`;
     const started = Date.now();
@@ -143,12 +108,9 @@ async function main() {
   const window = new Window(info);
   await window.connect();
   await window.openTab();
-  await sleep(1500); // let the shell reach a prompt
+  await sleep(1500);
 
   console.log('1. typing while the disk is refusing to answer');
-  // Long enough to cross several flush ticks — the flush runs every 3s, and
-  // every one of these keystrokes is output too, so the tab is dirty for all of
-  // them and every tick has something to write.
   const round = [];
   for (let n = 0; n < 60; n++) {
     round.push(await window.probe(n));
@@ -165,8 +127,6 @@ async function main() {
   check('and is quick throughout', median < 200, `median ${median}ms`);
 
   console.log('\n2. the scrollback was still written');
-  // The point of the flush is that it happens; doing it off the event loop must
-  // not mean not doing it.
   await sleep(WRITE_MS + 3500);
   const files = existsSync(SCROLLBACK_DIR) ? readdirSync(SCROLLBACK_DIR) : [];
   const log = files.find((f) => f === `${window.id}.log`);

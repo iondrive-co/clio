@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
-# clio — launcher. Starts the daemon if it is not already up, then opens a window.
 set -euo pipefail
 
-# Resolve symlinks before working out where clio lives. Without this, running
-# via a link on PATH (~/.local/bin/clio) makes ROOT the link's parent, and the
-# daemon entry point silently cannot be found.
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
 DAEMON_ENTRY="$ROOT/src/daemon/index.js"
@@ -21,7 +17,7 @@ LOG="$STATE_DIR/daemon.log"
 
 mkdir -p "$RUNTIME_DIR" "$STATE_DIR"
 
-field() { # field <key> — read a value out of the handshake file
+field() {
   [ -f "$HANDSHAKE" ] || return 1
   node -e '
     const fs = require("fs");
@@ -36,29 +32,12 @@ field() { # field <key> — read a value out of the handshake file
 daemon_pid() {
   local pid
   pid="$(field pid 2>/dev/null)" || return 1
-  # A pid in the file proves nothing on its own; the process has to still exist.
   kill -0 "$pid" 2>/dev/null || return 1
   echo "$pid"
 }
 
-# --------------------------------------------------------------- what it needs
-#
-# Three things have to be on the machine before any of this works: node, a
-# chrome-family browser to be the window, and a compiler — node-pty ships no
-# binary for Linux, so every install builds it here.
-#
-# A fresh desktop has none of them, and the way that used to be found out was
-# `npm install` failing somewhere inside node-gyp, or a daemon that started
-# and then had nothing to put a window in. So the launcher looks first, names
-# what is missing in terms of what it is for, and installs it with the
-# machine's own package manager — not into a directory of clio's own, because
-# a browser nobody updates is worse than no browser at all.
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# The window is a chrome-family browser and can be nothing else: --app is what
-# turns a page into a window with no browser wrapped around it, and only these
-# have it. The list is the one in src/daemon/window.js, which is what actually
-# goes looking.
 BROWSER_NAMES=(google-chrome google-chrome-stable chromium chromium-browser brave-browser)
 
 browser_on_path() {
@@ -69,7 +48,6 @@ browser_on_path() {
   return 1
 }
 
-# fetch(), which this script and the daemon both live on, arrived in node 18.
 node_ok() {
   have node || return 1
   local major
@@ -77,8 +55,6 @@ node_ok() {
   [ -n "$major" ] && [ "$major" -ge 18 ]
 }
 
-# What building node-pty takes. Missing, `npm install` fails halfway through
-# with a page of node-gyp output that names none of these.
 toolchain_ok() {
   have make || return 1
   have python3 || return 1
@@ -93,9 +69,7 @@ pkg_manager() {
   return 1
 }
 
-# Which package carries each missing thing. Only the names are distribution
-# business; what is needed was decided above.
-pkg_for() { # pkg_for <manager> <node|npm|browser|toolchain|monitors>
+pkg_for() {
   case "$1 $2" in
     'apt-get node') echo nodejs ;;
     'apt-get npm') echo npm ;;
@@ -120,7 +94,6 @@ pkg_for() { # pkg_for <manager> <node|npm|browser|toolchain|monitors>
   esac
 }
 
-# The install command, without the package names.
 pkg_install_argv() {
   case "$1" in
     apt-get) echo 'apt-get install -y' ;;
@@ -130,13 +103,6 @@ pkg_install_argv() {
   esac
 }
 
-# Installing packages is the one thing clio cannot do as you.
-#
-# Run from a terminal there is a tty, and sudo asks for the password where you
-# are already looking. Started from the applications menu there is no tty at
-# all — sudo would fail without asking anything — so the desktop is asked
-# instead, through pkexec, which puts up its own window. With neither, the
-# command is printed and you are the one who runs it.
 as_root() {
   if [ "$(id -u)" = 0 ]; then "$@"; return; fi
   if have sudo && [ -t 0 ] && [ -t 2 ]; then sudo -- "$@"; return; fi
@@ -144,9 +110,6 @@ as_root() {
   return 127
 }
 
-# Put on the machine whatever clio runs on that is not here yet. Silent and
-# nearly free when everything is already installed, which is every run but the
-# first.
 ensure_prereqs() {
   local missing=() thing
   node_ok || missing+=(node)
@@ -154,10 +117,6 @@ ensure_prereqs() {
   toolchain_ok || missing+=(toolchain)
   browser_on_path || missing+=(browser)
 
-  # wmctrl is the one thing here clio can do without: windows still come back
-  # with their tabs, their scrollback and their size, just together on
-  # whichever monitor the browser opened them on. So it is picked up while a
-  # password is being asked for anyway, and never asked for on its own.
   if [ ${#missing[@]} -gt 0 ] && ! have wmctrl && ! have xdotool; then
     missing+=(monitors)
   fi
@@ -184,7 +143,6 @@ ensure_prereqs() {
 
   local packages=()
   for thing in "${missing[@]}"; do
-    # Split on purpose: one missing thing can be more than one package.
     packages+=($(pkg_for "$manager" "$thing"))
   done
 
@@ -195,8 +153,6 @@ ensure_prereqs() {
   local status=0
   as_root "${install_argv[@]}" "${packages[@]}" >&2 || status=$?
 
-  # A package manager with no lists cannot find anything, and that is the usual
-  # reason the first install on a fresh machine fails. One refresh settles it.
   if [ "$status" -ne 0 ] && [ "$status" -ne 127 ] && [ "$manager" = apt-get ]; then
     echo "clio: that failed — refreshing the package lists and trying once more." >&2
     status=0
@@ -216,8 +172,6 @@ ensure_prereqs() {
     return 1
   fi
 
-  # What is still missing is said here, where the reason for wanting it is,
-  # rather than further away as something that cannot be started.
   local blocked=0
   node_ok || { echo "clio: still no usable node — nothing can run without one." >&2; blocked=1; }
   have npm || { echo "clio: still no npm — clio cannot fetch what it needs." >&2; blocked=1; }
@@ -228,8 +182,6 @@ ensure_prereqs() {
   return 0
 }
 
-# Everything that reads the daemon does it through node. Without one there is
-# nothing to report and nothing to do but say where it comes from.
 require_node() {
   node_ok && return 0
   echo "clio: no usable node here (18 or newer). Run 'clio install' and it is put" >&2
@@ -237,7 +189,6 @@ require_node() {
   return 1
 }
 
-# Fetch dependencies on first run so a fresh clone needs no separate setup step.
 ensure_deps() {
   if [ -d "$ROOT/node_modules/node-pty" ] && [ -d "$ROOT/node_modules/ws" ]; then
     return 0
@@ -255,8 +206,6 @@ start_daemon() {
   ensure_prereqs || return 1
   ensure_deps || return 1
   rm -f "$HANDSHAKE"
-  # setsid detaches the daemon from this shell's session, so closing the
-  # terminal that launched clio cannot take the ptys down with it.
   setsid node "$DAEMON_ENTRY" >>"$LOG" 2>&1 < /dev/null &
   disown 2>/dev/null || true
 
@@ -273,17 +222,7 @@ start_daemon() {
   return 1
 }
 
-# Windows are put on screen by the daemon, not from here. The + at the end of
-# the tab row asks for one too and cannot spawn a browser, so both go through
-# the same path and a window opened either way is the same window.
-#
-# Every window that was open when the daemon last stopped comes back — that is
-# how two windows left open before a reboot come back as two windows. With none
-# of those but some closed and kept, one window opens onto the picker and the
-# choice is the user's. With neither, a new window. The display variables go
-# with the request because the daemon may have been started from a session that
-# has since gone away, leaving it pointing at a display that no longer exists.
-open_windows() { # open_windows [name-or-id of one window to open]
+open_windows() {
   node -e '
     const fs = require("fs");
     const file = process.argv[1];
@@ -325,8 +264,6 @@ open_windows() { # open_windows [name-or-id of one window to open]
   ' "$HANDSHAKE" "${1:-}"
 }
 
-# The picker, for people who are already in a terminal. Everything it lists is a
-# window that was closed with shells still running in it.
 list_windows() {
   node -e '
     const fs = require("fs");
@@ -357,15 +294,6 @@ list_windows() {
   ' "$HANDSHAKE"
 }
 
-# Swap the daemon for one running the code that is on disk now.
-#
-# The shells go across as open file descriptors, so nothing in a tab is
-# restarted, reconnected or told anything happened — a build, an ssh session or
-# an editor carries on through it. Windows blink as their socket drops and come
-# back on their own.
-#
-# If the new code cannot start, the old daemon takes the shells back and stays
-# up: a failed reload costs a couple of seconds, not a day's work.
 reload_daemon() {
   local before="$1" now
   node -e '
@@ -403,8 +331,6 @@ reload_daemon() {
       });
   ' "$HANDSHAKE" "$DAEMON_ENTRY" || return 1
 
-  # The successor writes the handshake file only once it holds the shells, so a
-  # new pid there is the whole proof that this worked.
   for _ in $(seq 1 200); do
     now="$(daemon_pid 2>/dev/null || true)"
     if [ -n "$now" ] && [ "$now" != "$before" ]; then
@@ -424,25 +350,11 @@ reload_daemon() {
   return 1
 }
 
-# ------------------------------------------------------- asked to run one thing
-#
-# A terminal is asked to run a single command far more often than anyone
-# thinks: every .desktop file with Terminal=true, "run in terminal" in a file
-# manager, xdg-terminal-exec, and every script that ever wrote `xterm -e`. They
-# all mean it the same way — after -e, or after a -- — and they all expect the
-# terminal to be gone when the command is.
-#
-# clio has no answer to that yet. A tab here outlives the window it was opened
-# in, which is the point of it, and "a window that ends with the program in it"
-# is a different thing that has not been designed. What must not happen is a
-# command being dropped on the floor because clio was made the default, so it
-# goes to a terminal that does understand it, and says where it went.
 OTHER_TERMINALS=(qterminal xfce4-terminal konsole gnome-terminal mate-terminal
                  lxterminal alacritty kitty urxvt rxvt st xterm)
 
 other_terminal() {
   local candidate resolved
-  # The machine's own answer first, as long as it has not been pointed here.
   for candidate in /etc/alternatives/x-terminal-emulator /usr/bin/x-terminal-emulator; do
     [ -x "$candidate" ] || continue
     resolved="$(readlink -f "$candidate")"
@@ -472,27 +384,12 @@ hand_off_command() {
   exec "$fallback" "$@"
 }
 
-# --------------------------------------------------------------- the defaults
-#
-# Being *the* terminal on a desktop is not one setting. It is a handful of
-# small files that know nothing about each other, each read by something
-# different: the applications menu reads a .desktop file, a script reads
-# $TERMINAL, a file manager reads its own config, xdg-terminal-exec reads a
-# list of desktop files, and everything descended from xterm looks up
-# x-terminal-emulator on the PATH.
-#
-# All of them are written under $HOME. None of this is done to anybody else on
-# the machine, and none of it needs root — which is also why the PATH is where
-# x-terminal-emulator is answered, rather than update-alternatives.
 APPS_DIR="$HOME/.local/share/applications"
 DESKTOP_FILE="$APPS_DIR/clio.desktop"
 ENV_MARKER="# clio: the terminal \$TERMINAL means"
 PATH_MARKER="# clio: ~/.local/bin on the session PATH"
 
-# Read one key out of an ini file — the format Qt desktops keep their settings
-# in. Values go through the environment rather than -v, which would read the
-# backslashes in a key like apps\1\desktop as escapes.
-ini_get() { # ini_get <file> <section> <key>
+ini_get() {
   [ -f "$1" ] || return 1
   CLIO_SECTION="[$2]" CLIO_KEY="$3" awk '
     /^\[/ { inside = ($0 == ENVIRON["CLIO_SECTION"]); next }
@@ -503,17 +400,12 @@ ini_get() { # ini_get <file> <section> <key>
   ' "$1"
 }
 
-# Set one key in one section, leaving every other line of the file exactly as
-# it was: these are files somebody else owns and writes.
-ini_set() { # ini_set <file> <section> <key> <value>
+ini_set() {
   local file="$1"
   mkdir -p "$(dirname "$file")"
   [ -f "$file" ] || : > "$file"
   CLIO_SECTION="[$2]" CLIO_KEY="$3" CLIO_VALUE="$4" awk '
     BEGIN { done = 0; inside = 0; seen = 0; held = 0 }
-    # A blank line inside the section is held rather than printed, so a key
-    # added to the end of one lands above the blank line that separates it
-    # from the next — where somebody who opens the file would have put it.
     function flush() { while (held-- > 0) print ""; held = 0 }
     /^[ \t]*$/ {
       if (inside && !done) { held++; next }
@@ -521,8 +413,6 @@ ini_set() { # ini_set <file> <section> <key> <value>
       next
     }
     /^\[/ {
-      # Leaving the section it belongs in without having written it: it goes
-      # here, before the next section starts.
       if (inside && !done) { print ENVIRON["CLIO_KEY"] "=" ENVIRON["CLIO_VALUE"]; done = 1 }
       flush()
       inside = ($0 == ENVIRON["CLIO_SECTION"])
@@ -546,8 +436,6 @@ ini_set() { # ini_set <file> <section> <key> <value>
   ' "$file" > "$file.clio-new" && mv "$file.clio-new" "$file"
 }
 
-# The rc the user's own shell reads. Only the two clio can be sure about;
-# anything else and $TERMINAL is left to the session file alone.
 shell_rc() {
   case "$(basename "${SHELL:-}")" in
     zsh) echo "$HOME/.zshrc" ;;
@@ -559,16 +447,9 @@ shell_rc() {
 default_terminal() {
   mkdir -p "$HOME/.local/bin" "$HOME/.config"
 
-  # Everything descended from xterm looks up x-terminal-emulator on the PATH.
-  # A link in ~/.local/bin, which comes before /usr/bin, is this user's answer
-  # to that question and is theirs to give.
   ln -sf "$SELF" "$HOME/.local/bin/x-terminal-emulator"
   echo "  $HOME/.local/bin/x-terminal-emulator -> $SELF"
 
-  # $TERMINAL is what a script asks. Two files, because a shell and a desktop
-  # session read different ones: .xsessionrc is sourced as X starts, so
-  # everything launched from the panel or the menu has it, and the shell's own
-  # rc covers every terminal you type in.
   local rc
   for rc in "$HOME/.xsessionrc" "$(shell_rc)"; do
     [ -n "$rc" ] || continue
@@ -577,11 +458,6 @@ default_terminal() {
     echo "  $rc  (TERMINAL=clio)"
   done
 
-  # The PATH a session gives the things it starts is not a shell's PATH. A
-  # window manager's menu, a panel launcher and a file manager all run programs
-  # by name, and on a Debian desktop that PATH is /sbin:/bin:/usr/bin and
-  # nothing else — so nothing any of them start can find ~/.local/bin, however
-  # many links are in it. .xsessionrc is read as X starts, before the session.
   local session="$HOME/.xsessionrc"
   if ! grep -qF "$PATH_MARKER" "$session" 2>/dev/null; then
     {
@@ -595,14 +471,10 @@ default_terminal() {
     echo "  $session  (~/.local/bin on the session PATH, from the next login)"
   fi
 
-  # And where a systemd user session reads it, for a desktop that sources no
-  # shell file at all. The file is clio's own, so writing it again is safe.
   mkdir -p "$HOME/.config/environment.d"
   printf '# written by clio install\nTERMINAL=clio\n' > "$HOME/.config/environment.d/50-clio.conf"
   echo "  $HOME/.config/environment.d/50-clio.conf  (TERMINAL=clio)"
 
-  # The xdg-terminal-exec spec's version of the same question: desktop files,
-  # most preferred first. Any others there keep their order behind clio.
   local list="$HOME/.config/xdg-terminals.list" tmp
   tmp="$list.clio-new"
   echo "clio.desktop" > "$tmp"
@@ -610,8 +482,6 @@ default_terminal() {
   mv "$tmp" "$list"
   echo "  $list  (clio.desktop first)"
 
-  # A file manager keeps its own name for a terminal, and it is the one that
-  # answers "Open Terminal Here".
   local settings
   for settings in "$HOME"/.config/pcmanfm-qt/*/settings.conf; do
     [ -f "$settings" ] || continue
@@ -620,19 +490,6 @@ default_terminal() {
   done
 }
 
-# Openbox's root menu — the right-click on the desktop, and on a session with
-# no panel the only way to open anything at all.
-#
-# It runs its terminal by name, and a name is looked up in the PATH the window
-# manager was started with. That is not a shell's PATH: it is whatever the
-# session was given, which on a Debian desktop is /sbin:/bin:/usr/bin and
-# nothing else, so a link in ~/.local/bin is invisible to it — the menu goes on
-# opening the terminal it was opening before, and nothing anywhere explains
-# why. So the menu is given the path itself rather than a name to look up.
-#
-# The file is the user's own copy. Openbox reads ~/.config/openbox/menu.xml in
-# preference to the one in /etc/xdg, and re-reads it when asked, so this takes
-# effect without waiting for a login.
 openbox_defaults() {
   have openbox || return 0
 
@@ -646,9 +503,6 @@ openbox_defaults() {
     cp "$system" "$menu"
   fi
 
-  # Only an entry that is nothing but a terminal's name. A menu that runs a
-  # terminal with arguments is doing something more particular than "open a
-  # terminal" and is left alone.
   local changed=0 name
   for name in x-terminal-emulator "${OTHER_TERMINALS[@]}"; do
     grep -q "<execute>[[:space:]]*$name[[:space:]]*</execute>" "$menu" || continue
@@ -663,10 +517,6 @@ openbox_defaults() {
   fi
 }
 
-# LXQt keeps two more answers of its own: what sits in the panel, and what a
-# key opens. Both are config files under $HOME, and both are left alone where
-# something has already been said about them — a panel that already has clio
-# in it, a Ctrl+Alt+T that is already bound to something.
 lxqt_defaults() {
   local dir="$HOME/.config/lxqt"
   [ -d "$dir" ] || return 0
@@ -685,8 +535,6 @@ lxqt_defaults() {
 
   local keys="$dir/globalkeyshortcuts.conf"
   if ! grep -q '^\[Control%2BAlt%2BT\.' "$keys" 2>/dev/null; then
-    # Sections here are named for the key, with a number after it that no
-    # other section uses.
     local last
     last="$(sed -n 's/^\[.*\.\([0-9]\{1,\}\)\]$/\1/p' "$keys" 2>/dev/null | sort -n | tail -1)"
     {
@@ -705,9 +553,6 @@ lxqt_defaults() {
   return 0
 }
 
-# The windows come back by themselves after a reboot — but only once something
-# has started the daemon, and on a desktop where clio is never opened by hand
-# nothing does. This is that something.
 install_autostart() {
   local dir="$HOME/.config/autostart"
   mkdir -p "$dir"
@@ -731,8 +576,6 @@ install_desktop() {
   local icons="$HOME/.local/share/icons/hicolor"
   mkdir -p "$apps" "$HOME/.local/bin"
 
-  # Crisp icons at every panel size. Chrome only ever publishes a 16x16 window
-  # icon, so the panel needs its own copies to match the window by WM_CLASS.
   local installed=0
   for size in 256 128 48 32; do
     if [ -f "$ROOT/assets/icon-$size.png" ]; then
@@ -781,15 +624,6 @@ DESKTOP
 case "${1:-run}" in
   run)
     start_daemon
-    # Nothing to open a window on.
-    #
-    # This is clio at boot: an autostart entry that ran before any session
-    # existed, which is a real thing that happened — seventeen minutes before
-    # the X server, on a machine people reach over RDP. The right answer there
-    # is a daemon holding the shells and no browser at all, because a browser
-    # spawned with no display becomes the one every later window is handed to,
-    # and those windows are never seen. The session's own launch opens them
-    # when there is somewhere to open them.
     if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
       echo "clio: no display here, so no window — the daemon is up and holding your shells."
       echo "clio: run clio from a desktop session to put the windows back."
@@ -817,10 +651,6 @@ case "${1:-run}" in
     ;;
 
   install)
-    # Everything, in the order a machine needs it: what clio runs on, what it
-    # needs fetched, where it is found, what opens it — and then a window,
-    # because an install that leaves you looking at a shell prompt has not
-    # shown you the thing it installed.
     ensure_prereqs
     ensure_deps
     install_desktop
@@ -866,18 +696,12 @@ case "${1:-run}" in
 
   status)
     require_node
-    # Which clio this is, when there are two. Only a sandbox says so — one
-    # started with XDG_RUNTIME_DIR, XDG_STATE_HOME and CLIO_DEV=1 pointed
-    # somewhere disposable, the way the tests do it. The one holding your real
-    # shells is the one that needs no explanation.
     if [ "${CLIO_DEV:-}" = "1" ]; then
       echo "instance: sandbox under $STATE_DIR"
     fi
     if pid="$(daemon_pid)"; then
       echo "daemon:   running (pid $pid)"
       echo "address:  $(field url | sed 's/?token=.*//')"
-      # Asked of the daemon rather than read from the state file: the file is
-      # written on a debounce and knows nothing about what is on screen.
       node -e '
         const fs = require("fs");
         const info = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
@@ -953,8 +777,6 @@ case "${1:-run}" in
     tail -n "${2:-50}" "$LOG"
     ;;
 
-  # Not typed by a person: this is x-terminal-emulator being asked for a
-  # terminal that runs one command. See hand_off_command.
   -e | -x | --command | --execute | --)
     hand_off_command "$@"
     ;;

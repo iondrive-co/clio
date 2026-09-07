@@ -1,18 +1,3 @@
-/*
- * Opening a link from a tab.
- *
- * It goes to the desktop's own opener, which puts it in a tab of the browser
- * already on screen — or to a browser chosen by name from the menu, which is
- * the second half of this file. The rest is about what does *not* go there: the
- * text in a terminal is the output of whatever ran last, so a link in it is not
- * something the person clicking wrote, and only the schemes a click could
- * sensibly mean are passed on.
- *
- * Runs a sandbox daemon of its own, with a recorder standing in for xdg-open
- * and a directory of .desktop files standing in for the browsers installed.
- *
- *   node test/links.mjs
- */
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, chmodSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -45,24 +30,15 @@ const ran = join(dir, 'ran.txt');
 const runner = join(dir, 'record-args');
 const apps = join(dir, 'data', 'applications');
 
-// Standing in for xdg-open: writes down what it was asked to open, so the test
-// can look at the argument rather than at a browser appearing on somebody's
-// desktop.
 writeFileSync(opener, `#!/bin/sh\nprintf '%s\\n' "$1" >> ${opened}\n`);
 chmodSync(opener, 0o755);
 
-// And standing in for the browsers themselves, which are .desktop files as far
-// as any of this is concerned. This one writes down every argument, because
-// where a browser's own arguments end and the URL begins is the thing being
-// checked.
 writeFileSync(runner, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${ran}\n`);
 chmodSync(runner, 0o755);
 
 mkdirSync(apps, { recursive: true });
 
 const DESKTOP_FILES = {
-  // An ordinary browser, with an action group after the entry: the Name in
-  // there belongs to a menu item of the browser's own, not to the browser.
   'fakefox.desktop': `[Desktop Entry]
 Type=Application
 Name=Fakefox
@@ -73,15 +49,12 @@ MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;
 Name=Private Window
 Exec=${runner} fakefox --private %u
 `,
-  // Says nothing about http; files itself under WebBrowser, as Firefox does on
-  // the machine this was written on.
   'catbrowser.desktop': `[Desktop Entry]
 Type=Application
 Name=Cat Browser
 Categories=Network;WebBrowser;
 Exec=${runner} catbrowser %U
 `,
-  // Plumbing: the second entry a package ships to own a MIME type.
   'hidden.desktop': `[Desktop Entry]
 Type=Application
 Name=Hidden Browser
@@ -89,22 +62,18 @@ NoDisplay=true
 Exec=${runner} hidden %u
 MimeType=x-scheme-handler/http;
 `,
-  // A browser whose package has gone, leaving its entry behind.
   'ghost.desktop': `[Desktop Entry]
 Type=Application
 Name=Ghost
 Exec=${join(dir, 'not-installed')} %u
 MimeType=x-scheme-handler/http;
 `,
-  // The desktop's own launcher. Following it arrives at the default, which is
-  // where a link goes with nobody choosing anything.
   'indirect.desktop': `[Desktop Entry]
 Type=Application
 Name=Web Browser
 Exec=xdg-open %u
 MimeType=x-scheme-handler/http;
 `,
-  // Opens HTML files. Not a browser, and not a thing to offer a link to.
   'editor.desktop': `[Desktop Entry]
 Type=Application
 Name=Editor
@@ -121,8 +90,6 @@ const env = {
   ...process.env,
   XDG_RUNTIME_DIR: join(dir, 'run'),
   XDG_STATE_HOME: join(dir, 'state'),
-  // The browsers this run can see, and nowhere else to look for more: the real
-  // ones on the machine running the test are not something to assert about.
   XDG_DATA_HOME: join(dir, 'data'),
   XDG_DATA_DIRS: join(dir, 'nothing-here'),
   CLIO_DEV: '1',
@@ -134,12 +101,10 @@ function tearDown() {
   try {
     execFileSync(CLIO, ['stop'], { env, stdio: 'ignore' });
   } catch {
-    /* never started */
   }
   try {
     rmSync(dir, { recursive: true, force: true });
   } catch {
-    /* leave it */
   }
 }
 process.on('exit', tearDown);
@@ -153,12 +118,6 @@ function recorded() {
   return lines(opened);
 }
 
-/**
- * What the opener was handed, once it has had a moment to be handed it.
- *
- * `browser` names one by the id the daemon gave the window, in which case the
- * browser's own recorder is the one that will have written something down.
- */
 async function opensWith(ws, url, timeout = 1500, browser = null, file = opened) {
   const before = lines(file).length;
   ws.send(JSON.stringify({ t: 'openurl', url, ...(browser ? { browser } : {}) }));
@@ -183,8 +142,6 @@ async function main() {
     origin,
   });
   const messages = [];
-  // Kept out of the list above, which is emptied between checks: this one
-  // arrives once, on connect, and is still the answer long after.
   let listed = null;
   ws.on('message', (raw) => {
     const msg = JSON.parse(raw);
@@ -205,8 +162,6 @@ async function main() {
   check('mailto goes too', (await opensWith(ws, 'mailto:someone@example.com')) === 'mailto:someone@example.com');
 
   console.log('\n2. and what does not');
-  // A terminal shows whatever a program printed. None of these are worth the
-  // risk of handing to whatever the desktop has registered for them.
   for (const url of [
     'javascript:alert(1)',
     'file:///etc/passwd',
@@ -218,17 +173,12 @@ async function main() {
     check('  and the window is told why', messages.some((m) => m.t === 'link' && m.ok === false));
   }
 
-  // The shell argument that never was: a URL is parsed before it is passed on,
-  // so there is nothing here for a shell to expand — there is no shell.
   console.log('\n3. nothing reaches a shell');
   const sneaky = 'https://example.com/$(touch /tmp/clio-should-not-exist)';
   const got = await opensWith(ws, sneaky);
   check('a URL with shell syntax in it is passed through verbatim', !!got, got || 'not opened');
   check('and nothing ran', !existsSync('/tmp/clio-should-not-exist'));
 
-  // A menu that offers a browser by name has to be a menu of browsers that are
-  // here. The daemon reads that off the same .desktop files the desktop's own
-  // Open With is built from, so this section gives it a directory of them.
   console.log('\n4. the browsers this machine has');
   const names = (listed?.browsers || []).map((b) => b.name);
   check('a window is told what they are when it connects', !!listed);
@@ -239,8 +189,6 @@ async function main() {
   );
 
   console.log('\n5. opening in one of them by name');
-  // Everything the desktop has been handed up to here. Naming a browser goes
-  // straight to it, and nothing below should add to this.
   const defaultOpens = recorded().length;
   const fakefox = (listed?.browsers || []).find((b) => b.name === 'Fakefox');
   check(
@@ -261,9 +209,6 @@ async function main() {
 
   console.log('\n6. and a browser that is not there');
   messages.length = 0;
-  // The id comes back from the window, which was told it by the daemon — but a
-  // window is a page, and a page saying anything at all is a page that could be
-  // saying something else. Nothing runs but an entry found by looking the id up.
   for (const id of ['ghost.desktop', '../../../bin/sh', 'sh -c id']) {
     check(`${id} opens nothing`, (await opensWith(ws, 'https://example.com/', 700, id, ran)) === null);
   }

@@ -1,15 +1,3 @@
-/*
- * Real-browser UI test.
- *
- * The point of this file is to exercise clio the way a person does: a real
- * Chromium window, real mouse clicks at real coordinates, real key presses, and
- * screenshots that get looked at. The earlier tests drove the app by calling
- * its own functions, which passed happily while the actual window was unusable.
- *
- * It starts a daemon of its own, on its own state, and takes it down again:
- *
- *   node test/ui.mjs
- */
 import { chromium } from 'playwright';
 import {
   readFileSync,
@@ -26,49 +14,17 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import WebSocket from 'ws';
 
-// Most of this file is headless, but one section asks the daemon for a real
-// browser window. That window must never land on the desktop of whoever is
-// running the tests: it steals their focus, and a window a person is clicking
-// on or closing does not behave the way the assertions expect — failures that
-// look for all the world like bugs in clio.
-//
-// Dropped here, before anything can inherit it, and handed back only as a
-// display this file started for itself. See startDisplay below.
 delete process.env.DISPLAY;
 delete process.env.WAYLAND_DISPLAY;
 
-// And a clio of this run's own, from the first line to the last.
-//
-// Section 16 SIGKILLs the daemon and starts it again through the launcher —
-// which is the whole point of that section, and is fatal to whoever's shells
-// the daemon happens to be holding: their processes die with it, and their tabs
-// come back around new ones with the work in them gone. Which daemon that is
-// was, until this line existed, whichever one the caller's environment pointed
-// at. Inheriting a real XDG_RUNTIME_DIR meant a test run reaching into somebody
-// working two windows away, and no amount of care further down this file could
-// have stopped it.
-//
-// So the sandbox is made here, before HANDSHAKE below is worked out from it,
-// and every `bin/clio` this file runs inherits it. Do not make these
-// conditional, and do not add a way to point this at a daemon it did not start.
 const SANDBOX = mkdtempSync(join(tmpdir(), 'clio-ui-'));
 process.env.XDG_RUNTIME_DIR = join(SANDBOX, 'run');
 process.env.XDG_STATE_HOME = join(SANDBOX, 'state');
 mkdirSync(process.env.XDG_RUNTIME_DIR, { recursive: true });
 mkdirSync(process.env.XDG_STATE_HOME, { recursive: true });
-// Says "sandbox" in the window title, and is what the daemon reads to know it
-// is one — the dev badge, the UI watcher, and section 17 below all hang off it.
 process.env.CLIO_DEV = '1';
-// Section 15c runs a stand-in for claude, which writes a transcript where it is
-// told to. Told here, and not left to find the real ~/.claude and file a
-// conversation nobody had in among somebody's own.
 process.env.CLAUDE_CONFIG_DIR = join(SANDBOX, 'claude-config');
 
-// Section 7d clicks a link, and a link that is opened for real opens a browser
-// on somebody's desktop. These stand in for one: a script that writes down the
-// URL it was given in place of xdg-open, and a directory of .desktop files in
-// place of the browsers installed — which is all a browser is to the menu that
-// offers it. Set here, before the daemon inherits any of it.
 const OPENED = join(SANDBOX, 'opened.txt');
 const RAN = join(SANDBOX, 'ran.txt');
 const RUNNER = join(SANDBOX, 'record-args');
@@ -89,8 +45,6 @@ writeFileSync(
   join(SANDBOX, 'data', 'applications', 'catbrowser.desktop'),
   `[Desktop Entry]\nType=Application\nName=Cat Browser\nCategories=Network;WebBrowser;\nExec=${RUNNER} catbrowser %U\n`,
 );
-// Those two and no others: the browsers on the machine running this are not
-// something to write an assertion about.
 process.env.XDG_DATA_HOME = join(SANDBOX, 'data');
 process.env.XDG_DATA_DIRS = join(SANDBOX, 'no-applications-here');
 
@@ -104,12 +58,9 @@ function lines(file) {
   return readFileSync(file, 'utf8').trim().split('\n').filter(Boolean);
 }
 
-/** The links handed to the desktop, and the browsers started by name. */
 const urlsOpened = () => lines(OPENED);
 const browsersRun = () => lines(RAN);
 
-// wmctrl is not involved here, but a browser window with no window manager has
-// nothing to give it a frame or a close button, so keep the same requirement.
 const WINDOW_MANAGERS = ['openbox', 'xfwm4', 'marco', 'icewm', 'fluxbox', 'jwm', 'metacity'];
 
 function installed(command) {
@@ -128,34 +79,22 @@ function stopDisplay() {
     try {
       displayProcesses.pop().kill();
     } catch {
-      /* already gone */
     }
   }
 }
 
-// However this run ends — a passing exit, a failed assertion, a throw — the
-// display goes with it rather than being left on the machine, and so do the
-// daemon and the shells this run started. Both are synchronous on purpose: an
-// exit handler is the last moment anything runs.
 process.on('exit', () => {
   stopDisplay();
   try {
     execSync('./bin/clio stop', { stdio: 'ignore' });
   } catch {
-    /* it never started, or it is already down */
   }
   try {
     rmSync(SANDBOX, { recursive: true, force: true });
   } catch {
-    /* leave it, it is in /tmp */
   }
 });
 
-/**
- * A display of this test's own making, or null if the machine cannot provide
- * one. Null means the window section is skipped: using the display that is
- * already there is not an alternative.
- */
 async function startDisplay() {
   if (!installed('Xvfb')) return null;
   const wm = WINDOW_MANAGERS.find(installed);
@@ -168,7 +107,7 @@ async function startDisplay() {
     const xvfb = spawn('Xvfb', [display, '-screen', '0', '1280x900x24'], { stdio: 'ignore' });
     displayProcesses.push(xvfb);
     await sleep(1500);
-    if (xvfb.exitCode !== null) continue; // that number was taken after all
+    if (xvfb.exitCode !== null) continue;
 
     displayProcesses.push(
       spawn(wm, [], { stdio: 'ignore', env: { ...process.env, DISPLAY: display } }),
@@ -191,8 +130,6 @@ function check(label, ok, detail = '') {
     console.log(`  ✗ ${label}${detail ? `  — ${detail}` : ''}`);
   }
 }
-
-// ---------------------------------------------------------------- contrast
 
 function srgbToLinear(c) {
   const v = c / 255;
@@ -217,14 +154,6 @@ function parseColor(str) {
   return [parts[0], parts[1], parts[2]];
 }
 
-/**
- * Check every visible piece of text on screen, not a hand-picked few.
- *
- * Picking selectors by hand only ever tests the places you already thought
- * about — it is how an accent-blue command label on an accent-blue button
- * shipped completely invisible. Terminal content is excluded: its colours come
- * from the palette check and xterm's own minimumContrastRatio.
- */
 async function sweepContrast(page, label) {
   const samples = await page.evaluate(() => {
     const bgOf = (node) => {
@@ -251,14 +180,13 @@ async function sweepContrast(page, label) {
 
     const out = [];
     for (const el of document.querySelectorAll('body *')) {
-      if (el.closest('.xterm')) continue; // terminal content, covered elsewhere
+      if (el.closest('.xterm')) continue;
       const style = getComputedStyle(el);
       if (style.display === 'none' || style.visibility === 'hidden') continue;
       if (parseFloat(style.opacity) < 0.9) continue;
       const rect = el.getBoundingClientRect();
       if (rect.width === 0 || rect.height === 0) continue;
 
-      // only elements holding their own text, so we do not score containers
       const ownText = [...el.childNodes]
         .filter((n) => n.nodeType === Node.TEXT_NODE)
         .map((n) => n.textContent.trim())
@@ -283,7 +211,6 @@ async function sweepContrast(page, label) {
     const bg = parseColor(s.bg);
     if (!fg || !bg) continue;
     const ratio = contrast(fg, bg);
-    // WCAG: 3:1 counts for large text (>=18.66px, or >=24px at normal weight)
     const large = s.size >= 24 || (s.size >= 18.66 && Number(s.weight) >= 700);
     const floor = large ? 3 : 4.5;
     const ok = ratio >= floor;
@@ -300,17 +227,13 @@ async function sweepContrast(page, label) {
 async function main() {
   mkdirSync(SHOTS, { recursive: true });
   console.log(`sandbox at ${SANDBOX}\n`);
-  // The sandbox has no daemon in it yet; this is the first thing that ever
-  // runs there. Through the launcher, because that is what section 16 does too.
   execSync('./bin/clio start', { stdio: 'ignore' });
   const info = JSON.parse(readFileSync(HANDSHAKE, 'utf8'));
   const origin = `http://127.0.0.1:${info.port}`;
 
-  /** Live view of the daemon's windows and their tabs. */
   const daemonStatus = async () =>
     (await fetch(`${origin}/status?token=${info.token}`, { cache: 'no-store' })).json();
 
-  /** Another window onto a container, for driving one this page cannot touch. */
   const windowOnto = (container) =>
     new Promise((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${info.port}/?token=${info.token}&c=${container}`, {
@@ -323,9 +246,6 @@ async function main() {
       });
     });
 
-  // This run gets a window of its own. Sharing one with whatever the machine
-  // already has open would mean a test that closes tabs closing somebody's
-  // work, and assertions that depend on what was there before it started.
   const testWindow = randomBytes(4).toString('hex');
 
   const browser = await chromium.launch();
@@ -338,18 +258,12 @@ async function main() {
   });
   page.on('pageerror', (err) => consoleErrors.push(String(err)));
 
-  // Nothing should ever ask about leaving: closing a window puts its tabs away
-  // rather than ending them, so there is nothing to warn about. Anything that
-  // does appear is accepted, and counted — a dialog here means the guard came
-  // back, and a browser dialog in the way is how a person ends up closing a
-  // window twice.
   let closeDialogs = 0;
   page.on('dialog', async (dialog) => {
     if (dialog.type() === 'beforeunload') closeDialogs++;
     await dialog.accept();
   });
 
-  // ---- load exactly like the launcher does ------------------------------
   console.log('1. first load');
   await page.goto(`${origin}/?token=${info.token}&c=${testWindow}`);
   await page.waitForTimeout(2500);
@@ -357,8 +271,6 @@ async function main() {
 
   check('no dead screen', await page.locator('#deadscreen').isHidden());
   check('a tab is present', (await page.locator('.tab').count()) >= 1);
-  // The token is scrubbed from the address bar; which window this is must not
-  // be, or a reload comes back showing another window's tabs.
   check(
     'the window keeps its own name in the URL',
     (await page.evaluate(() => location.search)) === `?c=${testWindow}`,
@@ -367,10 +279,9 @@ async function main() {
   check('terminal rendered', await page.locator('.xterm-screen').isVisible());
   check('no console errors', consoleErrors.length === 0, consoleErrors[0]);
 
-  // ---- real mouse click on the + button ---------------------------------
   console.log('\n2. clicking + with a real mouse');
   const before = await page.locator('.tab').count();
-  await page.locator('#newtab').click(); // real pointer event, hit-tested
+  await page.locator('#newtab').click();
   await page.waitForTimeout(1200);
   const after = await page.locator('.tab').count();
   check('+ opened a tab', after === before + 1, `${before} -> ${after}`);
@@ -379,7 +290,6 @@ async function main() {
   await page.waitForTimeout(1200);
   check('+ opened another tab', (await page.locator('.tab').count()) === before + 2);
 
-  // ---- real typing into the shell ---------------------------------------
   console.log('\n3. typing for real');
   await page.locator('.pane.active .xterm-screen').click();
   await page.keyboard.type('echo real-keyboard-$((3*14))');
@@ -389,17 +299,6 @@ async function main() {
   check('typed command produced output', screenText.includes('real-keyboard-42'));
   await page.screenshot({ path: join(SHOTS, '02-after-typing.png') });
 
-  // ---- clicks that land on nothing ---------------------------------------
-  /*
-   * A few pixels of every window belong to no control at all: the padding above
-   * the first row, and the strip down the left of the grid. A mousedown there
-   * has nothing focusable under it, so the browser takes the focus off the
-   * terminal and gives it to nobody — and an unfocused terminal drops every key
-   * in silence, with the same tab open and the cursor still sitting there.
-   *
-   * Which is not a corner: the click a person makes is at the tab they are
-   * already looking at, on the way back from another window, a pixel or two low.
-   */
   console.log('\n3b. a click that lands on nothing keeps the keyboard');
   const deadSpots = await page.evaluate(() => {
     const term = document.querySelector('.pane.active .term').getBoundingClientRect();
@@ -418,8 +317,6 @@ async function main() {
     await page.keyboard.press('Enter');
     await page.waitForTimeout(1200);
     const after = await page.locator('.pane.active').innerText();
-    // Once as the command line it was typed on, once as the output of running
-    // it: a shell that only shows it once never ran anything.
     check(
       `the shell still hears the keyboard after a click ${where}`,
       after.split(marker).length - 1 >= 2,
@@ -427,18 +324,9 @@ async function main() {
     );
   }
 
-  // ---- contrast of every piece of chrome text ---------------------------
   console.log('\n4. contrast (WCAG AA needs 4.5:1 for body text)');
   await sweepContrast(page, 'first load');
 
-  // ---- terminal palette fidelity ----------------------------------------
-  //
-  // Held against xfce4-terminal's defaults rather than a contrast floor. A
-  // floor is the wrong test for terminal content: this palette cannot clear
-  // 4.5:1 on black and is not supposed to, and every earlier attempt to make it
-  // do so desaturated it into something that read as washed out. Chrome text is
-  // still swept for WCAG in step 4 — that part clio controls, and a label it
-  // renders itself has no program to be faithful to.
   console.log('\n5. terminal palette matches xfce4-terminal');
   const XFCE_DEFAULT = {
     background: '#000000',
@@ -468,20 +356,15 @@ async function main() {
     check(`${name} is ${want}`, palette[name] === want, `got ${palette[name]}`);
   }
 
-  // The other half of looking right. Above 1, xterm steps any under-contrast
-  // foreground 10% toward white per pass until it clears, which is what turned
-  // statuslines and fzf highlights into flat white and #aa0000 into #cf6a6a.
   check(
     'no render-time colour adjustment',
     (await page.evaluate(() => panes.get(activeId).term.options.minimumContrastRatio)) === 1,
     'anything above 1 blends colours toward white',
   );
 
-  // ---- reload must not break the window ---------------------------------
   console.log('\n6. reload');
   await page.reload();
   await page.waitForTimeout(2500);
-  // Nothing is lost by leaving, so nothing asks about it.
   check('leaving the page asked nothing', closeDialogs === 0, `${closeDialogs} dialogs`);
   check('still no dead screen after reload', await page.locator('#deadscreen').isHidden());
   const reloadTabs = await page.locator('.tab').count();
@@ -491,7 +374,6 @@ async function main() {
   check('+ still works after reload', (await page.locator('.tab').count()) === reloadTabs + 1);
   await page.screenshot({ path: join(SHOTS, '03-after-reload.png') });
 
-  // ---- right-click menu with a real right button -------------------------
   console.log('\n7. right-click menu');
   await page.locator('.pane.active .xterm-screen').click({ button: 'right' });
   await page.waitForTimeout(400);
@@ -504,9 +386,6 @@ async function main() {
     menuItems.some((t) => t.startsWith('Close Other Tab')),
     menuItems.join(' | '),
   );
-  // The two entries somebody arriving with a mouse and no shortcuts is looking
-  // for. They are the reason the menu exists at all, and a menu without them
-  // reads as a terminal that cannot copy.
   check(
     'menu offers Copy and Paste',
     menuItems.some((t) => t.startsWith('Copy')) && menuItems.some((t) => t.startsWith('Paste')),
@@ -517,28 +396,11 @@ async function main() {
   await page.mouse.click(550, 400);
   await page.waitForTimeout(300);
 
-  // ---- copy and paste, including where the browser will not allow it ------
-  //
-  // The thing this section is here for: navigator.clipboard.readText(), in a
-  // Chrome --app window on a profile that has not already granted
-  // clipboard-read, returns a promise that is never settled either way. The
-  // permission it is waiting on is asked for in a bubble hung off an address
-  // bar an --app window does not have. A Paste that awaited it did nothing at
-  // all — no text, no error, nothing to tell it from an empty clipboard — and
-  // over RDP that is every window, because a display of its own means a
-  // browser profile of its own.
-  //
-  // So everything below runs with the clipboard broken in exactly that way,
-  // and expects copy and paste to work through it anyway.
   console.log('\n7a. copy and paste');
 
-  /** Which tab this section starts on, to come back to after visiting another. */
   const homeTab = await page.locator('.tab.active').getAttribute('data-id');
   const marker = `clip-${randomBytes(3).toString('hex')}`;
   await page.locator('.pane.active .xterm-screen').click();
-  // A click has to land before the terminal has the keyboard, and the Escape
-  // that closed the menu above went to the shell, where it is the start of a
-  // key sequence. The wait is for the first, the Ctrl+C for the second.
   await page.waitForTimeout(400);
   await page.keyboard.press('Control+C');
   await page.waitForTimeout(400);
@@ -546,8 +408,6 @@ async function main() {
   await page.keyboard.press('Enter');
   await page.waitForTimeout(1000);
 
-  // Where that word was printed, in real page coordinates: selecting it means
-  // dragging across those pixels, which is what a person does.
   const markerAt = await page.evaluate((word) => {
     const rows = [...document.querySelectorAll('.pane.active .xterm-rows > div')];
     const row = rows.find((r) => r.textContent.includes(word) && !r.textContent.includes('printf'));
@@ -581,11 +441,6 @@ async function main() {
   await page.keyboard.press('Escape');
   await page.waitForTimeout(200);
 
-  /*
-   * The clipboard a window over RDP actually has: calls that are never
-   * answered rather than calls that fail. A promise that rejects was always
-   * caught; one that never settles is what was not.
-   */
   await page.evaluate(() => {
     Object.defineProperty(navigator, 'clipboard', {
       configurable: true,
@@ -593,11 +448,6 @@ async function main() {
     });
   });
 
-  // The daemon is the only thing every window shares — they are separate
-  // browser processes on separate profiles with nothing else in common — so
-  // this is what makes a copy here a paste in a window somewhere else. Listening
-  // starts before the copy: a window is told what the daemon is holding the
-  // moment it connects, in the same breath as its tab list.
   const listener = await windowOnto(`${testWindow}-clipboard`);
   let relayed = null;
   listener.ws.on('message', (raw) => {
@@ -613,7 +463,6 @@ async function main() {
   listener.ws.close();
   check('and the daemon holds it for every other window', relayed === marker, JSON.stringify(relayed));
 
-  // Into a different tab, which is the point of copying at all.
   await page.locator('.tab').nth(1).click();
   await page.waitForTimeout(500);
   await page.locator('.pane.active .xterm-screen').click();
@@ -630,30 +479,15 @@ async function main() {
   );
   check('and the paste does not sit there waiting on it', pastedIn < 3000, `${pastedIn}ms`);
 
-  // What was pasted is sitting at a prompt unexecuted; the line goes back to
-  // empty before anything else types there.
   await page.keyboard.press('Control+C');
   await page.waitForTimeout(400);
   await page.locator(`.tab[data-id="${homeTab}"]`).click();
   await page.waitForTimeout(400);
   await page.locator('.pane.active .xterm-screen').click({ position: { x: 5, y: 5 } });
   await page.waitForTimeout(600);
-  // Switching tabs focuses the pane on its own a moment after the click that
-  // did it, and a keystroke in flight while that happens is lost. One Enter,
-  // whose loss costs nothing, settles it before anything that is checked below.
   await page.keyboard.press('Enter');
   await page.waitForTimeout(600);
 
-  /*
-   * Ctrl+C copies what is selected, and interrupts when nothing is. Both halves
-   * are checked, because a terminal whose Ctrl+C stopped interrupting would be
-   * a far worse trade than one that could not copy.
-   *
-   * Whether the line survived is the tell, and it is counted rather than looked
-   * for: an interrupted command is still on the screen where it was typed, so
-   * the word appearing once means it was typed and dropped, and twice means it
-   * was typed and run.
-   */
   const seen = (text, word) => (text.match(new RegExp(word, 'g')) || []).length;
 
   const kept = `kept-${randomBytes(3).toString('hex')}`;
@@ -684,20 +518,11 @@ async function main() {
     JSON.stringify(droppedText.slice(-160)),
   );
 
-  // The browser's own clipboard back for every section after this one.
   await page.evaluate(() => {
     delete navigator.clipboard;
   });
 
-  // ---- naming this window -------------------------------------------------
-  //
-  // The name is what the tabs are put away under when the window is closed, and
-  // what the picker lists them by. Given here, before it is needed, it is the
-  // difference between finding a window again and reading a list of
-  // directories.
   console.log('\n7b. naming this window');
-  // On the window, not in a tab's context menu: that menu is about a tab, and
-  // an entry in it that renames the window is picked by mistake.
   const naming = page.locator('#windowname');
 
   await page.locator('.pane.active .xterm-screen').click({ button: 'right' });
@@ -736,11 +561,6 @@ async function main() {
     (await page.locator('#windowname').innerText()) === 'the window under test',
   );
 
-  // ---- the picker --------------------------------------------------------
-  //
-  // The whole point of closing a window being survivable: the tabs are put away
-  // under a name, and a window that opens while any are waiting opens onto the
-  // list of them instead of a blank shell.
   console.log('\n7c. a closed window comes back from the picker');
   const parked = randomBytes(4).toString('hex');
   const away = await windowOnto(parked);
@@ -748,12 +568,8 @@ async function main() {
   await sleep(1200);
   away.ws.send(JSON.stringify({ t: 'renamewindow', name: 'parked for the picker' }));
   await sleep(600);
-  // The goodbye a page sends as it is taken apart, which is what tells the
-  // daemon this window was closed rather than killed: a killed one is put back
-  // by itself and never reaches the picker at all.
   await fetch(`${origin}/gone?c=${parked}&token=${info.token}`, { method: 'POST' });
   away.ws.close();
-  // Past the grace period the daemon allows for a page that is only reloading.
   await sleep(13000);
 
   const beforePick = (await daemonStatus()).containers.find((c) => c.id === parked);
@@ -787,13 +603,6 @@ async function main() {
     (await daemonStatus()).containers.every((c) => c.sessions.length > 0),
   );
 
-  // Leave nothing running: these shells outlive the browser by design, and a
-  // window left waiting here changes what every later test sees.
-  //
-  // The page goes first and the tabs are closed from outside it. Done the other
-  // way round, a window whose last tab closes tries to close itself, and a page
-  // the browser will not close for a script opens a fresh shell rather than sit
-  // there dead — leaving exactly the window this is trying to clear up.
   await chooser.close();
   await sleep(1500);
   const { ws: tidy, tabs: tidyTabs } = await windowOnto(parked);
@@ -805,25 +614,15 @@ async function main() {
     !(await daemonStatus()).containers.some((c) => c.id === parked),
   );
 
-  // ---- a link in a tab ----------------------------------------------------
-  //
-  // A URL on screen here is not a page's link: it is something a program
-  // printed, in the middle of output that gets selected, scrolled past and
-  // clicked on to put the cursor somewhere. So a plain click leaves it alone
-  // and says what would have opened it, Ctrl+click sends it where the desktop
-  // sends links, and the menu offers the browsers this machine has by name.
   console.log('\n7d. a link in a tab');
   await page.locator('.pane.active .xterm-screen').click();
   await page.keyboard.type("printf 'https://example.com/thing\\n'");
   await page.keyboard.press('Enter');
   await page.waitForTimeout(1200);
 
-  // The middle of the URL where it was printed, in real page coordinates: the
-  // link is text in a row, and clicking it means clicking those pixels.
   const findLink = () =>
     page.evaluate(() => {
       const rows = [...document.querySelectorAll('.pane.active .xterm-rows > div')];
-      // Not the line it was typed on — that one has the printf around it.
       const row = rows.find(
         (r) => r.textContent.includes('https://example.com/thing') && !r.textContent.includes('printf'),
       );
@@ -834,8 +633,6 @@ async function main() {
     });
   const linkSpot = await findLink();
   check('the link is on screen', !!linkSpot);
-  // Somewhere harmless if it is not, so that the checks below fail rather than
-  // the file stopping here and taking every section after it with it.
   const at = linkSpot || { x: 900, y: 600 };
 
   await page.mouse.move(at.x, at.y);
@@ -894,8 +691,6 @@ async function main() {
     urlsOpened().join(' | '),
   );
 
-  // A menu summoned anywhere else is the menu it has always been: there is no
-  // link to open, and nothing about links in it.
   await page.mouse.move(at.x, at.y + 60);
   await page.waitForTimeout(300);
   await page.mouse.click(at.x, at.y + 60, { button: 'right' });
@@ -910,18 +705,7 @@ async function main() {
   await page.mouse.click(550, 500);
   await page.waitForTimeout(300);
 
-  // A program that asks for mouse reporting is handed every click in the
-  // window. If it draws links of its own — Claude Code does — it opens the one
-  // that was clicked on top of the one clio opened: two browser tabs, one
-  // click. So a Ctrl+click is the terminal's and is not passed on, the same
-  // bargain a terminal already makes with Shift for selecting text. Ordinary
-  // clicks still go to the program, or nothing with a mouse would work at all.
-  //
-  // `cat -v` stands in for such a program: it asks for nothing itself, but the
-  // printf before it turns reporting on, and it shows every byte it is sent.
   await page.locator('.pane.active .xterm-screen').click();
-  // The Escape that closed the menu above went to the shell, where it is the
-  // start of a key sequence; Ctrl+C puts the line back to a clean prompt.
   await page.keyboard.press('Control+C');
   await page.waitForTimeout(400);
   await page.keyboard.type("printf '\\033[?1000h\\033[?1006h'; cat -v");
@@ -966,14 +750,12 @@ async function main() {
     `${urlsOpened().length - openedBefore} opened`,
   );
 
-  // Put the tab back the way the rest of this file expects it.
   await page.keyboard.press('Control+C');
   await page.waitForTimeout(400);
   await page.keyboard.type("printf '\\033[?1000l\\033[?1006l'");
   await page.keyboard.press('Enter');
   await page.waitForTimeout(600);
 
-  // ---- closing tabs ------------------------------------------------------
   console.log('\n8. closing tabs');
   const n = await page.locator('.tab').count();
   await page.locator('.tab').first().hover();
@@ -981,12 +763,6 @@ async function main() {
   await page.waitForTimeout(1000);
   check('close button removed a tab', (await page.locator('.tab').count()) === n - 1);
 
-  // Closing the tab you are watching lands on the one to its left, not back at
-  // the front of the row. Needs three tabs to tell the two apart: with two, the
-  // left neighbour is the first tab and either rule looks right.
-  //
-  // Every tab this closes is one it opened, so the row is the length the
-  // sections below expect by the time they run.
   await page.locator('.pane.active .xterm-screen').click();
   const wasRow = await page.locator('.tab').count();
   do {
@@ -1015,7 +791,6 @@ async function main() {
   }
   check('the row is back to the length it was', (await page.locator('.tab').count()) === wasRow);
 
-  // ---- real keyboard shortcuts ------------------------------------------
   console.log('\n9. keyboard shortcuts');
   await page.locator('.pane.active .xterm-screen').click();
   const beforeKeys = await page.locator('.tab').count();
@@ -1030,7 +805,6 @@ async function main() {
     await page.locator('.tab').first().evaluate((e) => e.classList.contains('active')),
   );
 
-  // Ctrl+C must reach the shell rather than being eaten as a shortcut
   await page.locator('.pane.active .xterm-screen').click();
   await page.keyboard.type('sleep 30');
   await page.keyboard.press('Enter');
@@ -1045,7 +819,6 @@ async function main() {
     (await page.locator('.pane.active').innerText()).includes('interrupted-ok'),
   );
 
-  // ---- rename by double-clicking, typing for real -------------------------
   console.log('\n10. rename');
   const renameTarget = page.locator('.tab').first();
   await renameTarget.dblclick();
@@ -1060,9 +833,6 @@ async function main() {
     (await page.locator('.tab').first().innerText()).includes('renamed-for-real'),
   );
 
-  // Saving a name takes the input box out of the strip, which leaves the focus
-  // on nobody unless something hands it back. A tab that cannot be typed in
-  // after being given a name is not a tab that was renamed.
   await page.keyboard.type('echo after-the-rename');
   await page.keyboard.press('Enter');
   await page.waitForTimeout(1200);
@@ -1072,7 +842,6 @@ async function main() {
     await page.evaluate(() => document.activeElement?.tagName),
   );
 
-  // it must survive a reload, i.e. it reached the daemon
   await page.reload();
   await page.waitForTimeout(2500);
   check(
@@ -1080,7 +849,6 @@ async function main() {
     (await page.locator('.tab-title').allInnerTexts()).some((t) => t.includes('renamed-for-real')),
   );
 
-  // ---- drag to reorder with a real mouse ---------------------------------
   console.log('\n11. drag to reorder');
   const labelsBefore = await page.locator('.tab-title').allInnerTexts();
   await page.locator('.tab').first().dragTo(page.locator('.tab').nth(2));
@@ -1093,28 +861,11 @@ async function main() {
     JSON.stringify([...labelsBefore].sort()) === JSON.stringify([...labelsAfter].sort()),
   );
 
-  /*
-   * And it lands where it was aimed, which is a different question.
-   *
-   * A drag holds the tab at the point it was pressed, so a row that measures the
-   * pointer is out by however far in that was. Pressed near its right edge and
-   * dragged one place to the left, the cursor is still over the slot the tab came
-   * from — which the row read as "put it back where it was": no marker, no move,
-   * and the tab sprang home. The same gesture to the *right* landed perfectly,
-   * because there the error points the way the tab is already going, and that is
-   * the whole of "sometimes I can drag a tab and sometimes I can't".
-   *
-   * So both edges are pressed here, in both directions. The centre is the one
-   * grab point the old arithmetic got right, and dragTo above uses it, which is
-   * why it passed the entire time this was broken.
-   */
   const oneAlong = async (index, places, hold) => {
     const before = await page.evaluate(() => order.slice());
     const box = await page.locator('.tab').nth(index).boundingBox();
     const from = hold === 'right' ? box.x + box.width - 8 : box.x + 8;
     const y = box.y + box.height / 2;
-    // Walked across, not jumped: a drag is a gesture, and the row answers every
-    // step of it. One long jump would test an arithmetic this never sees.
     await page.mouse.move(from, y);
     await page.mouse.down();
     for (let step = 1; step <= 10; step++) {
@@ -1141,7 +892,6 @@ async function main() {
   await page.screenshot({ path: join(SHOTS, '05-final.png') });
   check('no console errors overall', consoleErrors.length === 0, consoleErrors.join(' | '));
 
-  // ---- font matches xfce4-terminal ---------------------------------------
   console.log('\n12. font');
   const font = await page.evaluate(() => {
     const t = panes.get(activeId).term.options;
@@ -1151,10 +901,6 @@ async function main() {
     `${font.size}px`);
   check('uses Liberation Mono first', font.family.startsWith('"Liberation Mono"'), font.family);
   const cellWidth = await page.evaluate(
-    // The pane on screen, and not whichever one comes first in the document:
-    // every pane but the open one is display:none and measures zero, so an
-    // unscoped selector answers "is the frontmost tab also the oldest one",
-    // which is not what this is asking.
     () =>
       document
         .querySelector('.pane.active .xterm-cursor-layer, .pane.active .xterm-rows')
@@ -1162,16 +908,12 @@ async function main() {
   );
   check('terminal actually laid out at that size', cellWidth > 0);
 
-  // ---- font size arrows ---------------------------------------------------
   console.log('\n12b. font size arrows');
   const termSizes = () => page.evaluate(() =>
     [...panes.values()].map((p) => p.term.options.fontSize));
   const headerSize = () => page.evaluate(() =>
     parseFloat(getComputedStyle(document.querySelector('.tab-title')).fontSize));
 
-  // Terminals are built lazily on first view, so visit a couple of tabs to
-  // materialise them — a size change has to reach every one that exists, not
-  // just the one on screen.
   if ((await page.locator('.tab').count()) >= 2) {
     await page.locator('.tab').nth(0).click();
     await page.waitForTimeout(800);
@@ -1211,7 +953,6 @@ async function main() {
   check('tab headers are untouched', (await headerSize()) === startHeader,
     `${startHeader} -> ${await headerSize()}`);
 
-  // A tab opened afterwards must come up at the chosen size, not the default.
   const sizeNow = (await termSizes())[0];
   await page.locator('#newtab').click();
   await page.waitForTimeout(1400);
@@ -1219,7 +960,6 @@ async function main() {
   check('a tab opened afterwards uses the chosen size',
     withNewTab.every((s) => s === sizeNow), JSON.stringify(withNewTab));
 
-  // the terminal must still work at the new size
   await page.locator('.pane.active .xterm-screen').click();
   await page.keyboard.type('echo resized-and-usable');
   await page.keyboard.press('Enter');
@@ -1234,7 +974,6 @@ async function main() {
   check('the size is remembered across a reload', (await termSizes())[0] === chosen,
     `${chosen} -> ${(await termSizes())[0]}`);
 
-  // bounds
   await page.evaluate(() => setFontSize(999));
   await page.waitForTimeout(300);
   const maxed = (await termSizes())[0];
@@ -1248,7 +987,6 @@ async function main() {
   await page.evaluate((n) => setFontSize(n), chosen);
   await page.waitForTimeout(400);
 
-  // ---- + button sits beside the last tab ---------------------------------
   console.log('\n13. + button placement');
   const geometry = await page.evaluate(() => {
     const tabs = [...document.querySelectorAll('.tab')];
@@ -1267,11 +1005,6 @@ async function main() {
     `+ at ${geometry.plusLeft} of ${geometry.windowWidth}`,
   );
 
-  // ---- the other + : a whole new window ----------------------------------
-  //
-  // Two buttons that both mean "new" and do very different things, so this
-  // checks where it sits and that it looks nothing like the tab one, as well as
-  // what it does.
   console.log('\n13b. the new-window button');
   const winButton = await page.evaluate(() => {
     const button = document.getElementById('newwindow').getBoundingClientRect();
@@ -1290,23 +1023,17 @@ async function main() {
   check('it is drawn, not the same + as the tab button', winButton.drawn && winButton.typed === '+');
   check('it says what it does on hover', winButton.says === 'New window', winButton.says);
 
-  // Everything above is headless; this part is not.
   const display = await startDisplay();
   if (!display) {
     console.log('  - the rest needs Xvfb and a window manager of its own; skipped');
   } else {
     console.log(`  (on ${display}, started for this test and taken down after it)`);
 
-    // Somewhere identifiable, so where the new window starts is provable.
     await page.locator('.pane.active .xterm-screen').click();
     await page.keyboard.type('cd /usr/share');
     await page.keyboard.press('Enter');
-    await page.waitForTimeout(2600); // the daemon polls /proc every 2s
+    await page.waitForTimeout(2600);
 
-    // The daemon is what spawns browser windows, and it aims them at whatever
-    // display the launcher last handed it — which may be the one this test just
-    // disowned. Run the launcher once against ours to point it somewhere safe;
-    // that opens a window of its own, which is closed again below.
     const beforeSeed = (await daemonStatus()).containers.map((c) => c.id);
     execSync('./bin/clio', { stdio: 'ignore', env: { ...process.env, DISPLAY: display } });
     await page.waitForTimeout(1500);
@@ -1317,18 +1044,12 @@ async function main() {
     const known = (await daemonStatus()).containers.map((c) => c.id);
     const tabsHere = await page.locator('.tab').count();
 
-    // What + does depends on whether anything is waiting: with windows put
-    // away it opens onto the picker, so that + is also the way back to one.
-    // With nothing waiting — the case here — it is a shell, straight away.
     const waiting = (await daemonStatus()).containers.filter((c) => c.saved);
     check('nothing is waiting, so + means a new shell', waiting.length === 0,
       JSON.stringify(waiting.map((c) => c.name)));
 
     await page.locator('#newwindow').click();
 
-    // A real browser window has to start and connect, which on a cold profile
-    // is not quick. Reporting it as open before it is there is the failure this
-    // is looking for, so give it room rather than a fixed sleep.
     let opened = null;
     for (let i = 0; i < 80 && !opened?.onScreen; i++) {
       await page.waitForTimeout(500);
@@ -1349,8 +1070,6 @@ async function main() {
       `${tabsHere} tabs before`,
     );
 
-    // Tidy up after ourselves, which is also the last thing worth proving: a
-    // window whose final tab closes goes away rather than sitting there empty.
     if (opened) {
       const { ws, tabs } = await windowOnto(opened.id);
       for (const tab of tabs) ws.send(JSON.stringify({ t: 'close', id: tab.id }));
@@ -1360,8 +1079,6 @@ async function main() {
       check('closing its last tab takes the window with it', !left);
     }
 
-    // And the window the launcher was run for, which was only ever a way to
-    // tell the daemon where the desktop is.
     for (const id of seeded) {
       const { ws, tabs } = await windowOnto(id);
       for (const tab of tabs) ws.send(JSON.stringify({ t: 'close', id: tab.id }));
@@ -1371,16 +1088,10 @@ async function main() {
     stopDisplay();
   }
 
-  // ---- a program's announced title becomes the tab name -------------------
   console.log('\n14. tab takes its name from the running program');
-  // A fresh tab: a title the user set by hand deliberately outranks anything a
-  // program announces, so this must not run on the renamed tab from step 10.
   await page.locator('#newtab').click();
   await page.waitForTimeout(1400);
   await page.locator('.pane.active .xterm-screen').click();
-  // OSC 2 is what Claude Code uses to publish the current job. It has to stay
-  // in the foreground to hold the title, exactly as claude does — a bare printf
-  // is overwritten by bash's PROMPT_COMMAND the instant the next prompt draws.
   await page.keyboard.type(
     String.raw`printf '\033]2;Find ineffective agent uses with xenia MCP\007'; sleep 20`,
   );
@@ -1392,26 +1103,12 @@ async function main() {
   check('and not "sleep"', !activeLabel.startsWith('sleep'), activeLabel);
   await page.screenshot({ path: join(SHOTS, '09-job-title.png') });
 
-  // Once it exits, bash resets the title to user@host:path — which tells us
-  // nothing the directory does not, so the tab must fall back rather than
-  // displaying it.
   await page.keyboard.press('Control+C');
   await page.waitForTimeout(1800);
   const afterShellTitle = await page.locator('.tab.active .tab-title').innerText();
   check('a bare user@host:path title is ignored', !afterShellTitle.includes('@'),
     afterShellTitle);
 
-  // ---- but an ssh tab is named after the host, over the top of that --------
-  //
-  // The case this is really about: a prompt that announces a bare directory —
-  // no user@host: in it, so the rule above does not catch it — and then an ssh
-  // away to somewhere else. The title left behind describes a directory on the
-  // machine you just left, and it would sit in the tab for the whole session.
-  // Which is what it did, until the extension was moved above it.
-  //
-  // The ssh is real and never reaches the network: ProxyCommand hands it a pipe
-  // nothing will ever say hello down, so it waits in the foreground the way a
-  // session does. .invalid is nobody's, by RFC 2606.
   console.log('\n14b. an ssh tab is named after its host');
   const SSH_HOST = 'p-fsn-095.test.invalid';
   await page.locator('#newtab').click();
@@ -1437,13 +1134,11 @@ async function main() {
   const afterSsh = await page.locator('.tab.active .tab-title').innerText();
   check('leaving the host gives the tab its ordinary name back', afterSsh !== SSH_HOST, afterSsh);
 
-  // ---- activity highlighting ---------------------------------------------
   console.log('\n15. activity in a background tab');
   const watched = await page.evaluate(() => activeId);
   await page.locator('#newtab').click();
   await page.waitForTimeout(1200);
 
-  // make the now-background tab produce output
   await page.evaluate((id) => send({ t: 'input', id, data: 'echo background-noise\r' }), watched);
   await page.waitForTimeout(2000);
 
@@ -1463,13 +1158,6 @@ async function main() {
   check('looking at it clears the flag',
     !(await bgTab.evaluate((e) => e.classList.contains('activity'))));
 
-  // ---- a repaint clio asked for is not activity ---------------------------
-  //
-  // A full-screen program draws its whole screen again when the terminal tells
-  // it something: the pane lost the keyboard, the pane got it back, the size
-  // moved. All three are clio talking to it — nobody typed, nothing happened
-  // in that tab — and for a row of agents that is the difference between a red
-  // tab meaning "your turn" and meaning nothing at all.
   console.log('\n15b. repaints clio caused itself');
   await page.locator('#newtab').click();
   await page.waitForTimeout(1200);
@@ -1484,16 +1172,10 @@ async function main() {
     page.locator(`.tab[data-id="${agentTab}"]`).evaluate((e) => e.classList.contains('activity'));
   check('the tab it is running in starts clean', !(await agentFlagged()));
 
-  // Leaving a tab blurs its pane, and the program answers with a repaint.
   await page.locator(`.tab[data-id="${watched}"]`).click();
   await page.waitForTimeout(1500);
   check('moving to another tab does not flag the one just left', !(await agentFlagged()));
 
-  // A window whose socket dropped — a daemon that crashed, a machine that
-  // slept, a screen that locked — comes back to the same tabs and has to say
-  // again which one it is showing. If it does not, the daemon counts every tab
-  // in the window as unwatched, and the redraw that reattaching provokes lands
-  // as unseen activity on the tab the user is looking at.
   await page.locator(`.tab[data-id="${agentTab}"]`).click();
   await page.waitForTimeout(1200);
   await page.evaluate(() => ws.close());
@@ -1504,11 +1186,6 @@ async function main() {
     await page.evaluate(() => ws.readyState === WebSocket.OPEN),
   );
 
-  // The same again as a window that was already open when this was fixed: its
-  // page is the old one, it will not say `focus` on the way back, and it
-  // cannot be made to without being reloaded out from under whoever is using
-  // it. All the daemon gets is the attach, which is only ever sent for the tab
-  // going on screen — so that has to be enough on its own.
   await page.evaluate(() => {
     window.beforeTheFix = window.send;
     window.send = (msg) => {
@@ -1523,9 +1200,6 @@ async function main() {
     window.send = window.beforeTheFix;
   });
 
-  // And the housekeeping an agent does on its own, with nobody near it: modes
-  // put back, a charset reset, its own tab renamed. Bytes out of the pty, and
-  // nothing on the screen to show for any of it.
   await page.locator(`.tab[data-id="${watched}"]`).click();
   await page.waitForTimeout(1200);
   await page.evaluate((id) => send({ t: 'input', id, data: 'q' }), agentTab);
@@ -1536,20 +1210,10 @@ async function main() {
   await page.waitForTimeout(2000);
   check('nor does a tab renaming itself', !(await agentFlagged()));
 
-  // What must still get through: the program itself saying something.
   await page.evaluate((id) => send({ t: 'input', id, data: '\r' }), agentTab);
   await page.waitForTimeout(2000);
   check('real output in a background tab is still flagged', await agentFlagged());
 
-  // ---- an agent that has stopped -----------------------------------------
-  //
-  // The other half of the same argument. Output arriving behind your back is
-  // worth a colour; an agent that has stopped and is waiting to be answered is
-  // worth a label that moves, because it is the one thing in a row of thirty
-  // tabs that somebody is being kept waiting for. Which of the two an agent is
-  // doing is in the terminal title and nowhere else a terminal can see it — see
-  // `activity` in src/agents/claude.js — so what has to be running in the tab
-  // is the stand-in that writes those titles.
   console.log('\n15c. a tab whose agent has stopped');
   await page.locator('#newtab').click();
   await page.waitForTimeout(1200);
@@ -1560,8 +1224,6 @@ async function main() {
   );
   await page.waitForTimeout(3000);
 
-  // And look away. The tab on screen is the one tab that is never flagged: it is
-  // in front of somebody, saying whatever it wants in full.
   await page.locator(`.tab[data-id="${watched}"]`).click();
   await page.waitForTimeout(1200);
 
@@ -1569,8 +1231,6 @@ async function main() {
     page.locator(`.tab[data-id="${stopped}"]`).evaluate((e) => e.classList.contains('waiting'));
   check('an agent that has not worked yet is not flagged', !(await stoppedFlagged()));
 
-  // A turn: the stand-in spins its title for a couple of seconds and then stops,
-  // which is the only moment any of this is about.
   await page.evaluate((id) => send({ t: 'input', id, data: 'a question\r' }), stopped);
   await page.waitForTimeout(9000);
   check('the tab is flagged once its agent stops', await stoppedFlagged());
@@ -1587,12 +1247,9 @@ async function main() {
   await page.waitForTimeout(1500);
   check('looking at the tab is the answer to it', !(await stoppedFlagged()));
 
-  // Not left running: a tab holding an agent is a tab clio would start again by
-  // itself in section 16, which is about something else entirely.
   await page.evaluate((id) => send({ t: 'close', id }), stopped);
   await page.waitForTimeout(800);
 
-  // ---- closing every tab but one -----------------------------------------
   console.log('\n15d. close other tabs');
   while ((await page.locator('.tab').count()) < 3) {
     await page.locator('#newtab').click();
@@ -1607,8 +1264,6 @@ async function main() {
   check('it says how many will go', (await othersItem.innerText()).match(/\(\d+\)/) !== null,
     await othersItem.innerText());
 
-  // Killing several shells at once is not undoable, so it must ask first —
-  // and taking it back must leave every one of them running.
   await othersItem.click();
   await page.waitForTimeout(400);
   const confirmItem = page.locator('#ctxmenu .item.danger');
@@ -1644,27 +1299,19 @@ async function main() {
     (await page.locator('.pane.active').innerText()).includes('survivor-still-alive'),
   );
 
-  // ---- the headline feature, through the real UI --------------------------
   console.log('\n16. surviving a daemon crash');
   await page.locator('.pane.active .xterm-screen').click();
   await page.keyboard.type('cd /etc/apt && sleep 400');
   await page.keyboard.press('Enter');
   await page.waitForTimeout(3000);
 
-  // SIGKILL, so the daemon saves nothing on the way out: the same path as a
-  // power cut rather than a clean stop. The restart goes through the launcher
-  // rather than by hand, because that is the part that has to work and a
-  // substitute for it hid a launcher bug once already.
   process.kill((await daemonStatus()).pid, 'SIGKILL');
   await sleep(1000);
   execSync('./bin/clio start', { stdio: 'ignore' });
-  await page.waitForTimeout(9000); // reconnect backoff
+  await page.waitForTimeout(9000);
 
   check('window reconnected by itself', await page.locator('#deadscreen').isHidden());
 
-  // Nothing to answer and nothing to click: the tab is simply working again. A
-  // pane with no shell behind it swallows everything typed into it, so asking
-  // first is only ever a way to end up with a window full of dead tabs.
   const pane = page.locator('.pane.active');
   check('no banner in the way', (await page.locator('.restore').count()) === 0);
   await pane.locator('.xterm-screen').click();
@@ -1675,8 +1322,6 @@ async function main() {
   check('the tab takes typing straight away', recovered.includes('back-without-being-asked'),
     recovered.slice(-120));
 
-  // What was on screen before the crash is still above it, with a seam so the
-  // dead prompt does not read as though it were still live.
   check('the old output is still there', recovered.includes('survivor-still-alive'));
   check('a seam marks where the new shell begins', recovered.includes('new shell'),
     recovered.slice(-200));
@@ -1697,16 +1342,6 @@ async function main() {
   );
   await page.screenshot({ path: join(SHOTS, '07-after-restore.png') });
 
-  // ---- reloading the daemon brings the window with it ---------------------
-  //
-  // A reload swaps the daemon for one running the code on disk, and the shells
-  // cross untouched — but the page in front of you is still the one that was
-  // served before the swap. A window that reconnects without reloading is a
-  // window running yesterday's UI against today's daemon, which is how "I
-  // reloaded and nothing changed" happens.
-  //
-  // Only ever done to a sandbox. Reloading the daemon somebody's real shells
-  // are in, from a test, is not this file's business.
   const { dev, pid: pidBefore } = await daemonStatus();
   if (!dev) {
     console.log('\n17. reload refreshes the window — skipped (needs a CLIO_DEV=1 sandbox)');
@@ -1724,7 +1359,6 @@ async function main() {
       try {
         pidNow = (await daemonStatus()).pid;
       } catch {
-        /* mid-handover the port is nobody's for a moment */
       }
     }
     check('a daemon running the code on disk took over', pidNow !== pidBefore);
@@ -1752,8 +1386,6 @@ async function main() {
 
   await browser.close();
 
-  // The window this run was using is closed for good, so a later `clio` does
-  // not put a test's leftovers back on somebody's desktop.
   const { ws, tabs } = await windowOnto(testWindow);
   for (const tab of tabs) ws.send(JSON.stringify({ t: 'close', id: tab.id }));
   await new Promise((r) => setTimeout(r, 800));

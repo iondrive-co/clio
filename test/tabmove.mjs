@@ -1,20 +1,3 @@
-/*
- * A tab moves between windows, and out into one of its own.
- *
- * Dragging a tab from one clio window to another is the same trick the whole
- * daemon rests on, turned sideways: the shell was never the window's, so handing
- * a tab over is a change of which page draws it and nothing else. The process is
- * not signalled, not re-opened, and not told. What this file is here to prove is
- * that the *shell* comes across — the same pty, the same history, still typeable
- * — and that the window it left stops being able to reach it.
- *
- * Two halves. The first drives the daemon over a socket, the way a page does,
- * and covers what the rules are. The second is the real thing: two clio windows
- * on a display of this test's own and a real mouse drag between them, because
- * the first half cannot tell whether a person could do any of it.
- *
- *   node test/tabmove.mjs
- */
 import { mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import { execFileSync, execSync, spawn } from 'node:child_process';
 import { join, dirname } from 'node:path';
@@ -24,15 +7,9 @@ import WebSocket from 'ws';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
-// Nothing this test opens may land on the desktop of whoever is running it: a
-// window somebody else is clicking on is a window this test's mouse drags fight
-// with, and the failure looks for all the world like a bug in clio. Dropped
-// before anything can inherit it, and handed back only as a display of our own.
 delete process.env.DISPLAY;
 delete process.env.WAYLAND_DISPLAY;
 
-// And a clio of this run's own. This file starts and stops daemons; pointing one
-// at somebody's real shells would take them down with it.
 const SANDBOX = mkdtempSync(join(tmpdir(), 'clio-tabmove-'));
 process.env.XDG_RUNTIME_DIR = join(SANDBOX, 'run');
 process.env.XDG_STATE_HOME = join(SANDBOX, 'state');
@@ -70,30 +47,25 @@ function installed(command) {
 
 const WINDOW_MANAGERS = ['xfwm4', 'openbox', 'marco', 'icewm', 'fluxbox', 'jwm', 'metacity'];
 
-/** Everything this file spawned, so it kills those and nothing else. */
 const started = [];
 
 process.on('exit', () => {
   try {
     execFileSync(join(ROOT, 'bin', 'clio'), ['stop'], { stdio: 'ignore' });
   } catch {
-    /* never started, or already down */
   }
   while (started.length) {
     try {
       started.pop().kill();
     } catch {
-      /* already gone */
     }
   }
   try {
     rmSync(SANDBOX, { recursive: true, force: true });
   } catch {
-    /* leave it, it is in /tmp */
   }
 });
 
-/** A display of this test's own, or null if the machine cannot provide one. */
 async function startDisplay() {
   if (!installed('Xvfb')) return null;
   const wm = WINDOW_MANAGERS.find(installed);
@@ -106,7 +78,7 @@ async function startDisplay() {
     const xvfb = spawn('Xvfb', [display, '-screen', '0', '1920x1080x24'], { stdio: 'ignore' });
     started.push(xvfb);
     await sleep(1500);
-    if (xvfb.exitCode !== null) continue; // that number was taken after all
+    if (xvfb.exitCode !== null) continue;
 
     started.push(spawn(wm, [], { stdio: 'ignore', env: { ...process.env, DISPLAY: display } }));
     await sleep(1500);
@@ -127,7 +99,6 @@ async function status() {
   return res.json();
 }
 
-/** Which window a tab is in, and where in the row, as the daemon has it. */
 async function whereIs(id) {
   const { containers } = await status();
   for (const container of containers) {
@@ -137,10 +108,6 @@ async function whereIs(id) {
   return null;
 }
 
-/**
- * A page, played by a socket. Everything a window sends, this can send, which is
- * the point: the rules being tested are the daemon's.
- */
 async function connect(container = '') {
   const { port, token } = handshake();
   const ws = new WebSocket(`ws://127.0.0.1:${port}/?token=${token}&c=${container}`, {
@@ -165,7 +132,6 @@ async function connect(container = '') {
   });
   client.send = (msg) => ws.send(JSON.stringify(msg));
   client.ids = () => client.sessions.map((s) => s.id);
-  /** Open a tab and wait for the daemon to name it. */
   client.open = async (cwd = process.env.HOME) => {
     client.created = null;
     client.send({ t: 'create', cwd, cols: 80, rows: 24 });
@@ -178,8 +144,6 @@ async function connect(container = '') {
 console.log(`clio tab-move test — sandbox at ${SANDBOX}`);
 console.log(clio('start').trim());
 await sleep(500);
-
-/* ------------------------------------------- 1. the rules, over the socket */
 
 console.log('\n1. a tab handed from one window to another');
 
@@ -197,14 +161,11 @@ await sleep(500);
 check('two windows, three tabs', alpha.container !== beta.container && !!keep && !!going && !!theirs,
   `${alpha.container}:${alpha.ids()} ${beta.container}:${beta.ids()}`);
 
-// Something in the moving tab's history, written before it goes anywhere. The
-// shell is what is being moved; this is how we know it is the same one.
 alpha.send({ t: 'attach', id: going, cols: 80, rows: 24 });
 await sleep(500);
 alpha.send({ t: 'input', id: going, data: 'echo BEFORE-THE-MOVE\r' });
 await sleep(1200);
 
-// Dropped on the far window's strip, in front of the tab already there.
 beta.send({ t: 'adopttab', id: going, ids: [going, theirs] });
 await sleep(1000);
 
@@ -216,23 +177,17 @@ check('the window it left has only its own tabs', (await whereIs(keep))?.of === 
 check('the window it left was told', !alpha.ids().includes(going), JSON.stringify(alpha.ids()));
 check('the window that took it was told', beta.ids().includes(going), JSON.stringify(beta.ids()));
 
-// The same shell, with everything that was in it: what the new window is handed
-// when it puts the tab on screen is the pty's own history.
 beta.send({ t: 'attach', id: going, cols: 100, rows: 30 });
 await sleep(800);
 check('the scrollback came with it', /BEFORE-THE-MOVE/.test(beta.replayed || ''),
   JSON.stringify((beta.replayed || '').slice(-80)));
 
-// And it is still a shell, taking input from where it is now.
 beta.send({ t: 'input', id: going, data: 'echo AFTER-THE-MOVE\r' });
 await sleep(1500);
 check('the shell is still running and answers the new window',
   /AFTER-THE-MOVE/.test(beta.output.get(going) || ''),
   JSON.stringify((beta.output.get(going) || '').slice(-80)));
 
-// The window it left must not be able to reach it any more — that is the whole
-// of what a container is for, and a stale id in a page that has not caught up
-// yet is the ordinary way it gets tested.
 alpha.send({ t: 'input', id: going, data: 'echo FROM-THE-OLD-WINDOW\r' });
 alpha.send({ t: 'close', id: going });
 await sleep(1500);
@@ -251,9 +206,6 @@ check('a tab that does not exist, and one already here, change nothing',
 
 console.log('\n3. the last tab of a window, handed over');
 
-// The window is left with nothing in it. A page would close itself; the window
-// as far as the daemon is concerned simply stops existing, rather than being
-// kept as something to open again — there is nothing in it to keep.
 beta.send({ t: 'adopttab', id: keep, ids: [keep, going, theirs] });
 await sleep(1000);
 const containers = (await status()).containers.map((c) => c.id);
@@ -264,17 +216,12 @@ check('in the order they were dropped in',
   (await whereIs(keep))?.index === 0 && (await whereIs(going))?.index === 1,
   JSON.stringify(await whereIs(going)));
 
-// Written down, not just remembered: a tab moved between windows has to still
-// be in its new one after a reboot, which is the whole promise clio makes about
-// everything else.
 await sleep(1200);
 const onDisk = savedState().sessions.find((s) => s.id === going);
 check('the move is on disk', onDisk?.container === beta.container, JSON.stringify(onDisk?.container));
 
 console.log('\n4. a tab pulled out into a window of its own');
 
-// Without a display there is no browser to put a window on, and poptab is a
-// window being opened. The rule that does not need one is the refusal.
 const lonely = await connect();
 await sleep(400);
 const only = await lonely.open();
@@ -284,16 +231,11 @@ await sleep(1200);
 check('the only tab in a window stays where it is', (await whereIs(only))?.container === lonely.container,
   JSON.stringify(await whereIs(only)));
 
-// End it rather than just dropping the socket. A window's worth of tabs with
-// nobody looking at them is a window that was closed, and the section below
-// wants a plain window rather than one that opens onto the picker offering it.
 lonely.send({ t: 'close', id: only });
 await sleep(800);
 lonely.ws.close();
 alpha.ws.close();
 await sleep(500);
-
-/* ------------------------------------------------- 5. a real mouse, real windows */
 
 const display = await startDisplay();
 const canDrag = display && installed('wmctrl') && installed('xdotool');
@@ -309,9 +251,6 @@ console.log(`\n5. two windows on display ${display}, dragged with a real mouse`)
 const xdotool = (...args) => execFileSync('xdotool', args, { encoding: 'utf8', env: process.env });
 const wmctrl = (...args) => execFileSync('wmctrl', args, { encoding: 'utf8', env: process.env });
 const windowCount = () => wmctrl('-l').trim().split('\n').filter(Boolean).length;
-// `wmctrl -l` is id, desktop, client machine, then the title — and a named
-// window's title is exactly its name, so the title is compared whole rather
-// than searched. A substring would find `left` in this test's own window.
 const windowNamed = (name) =>
   wmctrl('-l')
     .trim()
@@ -319,26 +258,10 @@ const windowNamed = (name) =>
     .find((line) => line.split(/\s+/).slice(3).join(' ') === name)
     ?.split(/\s+/)[0] || null;
 
-/*
- * Both windows are put where this test wants them, at a size it chose.
- *
- * Chrome honours --window-position for the first window of its browser process
- * and ignores it for every one after, so two windows asked for in a row arrive
- * exactly on top of each other — which is fine for a person, who moves one, and
- * useless here: a drag between two windows in the same place proves nothing.
- * Side by side with room underneath, so "outside every window" is a real place.
- */
 const PLACE = {
   left: { x: 0, y: 0, w: 700, h: 450 },
   right: { x: 760, y: 0, w: 700, h: 450 },
 };
-/*
- * Where a tab is let go with no window under it: below both of them, and far
- * enough from the bottom edge that the window it turns into fits on the screen.
- * A drop too near the edge is placed as well as it can be rather than where it
- * was asked for — the desktop keeps a window on itself — and this is about
- * whether the right place was asked for at all.
- */
 const DESKTOP = { x: 900, y: 560 };
 
 function place(name, at) {
@@ -348,14 +271,6 @@ function place(name, at) {
   return true;
 }
 
-/**
- * Which windows have a page connected to them, waiting for one to arrive.
- *
- * Worth waiting for rather than assuming: everything below is coordinates on a
- * window, and a probe that connects before the real page has means the daemon
- * hands it a container of its own — an empty one, with no window anywhere, that
- * answers every question in this section plausibly and wrongly.
- */
 async function onScreen(count) {
   for (let i = 0; i < 60; i++) {
     const shown = (await status()).containers.filter((c) => c.onScreen);
@@ -365,30 +280,14 @@ async function onScreen(count) {
   return [];
 }
 
-// Tidy: this section wants two plain windows and nothing else, and the half
-// above has left a window's worth of tabs with a socket watching them.
 for (const id of beta.ids()) beta.send({ t: 'close', id });
 await sleep(1500);
 beta.ws.close();
 await sleep(1500);
 
-/*
- * Nothing may be left over by the time a window is asked for.
- *
- * Two things go wrong otherwise, and both look like something else. A window
- * that opens while a closed one is waiting opens onto the picker — and a page on
- * the picker has no tab row and does not even say where it is, so every
- * coordinate below would be measuring an overlay. And a container still being
- * watched by a socket from up there counts as a window on screen, which is how a
- * probe ends up attached to a set of tabs that no window is showing: every
- * question answered plausibly, about the wrong thing.
- */
 const over = (await status()).containers;
 check('nothing is left over from the sections above', !over.length, JSON.stringify(over));
 
-// The daemon has to be told about the display: it was started from a shell that
-// had none, which is the position a daemon launched by a desktop is in once the
-// session it was launched from goes away.
 clio();
 const one = await onScreen(1);
 check('one window on screen', one.length === 1,
@@ -413,16 +312,8 @@ check('watching the second one', right.container !== left.container && !!right.c
 right.send({ t: 'renamewindow', name: 'right' });
 await sleep(1500);
 
-/*
- * Short names for the tabs, so where they are is arithmetic rather than a guess.
- *
- * A tab is as wide as its label up to a limit, and these are named after a
- * directory — the path this test happens to be run from, which can be anything
- * at all. Renamed, every one of them comes to the same minimum width, and the
- * nth tab is n of those along from the left edge of the page.
- */
-const TABBAR_HEIGHT = 32; // --tabbar-height in src/ui/style.css
-const TAB_WIDTH = 90; // .tab's min-width, which is what a two-letter label comes to
+const TABBAR_HEIGHT = 32;
+const TAB_WIDTH = 90;
 left.sessions.forEach((s, i) => left.send({ t: 'rename', id: s.id, title: `L${i + 1}` }));
 right.sessions.forEach((s, i) => right.send({ t: 'rename', id: s.id, title: `R${i + 1}` }));
 await sleep(1000);
@@ -431,17 +322,6 @@ const placedLeft = place('left', PLACE.left);
 const placedRight = place('right', PLACE.right);
 check('both windows can be found by name and moved', placedLeft && placedRight, wmctrl('-l'));
 
-/*
- * Where a window's page actually is, which is what every coordinate below is
- * measured from.
- *
- * Not from the window manager: `wmctrl -lG` reports the frame, and the offset
- * between the frame and the page inside it belongs to whatever theme is
- * running. The page itself knows — window.screenX/Y is the top left of the
- * viewport — and tells the daemon, which writes it down. So this reads it out of
- * the daemon's own state file, and waits until what is written is where the
- * window was just put: that wait is also how this knows the move landed.
- */
 async function viewport(containerId, frame) {
   for (let i = 0; i < 40; i++) {
     const geometry = savedState().containers.find((c) => c.id === containerId)?.geometry;
@@ -453,7 +333,6 @@ async function viewport(containerId, frame) {
   return null;
 }
 
-/** The middle of the nth tab in a window whose page is at `geometry`. */
 function tabAt(geometry, index, fraction = 0.5) {
   if (!geometry) return null;
   return {
@@ -462,14 +341,6 @@ function tabAt(geometry, index, fraction = 0.5) {
   };
 }
 
-/**
- * A real drag: press, walk the pointer across in steps, let go.
- *
- * `held` runs with the button still down and the pointer at its destination,
- * which is the only moment the page can be caught showing what a drop would do.
- * `abandon` presses Escape there instead of letting go, the way a person changes
- * their mind halfway.
- */
 function drag(from, to, { held = null, abandon = false } = {}) {
   xdotool('mousemove', String(from.x), String(from.y), 'sleep', '0.4');
   xdotool('mousedown', '1', 'sleep', '0.4');
@@ -495,12 +366,9 @@ function shot(name) {
     execFileSync('import', ['-window', 'root', join(SHOTS, name)], { env: process.env });
     console.log(`  · screenshot: ${join(SHOTS, name)}`);
   } catch {
-    /* a picture is a nicety */
   }
 }
 
-// Both pages say where they are, and it is where they were put — without which
-// every coordinate below is pointing at the wrong window, or at both.
 const leftAt = await viewport(left.container, PLACE.left);
 const rightAt = await viewport(right.container, PLACE.right);
 const apart = !!leftAt && !!rightAt && rightAt.x - leftAt.x > 300;
@@ -510,17 +378,10 @@ check('the two windows are side by side, and each says where it is', apart,
 if (apart) {
   shot('tabmove-01-two-windows.png');
 
-  // The second of the left window's two tabs, onto the right half of the only
-  // tab in the other window — so it lands after it, which is a place a drop has
-  // to be able to choose.
   const grabbed = tabAt(leftAt, 1);
   const onto = tabAt(rightAt, 0, 0.85);
   xdotool('windowactivate', windowNamed('left') || '0');
   await sleep(800);
-  // The picture is taken with the tab still in the air, over the row that is
-  // about to take it: the mark showing where it would land is the only thing
-  // telling the person this is going to work, and it is on screen for exactly
-  // as long as the button is down.
   drag(grabbed, onto, { held: () => shot('tabmove-02-held-over-another-window.png') });
   await sleep(2500);
 
@@ -533,8 +394,6 @@ if (apart) {
   check('both windows are still on screen', windowCount() === 2, wmctrl('-l'));
   shot('tabmove-03-moved-between-windows.png');
 
-  /* ----------------------------- 6. and out onto the desktop, into its own */
-
   console.log('\n6. a tab dragged out where no window is');
 
   await sleep(1500);
@@ -542,16 +401,6 @@ if (apart) {
   xdotool('windowactivate', windowNamed('right') || '0');
   await sleep(800);
 
-  /*
-   * Changing your mind: the same drag, abandoned with Escape where it would
-   * otherwise have become a window.
-   *
-   * Worth a test of its own because the page has so little to go on. The browser
-   * never delivers the keypress that cancelled the drag, and what it does say —
-   * dropEffect — describes the last thing the pointer crossed rather than
-   * whether anything took the tab. If this ever stops working, Escape becomes a
-   * way of getting a window you were trying not to make.
-   */
   drag(pullOut, DESKTOP, { abandon: true });
   await sleep(3000);
   const afterEscape = await whereIs(dragMe);
@@ -560,8 +409,6 @@ if (apart) {
     `${JSON.stringify(afterEscape)} :: ${wmctrl('-l')}`);
 
   drag(pullOut, DESKTOP);
-  // A browser has to start and a window has to come up, which is slower than
-  // anything else here by an order of magnitude.
   await sleep(14000);
 
   const popped = await whereIs(dragMe);
@@ -570,9 +417,6 @@ if (apart) {
     JSON.stringify(popped));
   check('and that window is on screen', windowCount() === 3, wmctrl('-l'));
 
-  // Where it came up. A window pulled out of another should arrive under the
-  // cursor that pulled it rather than wherever the browser felt like — the
-  // pointer is the only thing the person doing it was aiming with.
   const pulledTo = popped ? await viewport(popped.container, { x: DESKTOP.x - 60, y: DESKTOP.y - 16 }) : null;
   check('it came up where the tab was let go', !!pulledTo,
     `${JSON.stringify(savedState().containers.map((c) => c.geometry))} for a drop at ${DESKTOP.x},${DESKTOP.y}`);

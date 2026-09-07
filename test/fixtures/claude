@@ -1,34 +1,4 @@
 #!/usr/bin/env node
-/*
- * A stand-in for Claude Code, for the agent tests.
- *
- * It does the three things the adapter reads: it writes a transcript into
- * $CLAUDE_CONFIG_DIR/projects/<slug>/<session id>.jsonl, it keeps a child
- * process carrying CLAUDE_CODE_SESSION_ID the way the real one's MCP servers do,
- * and it sits there in the foreground of the tab the way an agent does. It says
- * what it did on stdout, so the test can tell a conversation resumed from one
- * started fresh by reading the scrollback, which is what a person would be
- * doing too.
- *
- * `/clear` typed at it starts a new conversation in the same process, which is
- * the one case where the conversation in a tab changes without the process
- * changing with it.
- *
- * `--resume` with no id is the other awkward one: Claude Code opens its own
- * list and a person picks a conversation out of it, so nothing on the command
- * line says which, and the id the children are holding is one allocated before
- * the choice was made and then abandoned. The stand-in does the same — it holds
- * an id that never becomes a file, and opens whatever $CLAUDE_TEST_PICK names,
- * which is this test's way of pressing Enter on a line in that list.
- *
- * Both of them are found the way the real one is found: by name. Every
- * conversation here writes an `ai-title` into its transcript and puts the same
- * name in the terminal title, which is what Claude Code does.
- *
- * Started through a node shebang on purpose: that is how an npm-installed
- * claude appears in /proc — `node .../claude` rather than a program of its own
- * — so the adapter's match is being tested and not just a filename.
- */
 import { mkdirSync, appendFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -41,19 +11,6 @@ const resuming = at !== -1 ? argv[at + 1] : null;
 const dir = join(process.env.CLAUDE_CONFIG_DIR, 'projects', process.cwd().replace(/[^a-zA-Z0-9]/g, '-'));
 mkdirSync(dir, { recursive: true });
 
-/*
- * A child holding the id, which is what an MCP server is.
- *
- * The real one generates its session id after exec, so its own environment
- * cannot hold it — but everything it starts afterwards inherits one that does,
- * and that is how the adapter proves which conversation is in a tab instead of
- * guessing it from the newest file in a shared directory. So the stand-in keeps
- * one too, and starts it again whenever the conversation changes.
- *
- * It watches for its parent going and lets go when it does: a leftover process
- * holding the pty of a tab the test has finished with is how a sandbox stops
- * being one.
- */
 let holder = null;
 function hold(id) {
   holder?.kill();
@@ -67,7 +24,6 @@ function hold(id) {
   );
 }
 
-/** What a conversation is called, which is the same in the file and in the tab. */
 const nameOf = (id) => `conversation ${id.slice(0, 8)}`;
 
 let sessionId = null;
@@ -85,11 +41,6 @@ function open(id, what, { holding = id } = {}) {
   announce('✳');
 }
 
-/*
- * Which conversation a person picked out of the list. $CLAUDE_TEST_PICK names
- * it; without one, the oldest in the directory, so that "the newest file" —
- * which is what a guess takes — is never the answer by accident.
- */
 function chosen() {
   const asked = process.env.CLAUDE_TEST_PICK;
   if (asked) return asked;
@@ -100,20 +51,8 @@ function chosen() {
   return files.length ? files[0].id : randomUUID();
 }
 
-// `--resume` with an id is clio bringing a tab back; `--resume` on its own is
-// somebody at the keyboard choosing from the list.
 const picking = !resuming && argv.some((arg) => arg === '--resume' || arg === '-r');
 
-/*
- * Titles, the way Claude Code writes them: a spinner into the terminal title
- * while it is working, and a still glyph the moment it stops. That is the only
- * place a terminal can see which of the two is going on — see `activity` in
- * src/agents/claude.js — so a stand-in that never writes one leaves the tab
- * flash with nothing to read.
- *
- * The work is deliberately longer than clio's two-second proc poll, so that a
- * poll cannot miss the spinner and mistake a turn for a tab that never worked.
- */
 const SPINNER = ['◐', '◑'];
 const FRAME_MS = 300;
 const WORK_MS = 2400;
@@ -128,16 +67,11 @@ function stop() {
 }
 
 if (picking) {
-  // The id the children hold is the one from before the choice, and nothing
-  // ever writes a file under it — see the header.
   open(chosen(), 'PICKED', { holding: randomUUID() });
 } else {
   open(resuming || randomUUID(), resuming ? 'RESUMED' : 'STARTED');
 }
 
-// Anything typed at it is a turn, except the one thing that is a change of
-// conversation. Not raw mode, on purpose: Ctrl-C has to go on killing this the
-// way it kills an agent, which is what test 5 is about.
 process.stdin.on('data', (data) => {
   if (String(data).includes('/clear')) {
     open(randomUUID(), 'STARTED');
@@ -149,5 +83,4 @@ process.stdin.on('data', (data) => {
   setTimeout(stop, WORK_MS);
 });
 
-// Hold the terminal, as an agent waiting for you would.
 setInterval(() => {}, 1 << 30);

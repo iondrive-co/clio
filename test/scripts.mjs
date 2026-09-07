@@ -1,18 +1,3 @@
-/*
- * The thing somebody set running and left running.
- *
- * The other two extensions bring back something that was already on disk or was
- * only ever a connection; this one restarts a program, which is a different
- * promise and needs holding to a narrower line. So this drives both halves of
- * it: a script that was in the foreground of a tab comes back, with the
- * arguments it had, in the directory it was in — and the several things that
- * look like scripts and are not stay exactly where the seam leaves them.
- *
- * Runs a clio of its own, on its own state, in a directory of its own: nothing
- * here touches the daemon anybody is working in.
- *
- *   node test/scripts.mjs
- */
 import {
   mkdirSync,
   mkdtempSync,
@@ -33,7 +18,6 @@ import { scriptIn } from '../src/scripts/index.js';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** Everything the sandbox daemon says, kept for when something goes wrong. */
 const log = [];
 
 let passed = 0;
@@ -49,8 +33,6 @@ function check(label, ok, detail = '') {
   }
 }
 
-/* ---------------------------------------------------------------- a sandbox */
-
 const TMP = mkdtempSync(join(tmpdir(), 'clio-scripts-'));
 const RUN = join(TMP, 'run');
 const STATE = join(TMP, 'state');
@@ -62,14 +44,11 @@ const SCRIPT = join(WORK, 'loop.sh');
 
 const env = {
   ...process.env,
-  // Nothing here asks for a window, and nothing here may put one on somebody's
-  // desktop by accident either.
   DISPLAY: undefined,
   WAYLAND_DISPLAY: undefined,
   HOME,
   XDG_RUNTIME_DIR: RUN,
   XDG_STATE_HOME: STATE,
-  // Says "sandbox" in the window title, and keeps this away from the real one.
   CLIO_DEV: '1',
   CLIO_NO_UI_WATCH: '1',
 };
@@ -78,7 +57,6 @@ const HANDSHAKE = join(RUN, 'clio', 'daemon.json');
 
 let daemon = null;
 
-/** A daemon of this test's own, and proof that it is listening. */
 async function startDaemon() {
   daemon = spawn(process.execPath, [join(ROOT, 'src', 'daemon', 'index.js')], {
     cwd: ROOT,
@@ -95,7 +73,6 @@ async function startDaemon() {
         const info = JSON.parse(readFileSync(HANDSHAKE, 'utf8'));
         if (info.pid === daemon.pid) return info;
       } catch {
-        /* half-written; look again */
       }
     }
     await sleep(100);
@@ -103,7 +80,6 @@ async function startDaemon() {
   throw new Error(`daemon did not start:\n${log.join('')}`);
 }
 
-/** A stand-in for a window. */
 class Client {
   constructor(info, container) {
     this.info = info;
@@ -169,8 +145,6 @@ function savedExt(id) {
   return savedState().sessions.find((s) => s.id === id)?.ext ?? null;
 }
 
-/* ------------------------------------------------------- what counts as one */
-
 function readsAFile() {
   console.log('1. what is a script and what only looks like one');
 
@@ -181,7 +155,6 @@ function readsAFile() {
     [['./deploy.sh'], './deploy.sh'],
     [['/home/me/bin/watch'], '/home/me/bin/watch'],
     [['node', '--', 'server.js'], 'server.js'],
-    // Found on PATH, but still a file somebody wrote and put there.
     [['agent.sh'], 'agent.sh'],
   ];
   for (const [argv, file] of yes) {
@@ -190,17 +163,12 @@ function readsAFile() {
   }
 
   const no = [
-    // A program written in python is not a script for these purposes: rerunning
-    // somebody's playbook is exactly what this must not do.
     ['ansible-playbook', 'site.yml'],
-    // An interactive shell, and a REPL. There is nothing in either to bring back.
     ['bash'],
     ['python3'],
-    // The quoting is the argument's whole meaning, and there is no file to name.
     ['bash', '-c', 'while true; do date; sleep 5; done'],
     ['python3', '-m', 'http.server'],
     ['perl', '-e', 'print 1'],
-    // Programs on the PATH, which is most of what runs in a terminal.
     ['make', 'install'],
     ['git', 'log'],
   ];
@@ -208,8 +176,6 @@ function readsAFile() {
     check(`${argv.join(' ')}  →  not a script`, scriptIn(argv) === null, String(scriptIn(argv)));
   }
 }
-
-/* ------------------------------------------------------------------- the test */
 
 async function main() {
   readsAFile();
@@ -257,7 +223,6 @@ async function main() {
     JSON.stringify(record?.state?.argv),
   );
 
-  // ---- the part that matters ---------------------------------------------
   console.log('\n4. the daemon is killed outright, and started again');
   client.close();
   daemon.kill('SIGKILL');
@@ -277,9 +242,6 @@ async function main() {
     JSON.stringify(replayed.slice(-300)),
   );
 
-  // The script itself has to answer, or all of the above is clio talking to
-  // itself. A different pid is the whole of the proof that this is a new run
-  // and not the old one having somehow survived its terminal.
   const again = await (async () => {
     const deadline = Date.now() + 20000;
     while (Date.now() < deadline) {
@@ -293,8 +255,6 @@ async function main() {
   check('and it is running again', !!again, JSON.stringify(since.slice(-300)));
   check('as a new run, not the old one', !!again && again[1] !== first?.[1], `${again?.[1]} vs ${first?.[1]}`);
   check('with the argument it had', again?.[2] === 'nightly', again?.[2]);
-  // Typed into the shell rather than exec'd around it, so the terminal echoes
-  // it: what happened here is legible to whoever opens the tab.
   check(
     'the command was typed into the new shell, in view',
     since.includes(`bash ${SCRIPT} nightly`),
@@ -311,15 +271,8 @@ async function main() {
   );
 
   console.log('\n6. stopping it is stopping it');
-  // A record that outlived the process would be a tab that restarts something
-  // somebody deliberately stopped, on every reboot, forever.
-  // Wait for the proc poll to have seen the restarted script at least once
-  // first. Until it has, the tab holds a record that names no process yet and
-  // is being kept on the strength of having just been resumed — ADOPT_GRACE_MS
-  // in src/extensions — and a Ctrl-C before that is a tab stopped before it was
-  // ever seen to start, which is not what anybody means by stopping it.
   await sleep(4000);
-  back.send({ t: 'input', id: scriptTab, data: '\x03' }); // Ctrl-C
+  back.send({ t: 'input', id: scriptTab, data: '\x03' });
   await sleep(5000);
   check('the tab stops claiming a script once it has gone',
     back.tab(scriptTab)?.ext === null, JSON.stringify(back.tab(scriptTab)?.ext));
@@ -344,12 +297,10 @@ function cleanup() {
   try {
     daemon?.kill('SIGKILL');
   } catch {
-    /* already gone */
   }
   try {
     rmSync(TMP, { recursive: true, force: true });
   } catch {
-    /* leave it, it is in /tmp */
   }
 }
 

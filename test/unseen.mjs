@@ -1,21 +1,3 @@
-/*
- * A tab goes red when there is something in it to read.
- *
- * Which is a question about the screen, not about the bytes, and the difference
- * is a real morning: Claude Code checks for a new version every thirty minutes,
- * paints the answer into its footer while it waits for the network, and then
- * paints the footer back the way it was. Two frames of perfectly visible text,
- * a net change of nothing, and every idle agent on the desktop lighting up
- * twice an hour with nothing in it to look at.
- *
- * So this file is about both halves of that. First the screen model on its own
- * — fed the real 249 bytes off a real tab, and made to answer the question the
- * byte filter cannot. Then the daemon, with a tab painting the same thing at a
- * moment when nobody is watching it, which is the only moment any of this is
- * about.
- *
- *   node test/unseen.mjs
- */
 import { mkdirSync, mkdtempSync, readFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -30,7 +12,6 @@ import { Session } from '../src/daemon/session.js';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** Everything the sandbox daemon says, kept for when something goes wrong. */
 const log = [];
 
 let passed = 0;
@@ -46,13 +27,6 @@ function check(label, ok, detail = '') {
   }
 }
 
-/* --------------------------------------------------- what an agent really wrote */
-
-/*
- * Off tab c09b5f91d31b on 21 August, an idle Claude Code in ~/clio, 249 bytes
- * a second or so apart. The footer is written at column 190 of row 40, and then
- * written over with spaces and the token count it displaced.
- */
 const CHECKING =
   '\x1b[?25l\x1b[H\r\x1b[189C\x1b[39B\x1b[38;2;153;153;153mcurrent: 2.1.238 · latest: 2.1.238' +
   '\x1b[225GChecking for update\x1b[39m\x1b[44;1H\x1b[42;3H\x1b[?25h';
@@ -60,13 +34,9 @@ const CHECKED =
   '\x1b[?25l\x1b[H\r\x1b[189C\x1b[39B                                  \x1b[225G       ' +
   '\x1b[38;2;153;153;153m283539 token\x1b[39m\x1b[44;1H\x1b[42;3H\x1b[?25h';
 
-/* ------------------------------------------------------------- the screen alone */
-
 function screenTests() {
   console.log('1. the screen, on its own');
 
-  // The footer as it stands before the check: the token count where the wipe
-  // will put it back, and nothing else on that row.
   const screen = new Screen({ cols: 236, rows: 44 });
   screen.write('\x1b[?25l\x1b[H\r\x1b[231C\x1b[39B\x1b[38;2;153;153;153m283539 token\x1b[39m\x1b[?25h');
   const seen = screen.digest();
@@ -80,10 +50,6 @@ function screenTests() {
   check('the pair of them put it back the way it was', screen.digest() === seen);
   check('and the screen is sure of itself throughout', screen.sure);
 
-  // The spinner an agent draws while it works: a frame every half second, in
-  // the same place, and one whole turn of it is no change at all. Fed in
-  // kernel-sized bites so that a sequence split across two reads is part of
-  // what is being tested.
   const frame = (glyph) =>
     `\x1b]0;${glyph} Working on the thing\x07\x1b[?25l\x1b[H\r\x1b[2C\x1b[38B` +
     `\x1b[38;2;153;153;153m${glyph} esc to interrupt\x1b[39m\x1b[44;1H\x1b[?25h`;
@@ -97,16 +63,12 @@ function screenTests() {
   check('a hundred and sixty frames of a spinner are understood', spinning.sure);
   check('and land back on the screen they started from', spinning.digest() === still);
 
-  // Something to actually read.
   const said = new Screen({ cols: 80, rows: 24 });
   said.write('\x1b[H\x1b[2J$ ');
   const prompt = said.digest();
   said.write('\x1b[12;1Hthe build failed\r\n');
   check('a line nobody has read is a changed screen', said.digest() !== prompt);
 
-  // Cursor movement, colour, mouse reporting, a title: bytes with nothing in
-  // them. The old filter knows this too; the point is that the new answer does
-  // not disagree with it.
   const quiet = new Screen({ cols: 80, rows: 24 });
   quiet.write('\x1b[H\x1b[2Jhello');
   const settled = quiet.digest();
@@ -114,7 +76,6 @@ function screenTests() {
   check('mouse modes, a charset, a title and a cursor move change nothing', quiet.digest() === settled);
   check('which is what drawsSomething says as well', !drawsSomething('\x1b(B\x0f\x1b[?1000h\x1b]0;a title\x07'));
 
-  // A sequence arriving in two pieces must not be read as two sequences.
   const split = new Screen({ cols: 80, rows: 24 });
   split.write('\x1b[H\x1b[2J\x1b[5;10Hxy');
   const whole = split.digest();
@@ -123,22 +84,18 @@ function screenTests() {
   again.write('0Hxy');
   check('an escape sequence split across two chunks is still one sequence', again.digest() === whole);
 
-  // What this must never do: claim to know a screen it does not.
   const lost = new Screen({ cols: 80, rows: 24 });
   lost.write('\x1b[H\x1b[2Jsettled');
   check('a screen it has followed from blank is sure', lost.sure);
-  lost.write('\x1b[4h'); // insert mode: the next text lands somewhere else
+  lost.write('\x1b[4h');
   check('a mode that moves text sideways is admitted, not ignored', !lost.sure);
   lost.write('\x1b[2J');
   check('and clearing the screen is how it becomes knowable again', lost.sure);
 
-  // A pty inherited from the daemon before this one: the screen has something
-  // on it that this process never saw.
   const handed = new Screen({ cols: 80, rows: 24, known: false });
   handed.write('\x1b[10;1Hstill here');
   check('an inherited screen never claims nothing happened', !handed.sure);
 
-  // less, vim, fzf: the whole terminal borrowed and given back.
   const alt = new Screen({ cols: 80, rows: 24 });
   alt.write('\x1b[H\x1b[2Jat the prompt');
   const beneath = alt.digest();
@@ -147,16 +104,6 @@ function screenTests() {
   alt.write('\x1b[?1049l');
   check('and leaving it puts back the one that was underneath', alt.digest() === beneath);
 
-  /*
-   * The other half of an idle agent's footer: the lines that change and stay
-   * changed.
-   *
-   * The version check above is a pair that cancels, and a digest is enough for
-   * it. This is the half a digest cannot answer — Claude Code rotates a hint
-   * through the same cells, and once it has installed a new version it says so
-   * there until it is restarted. Off tab 2a8cf0cb4d38 on 24 August, half an hour
-   * after anybody last touched it. See isNews.
-   */
   const idle = new Screen({ cols: 120, rows: 24 });
   idle.write('\x1b[H\x1b[2J\x1b[20;1H  the last thing it said\x1b[22;100H255556 token\x1b[24;1H❯ ');
   const looked = idle.snapshot();
@@ -168,9 +115,6 @@ function screenTests() {
   idle.write('\x1b[21;1H  and then it said something');
   check('a line where there was no line is news', isNews(looked, idle.snapshot()));
 
-  // What a status line is allowed: two rows. And the seen screen stays what
-  // somebody looked at, so a screen walking away from it one row at a time gets
-  // there in the end rather than never.
   const creep = new Screen({ cols: 80, rows: 10 });
   creep.write('\x1b[H\x1b[2Jone\r\ntwo\r\nthree\r\nfour');
   const start = creep.snapshot();
@@ -181,64 +125,36 @@ function screenTests() {
   creep.write('\x1b[3;1H3rd  ');
   check('three is a program drawing', isNews(start, creep.snapshot()));
 
-  /*
-   * And the price of that, said out loud.
-   *
-   * A program that overwrites one line with something worth reading — a progress
-   * line replaced by its own result — is not news either. Nearly everything ends
-   * its line, and a line that is ended scrolls the screen or fills a blank row,
-   * both of which are news; this is the one shape that does not, and it is the
-   * shape a status line has. Of the two ways to be wrong, a desktop that stays
-   * quiet about a line somebody will see the moment they look is better than one
-   * that lights up twice an hour about a token count.
-   */
   const inPlace = new Screen({ cols: 80, rows: 10 });
   inPlace.write('\x1b[H\x1b[2Jdownloading… 99%');
   const during = inPlace.snapshot();
   inPlace.write('\r\x1b[Kdone: saved to the file');
   check('a line overwritten where a line already was is not news either', !isNews(during, inPlace.snapshot()));
 
-  // A line taken away is as much news as a line arriving: a program that clears
-  // its own question has changed what there is to read.
   const erased = new Screen({ cols: 80, rows: 10 });
   erased.write('\x1b[H\x1b[2Jkept\r\ngoing away');
   const both = erased.snapshot();
   erased.write('\x1b[2;1H\x1b[K');
   check('a line gone from where there was one is news', isNews(both, erased.snapshot()));
 
-  // And the screen moving under it, which is what everything real does.
   const scrolled = new Screen({ cols: 80, rows: 6 });
   scrolled.write('\x1b[H\x1b[2Ja\r\nb\r\nc\r\nd\r\ne\r\nf');
   const before = scrolled.snapshot();
   scrolled.write('\r\ng');
   check('a screen that has scrolled is news', isNews(before, scrolled.snapshot()));
 
-  // The screen being borrowed outright: not the same screen, so not comparable.
   const borrowed = new Screen({ cols: 80, rows: 10 });
   borrowed.write('\x1b[H\x1b[2Jat the prompt');
   const under = borrowed.snapshot();
   borrowed.write('\x1b[?1049h\x1b[H\x1b[2Jat the prompt');
   check('the same text on the alternate screen is still news', isNews(under, borrowed.snapshot()));
 
-  // Where a recording is two recordings; see Session.append.
   check('the swap is found in a mode list', lastScreenSwap('x\x1b[?1049;1000h').borrowed);
   check('and in the two forms that came before it', lastScreenSwap('\x1b[?47h').borrowed && !lastScreenSwap('\x1b[?1047l').borrowed);
   check('the last of them is the one that counts', !lastScreenSwap('\x1b[?1049h\x1b[2J\x1b[?1049l').borrowed);
   check('a tab that never borrowed the screen has none', lastScreenSwap('\x1b[?25l\x1b[H hello \x1b[?25h') === null);
 }
 
-/* ------------------------------------------- the same bytes in a real terminal */
-
-/*
- * Recordings that catch a model of somebody else's terminal being wrong.
- *
- * The screen these tabs are really drawn on is xterm.js, in the window — so the
- * way to find out whether ./screen.js models it or merely resembles it is to
- * put the same bytes through both and compare the screens row by row. What is
- * in here is the awkward half of a terminal: the wrap that happens one
- * character late, the scrolling region, lines and cells being inserted and
- * pushed sideways, the alternate screen, and every flavour of erase.
- */
 const RECORDINGS = {
   'plain text and line feeds': 'hello\r\nsecond line\r\n\ttabbed\r\nlast',
   'the wrap that comes one character late': `\x1b[H\x1b[2J${'x'.repeat(80)}y\r\nafter`,
@@ -267,16 +183,12 @@ async function terminalTests() {
     return;
   }
 
-  // The pinned build first, so a CI box uses the browser the project installed;
-  // the desktop's own Chrome after it, because a machine that has never run
-  // `playwright install` still has one and this is worth running there.
   let browser = null;
   for (const options of [{}, { channel: 'chrome' }]) {
     try {
       browser = await chromium.launch(options);
       break;
     } catch {
-      /* try the next one */
     }
   }
   if (!browser) {
@@ -306,20 +218,7 @@ async function terminalTests() {
     );
   }
 
-  /*
-   * And what a terminal does when a program gives back a screen it was never
-   * told about.
-   *
-   * A window opening on a tab is handed the recording and writes it into a new
-   * xterm, so what the recording says is what that terminal believes. Lose the
-   * sequence that borrowed the screen — trimmed off the front, which is what
-   * happened to ten of the sixteen agent tabs on this desktop by 24 August — and
-   * the agent's frame is painted onto the ordinary screen instead. The `?1049l`
-   * on its way out then has nothing to give back: the frame stays where it is,
-   * and the shell prints its prompt through it. That is the overlap, and this is
-   * the difference the split buffer makes. See Session.append.
-   */
-  const beneath = '\x1b[H\x1b[2Jmiles@ptah:~/core3 [master]\r\n$ claude\r\n';
+  const beneath = '\x1b[H\x1b[2Juser@host:~/work [main]\r\n$ claude\r\n';
   const swap = '\x1b7\x1b[?1049h\x1b[2J\x1b[H';
   const frame = "\x1b[H  a line of the conversation\x1b[10;1H❯ typed here\x1b[12;1H✻ Sautéed for 5m 23s";
   const leaving = '\x1b[?1049l\x1b[?25h\r\nResume this session with: claude --resume 1234\r\n$ ';
@@ -341,7 +240,6 @@ async function terminalTests() {
   await browser.close();
 }
 
-/** A recording written into a real terminal, as a row of text per line. */
 function drawn(page, recording, cols, rows) {
   return page.evaluate(
     async ({ text, cols, rows }) => {
@@ -362,21 +260,10 @@ function drawn(page, recording, cols, rows) {
   );
 }
 
-/* ------------------------------------------------------- the recording itself */
-
-/*
- * Half a megabyte of it, and what has to survive being trimmed.
- *
- * An agent tab writes a screenful a second all day, so everything a window
- * replays is the tail of what it wrote — except the one thing that is not on the
- * tail at all: the sequence where the program borrowed the screen, which
- * happened when it started and is the first thing dropped. The recording is two
- * recordings for exactly that reason.
- */
 function recordingTests() {
   console.log('\n3. the recording, once there is more of it than fits');
 
-  const prompt = '\x1b[32mmiles@ptah:\x1b[33m~/core3\x1b[0m [master]\r\r\n$ claude\r\n';
+  const prompt = '\x1b[32muser@host:\x1b[33m~/work\x1b[0m [main]\r\r\n$ claude\r\n';
   const session = new Session({ id: 'recording' });
   session.append(prompt);
   session.append('\x1b[?2004l\r\n\x1b7\x1b[r\x1b8\x1b[?1049h\x1b[2J\x1b[H\x1b[?1000h');
@@ -392,26 +279,18 @@ function recordingTests() {
   check('but the swap is still in it', recording.includes('\x1b[?1049h'));
   check('and so is the command that caused it', recording.includes('$ claude'));
 
-  // Given back, the two are one recording again and the whole of it is scrollback.
   session.append('\x1b[?1049l\x1b[?25h\r\nback at the prompt\r\n$ ');
   check('giving the screen back joins them up', session.underneath.length === 0);
   check('and what was underneath is still there to be read', session.scrollback().includes('$ claude'));
   for (let i = 0; i < 12000; i++) session.append(`line ${i} of something ordinary\r\n`);
   check('after which it is trimmed like anything else', !session.scrollback().includes('$ claude'));
 
-  // A tab that never borrows anything: exactly as it always was.
   const plain = new Session({ id: 'plain' });
   plain.append('the first thing it said\r\n');
   for (let i = 0; i < 30000; i++) plain.append(`line ${i} of a build\r\n`);
   check('a tab with nothing borrowed keeps nothing back', plain.underneath.length === 0);
   check('and drops its oldest output', !plain.scrollback().includes('the first thing it said'));
 
-  /*
-   * And across a restart, where the recording comes back off the disk as one
-   * chunk. Seeded without the split, the swap is on the front of that chunk and
-   * the next trim drops it — which is the same tab in the same state, one reboot
-   * later.
-   */
   const seeded = new Session({ id: 'seeded' });
   seeded.seedScrollback(recording);
   check('a recording read back off the disk is split where it was written', seeded.underneath.length > 0);
@@ -421,8 +300,6 @@ function recordingTests() {
   check('so the swap survives the next trim too', seeded.scrollback().includes('\x1b[?1049h'));
   check('and the command with it', seeded.scrollback().includes('$ claude'));
 }
-
-/* ---------------------------------------------------------------- the daemon */
 
 const TMP = mkdtempSync(join(tmpdir(), 'clio-unseen-'));
 const RUN = join(TMP, 'run');
@@ -434,8 +311,6 @@ for (const dir of [RUN, STATE, BIN, WORK, HOME]) mkdirSync(dir, { recursive: tru
 
 const env = {
   ...process.env,
-  // Nothing here asks for a window, and nothing here may put one on somebody's
-  // desktop by accident either.
   DISPLAY: undefined,
   WAYLAND_DISPLAY: undefined,
   HOME,
@@ -454,7 +329,6 @@ function handshake() {
   return JSON.parse(readFileSync(HANDSHAKE, 'utf8'));
 }
 
-/** Wait for the daemon named in the handshake file to be somebody new. */
 async function daemonAfter(oldPid, timeout = 25000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
@@ -462,7 +336,6 @@ async function daemonAfter(oldPid, timeout = 25000) {
       const info = handshake();
       if (info.pid !== oldPid && alive(info.pid)) return info;
     } catch {
-      /* mid-write, or not there yet */
     }
     await sleep(100);
   }
@@ -494,7 +367,6 @@ async function startDaemon() {
         const info = JSON.parse(readFileSync(HANDSHAKE, 'utf8'));
         if (info.pid === daemon.pid) return info;
       } catch {
-        /* half-written; look again */
       }
     }
     await sleep(100);
@@ -502,14 +374,12 @@ async function startDaemon() {
   throw new Error(`daemon did not start:\n${log.join('')}`);
 }
 
-/** A stand-in for a window, which is also the only thing that ever sees red. */
 class Client {
   constructor(info, container) {
     this.info = info;
     this.container = container;
     this.sessions = [];
     this.messages = [];
-    /** Every tab that has ever been broadcast as having unseen output. */
     this.everRed = new Set();
   }
 
@@ -575,30 +445,22 @@ async function daemonTests() {
   }
   check('two tabs, one to paint in and one to look at instead', true);
 
-  // Looked at, so that what it paints now is what somebody has seen. Run with
-  // `exec` so there is no shell prompt underneath it: a prompt drawn after the
-  // program ends is a changed screen, and a real one, which would drown out the
-  // thing being measured.
   await sleep(800);
   client.send({ t: 'focus', id: painting.id });
   await sleep(200);
   client.send({ t: 'input', id: painting.id, data: `exec node ${fixture}\n` });
 
-  // The opening paint lands while it is on screen; then the window looks away.
   await sleep(1200);
   client.send({ t: 'focus', id: other.id });
   await sleep(300);
   client.everRed.delete(painting.id);
   check('the tab being painted in is not red while it is being looked at', !client.red(painting.id));
 
-  // The version check: visible text, twice, and a net change of nothing.
   client.send({ t: 'input', id: painting.id, data: 'v' });
   await sleep(3000);
   check('a repaint that puts the screen back does not turn the tab red', !client.red(painting.id));
   check('and it never went red in the meantime either', !client.everRed.has(painting.id));
 
-  // The hint moving on: visible text, once, and it stays. A different screen
-  // from the one somebody last looked at, and still nothing to read.
   client.send({ t: 'input', id: painting.id, data: 'h' });
   await sleep(2500);
   client.send({ t: 'input', id: painting.id, data: 'h' });
@@ -606,7 +468,6 @@ async function daemonTests() {
   check('a footer that changes and stays changed does not turn it red either',
     !client.red(painting.id) && !client.everRed.has(painting.id));
 
-  // Then something worth knowing about.
   client.send({ t: 'input', id: painting.id, data: 'n' });
   await sleep(2500);
   check('a line nobody has read does turn it red', client.red(painting.id));
@@ -615,18 +476,7 @@ async function daemonTests() {
   await sleep(400);
   check('and looking at the tab puts the red out', !client.red(painting.id));
 
-  /*
-   * And again across a reload, which is the case that would otherwise be
-   * missed. A successor daemon inherits the pty as an open descriptor and has
-   * never seen a byte of what is on that screen — so unless it works the screen
-   * out from the recording of the tab (see Session.replayScreen), the first
-   * thing the program repaints after a reload reads as news and the row goes red
-   * again. Which, on a desktop where reloading is how new code arrives, is every
-   * time anybody touches clio.
-   */
   console.log('\n5. and after a reload, on a screen this daemon never saw');
-  // Past the scrollback flush, so the successor reads a recording that includes
-  // everything above rather than depending on lucky timing.
   await sleep(3500);
   const before = info.pid;
   execFileSync(join(ROOT, 'bin', 'clio'), ['reload'], { env, stdio: 'ignore' });
@@ -638,10 +488,6 @@ async function daemonTests() {
   client = new Client(next, '0ff1ce00');
   await client.connect();
   await client.await((m) => m.t === 'sessions');
-  // The window comes back and looks at the *other* tab, so nobody looks at this
-  // one at all under the new daemon. Which is the real case: a reload happens
-  // while somebody is working in one tab, and the twelve they are not in must
-  // not light up afterwards for repainting themselves.
   client.send({ t: 'attach', id: other.id, cols: 80, rows: 24 });
   await client.await((m) => m.t === 'attached');
   client.send({ t: 'focus', id: other.id });
@@ -658,13 +504,6 @@ async function daemonTests() {
   await sleep(2500);
   check('and a line nobody has read still is', client.red(painting.id));
 
-  /*
-   * The last second before a reload, which is the seam this could fall through.
-   * A tab is judged a beat after it stops drawing (see UNSEEN_SETTLE_MS), and a
-   * reload inside that beat takes the daemon that was going to do the judging
-   * away with it — so the flag has to be settled on the way out, or the
-   * successor inherits a screen it takes to have been seen and the line is lost.
-   */
   console.log('\n6. output that arrives just as the daemon is standing down');
   client.send({ t: 'focus', id: painting.id });
   await sleep(400);
@@ -688,17 +527,7 @@ async function daemonTests() {
   check('the line still counts as unread on the other side of the reload',
     client.red(painting.id));
 
-  /*
-   * And the other way a tab comes back: the machine was restarted, so there is
-   * no pty to inherit and every tab is rebuilt from disk with a new shell in
-   * it. All of that drawing is clio putting the row back — a profile, a seam, a
-   * resume command typed into a shell that has only just arrived — and on
-   * 22 August the row was red before anybody had opened a window, which is the
-   * flag saying "something in here to read" about thirteen tabs at once.
-   */
   console.log('\n7. a restart, and the tabs that come back from it');
-  // The state on disk is what a restore is built from, so let the daemon flush
-  // before it is taken away.
   await sleep(3500);
   const beforeRestart = last.pid;
   client.close();
@@ -711,15 +540,12 @@ async function daemonTests() {
   client = new Client(restored, '0ff1ce00');
   await client.connect();
   await client.await((m) => m.t === 'sessions');
-  // Long enough for the shells, their profiles and their prompts.
   await sleep(6000);
   check('both tabs came back', client.sessions.length === 2, `${client.sessions.length} tab(s)`);
   check('and neither of them is red', !client.red(painting.id) && !client.red(other.id));
   check('nor was either of them on the way back',
     !client.everRed.has(painting.id) && !client.everRed.has(other.id));
 
-  // Once a tab has stopped arriving, the screen it stopped on is the state it
-  // came back as — and anything after that is news again.
   await sleep(11000);
   client.send({ t: 'input', id: painting.id, data: 'echo something-new\n' });
   await sleep(2500);
@@ -729,8 +555,6 @@ async function daemonTests() {
   client.close();
 }
 
-/* -------------------------------------------------------------------- report */
-
 function report() {
   console.log(`\n${passed} passed, ${failed} failed`);
   if (failed) console.log(`\n---- daemon log ----\n${log.join('')}`);
@@ -739,19 +563,15 @@ function report() {
 }
 
 function stop() {
-  // The daemon this test started, and — after a reload — the one it handed the
-  // shells to, which is a child of that rather than of this process.
   try {
     const running = handshake().pid;
     if (running !== daemon?.pid) process.kill(running, 'SIGKILL');
   } catch {
-    /* no handshake, or nothing behind it */
   }
   if (!daemon) return;
   try {
     daemon.kill('SIGKILL');
   } catch {
-    /* already gone */
   }
   daemon = null;
 }

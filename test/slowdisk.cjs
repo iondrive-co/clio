@@ -1,14 +1,3 @@
-/*
- * A stand-in for a disk that has stopped answering, for test/stall.mjs.
- *
- * Preloaded into a daemon with NODE_OPTIONS=--require. Writes to the path named
- * in CLIO_SLOW_DISK_PATH take CLIO_SLOW_DISK_MS to complete — the synchronous
- * ones by holding on to the thread that called them, which for the daemon is
- * the one thread it has, and the asynchronous ones by not being finished yet.
- * Which is the difference the test is about: the kernel blocks the caller of a
- * write it cannot satisfy, and it matters enormously whether that caller is the
- * event loop or one of libuv's file threads.
- */
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 
@@ -20,7 +9,6 @@ if (DELAY && TARGET) {
   const hold = (ms) => {
     const until = Date.now() + ms;
     while (Date.now() < until) {
-      /* the thread that called this is not going anywhere */
     }
   };
 
@@ -30,7 +18,6 @@ if (DELAY && TARGET) {
     return realSync.call(this, file, ...rest);
   };
 
-  // fs.promises and node:fs/promises are the same object; patch it once.
   const seen = new Set();
   for (const target of [fsp, fs.promises]) {
     if (seen.has(target)) continue;
@@ -41,6 +28,4 @@ if (DELAY && TARGET) {
       return real.call(this, file, ...rest);
     };
   }
-  // Nothing is printed from here. NODE_OPTIONS reaches every node process the
-  // launcher runs, including the ones whose stdout it parses as JSON.
 }

@@ -1,29 +1,3 @@
-/*
- * Two sessions on one desktop, and the tabs go to the one somebody is at.
- *
- * A machine that is logged in locally and also reached over RDP has two
- * displays, two desktop sessions and two autostart entries — with a person in
- * front of exactly one of them. Whichever session comes up first gets the
- * windows, and at boot that is the local one, seconds before anybody has
- * connected. `clio` in the other session used to find every window already on
- * screen, conclude there was nothing to put back, and open the picker — or a
- * bare new window — while a day's shells sat on a display nobody was at, not
- * offered by anything and not reachable from the session that was in use.
- *
- * So: a window is not open, for the purposes of putting a desktop back, unless
- * it is open where the person asking can see it. A window that is open
- * somewhere else comes over, with its tabs and its shells, and the frame it was
- * in is taken off that screen.
- *
- * Two halves, like test/tabmove.mjs. The first drives the daemon the way a page
- * does and needs no X at all: the browser it opens windows with is a script
- * that holds a socket instead of drawing anything, which is the whole of what a
- * window is as far as the daemon can tell. The second is the real thing — two
- * displays of this test's own making and a real browser on each — and is
- * skipped on a machine with no Xvfb.
- *
- *   node test/displays.mjs
- */
 import {
   mkdirSync,
   mkdtempSync,
@@ -42,17 +16,9 @@ import WebSocket from 'ws';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
-// Nothing this test opens may land on the desktop of whoever is running it: it
-// moves windows between displays and counts what is on each, and a window
-// somebody else is looking at would be counted as one of ours. Dropped before
-// anything can inherit it, and handed back only as displays of our own — the
-// first half's are not displays at all, which is the point of the shim below.
 delete process.env.DISPLAY;
 delete process.env.WAYLAND_DISPLAY;
 
-// A clio of this run's own, from the first line to the last: it starts and
-// stops daemons, and pointing one at somebody's real shells would take them
-// down with it.
 const SANDBOX = mkdtempSync(join(tmpdir(), 'clio-displays-'));
 process.env.XDG_RUNTIME_DIR = join(SANDBOX, 'run');
 process.env.XDG_STATE_HOME = join(SANDBOX, 'state');
@@ -92,37 +58,19 @@ process.on('exit', () => {
   try {
     execFileSync(join(ROOT, 'bin', 'clio'), ['stop'], { stdio: 'ignore', env: process.env });
   } catch {
-    /* never started, or already down */
   }
   while (started.length) {
     try {
       started.pop().kill();
     } catch {
-      /* already gone */
     }
   }
   try {
     rmSync(SANDBOX, { recursive: true, force: true });
   } catch {
-    /* leave it, it is in /tmp */
   }
 });
 
-/* ------------------------------------------------------------- the shim */
-
-/*
- * A browser for a test with no display.
- *
- * The daemon finds a browser by name on its PATH and hands it an --app= URL. A
- * clio window is that URL held open on a socket: everything else about it is
- * pixels, and none of the rules being tested here are about pixels. So this
- * connects, says which display the URL named, and stays — one process per
- * window, which makes counting the windows on a display something a test can
- * do without a window manager to ask.
- *
- * It answers exactly one message, for the same reason a page does: told its
- * tabs have moved to a window in another session, it stops being a window.
- */
 const SHIMDIR = join(SANDBOX, 'bin');
 const WINDOWS = join(SANDBOX, 'windows');
 mkdirSync(SHIMDIR, { recursive: true });
@@ -175,7 +123,6 @@ ws.on('error', gone);
 writeFileSync(join(SHIMDIR, 'chromium'), `#!/bin/sh\nexec node ${join(SHIMDIR, 'window.cjs')} "$@"\n`);
 chmodSync(join(SHIMDIR, 'chromium'), 0o755);
 
-/** The windows on screen, as the shim records them, by display. */
 function shimWindows(display = null) {
   const out = [];
   for (const name of readdirSync(WINDOWS)) {
@@ -184,18 +131,15 @@ function shimWindows(display = null) {
       const record = JSON.parse(readFileSync(join(WINDOWS, name), 'utf8'));
       if (display === null || record.display === display) out.push(record);
     } catch {
-      /* half-written, or gone since the listing */
     }
   }
   return out;
 }
 
-/** Take a window off the screen, the way closing one does. */
 function closeWindow(record) {
   try {
     process.kill(record.pid);
   } catch {
-    /* it went on its own */
   }
 }
 
@@ -204,9 +148,6 @@ const movedLog = () => {
   return existsSync(file) ? readFileSync(file, 'utf8').trim().split('\n').filter(Boolean) : [];
 };
 
-/* ----------------------------------------------------------- the daemon */
-
-/** `clio`, run from a shell in one session or the other. */
 const clio = (display, ...args) => {
   try {
     return execFileSync(join(ROOT, 'bin', 'clio'), args, {
@@ -220,7 +161,6 @@ const clio = (display, ...args) => {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
   } catch (err) {
-    // A launcher that reports a failure is one of the things being tested.
     return `${err.stdout || ''}${err.stderr || ''}`;
   }
 };
@@ -233,16 +173,8 @@ async function status() {
   return res.json();
 }
 
-/** What the daemon calls a display, and what a window reports it is on. */
 const key = (display) => display.replace(/^:/, '');
 
-/**
- * A window, driven from here rather than by a browser.
- *
- * `d` is the whole point: it is what the daemon writes into the address of
- * every window it opens, and what a window hands back on every connection, so
- * that a window in one session can be told from a window in another.
- */
 async function connect(container, display) {
   const { port, token } = handshake();
   const address =
@@ -253,9 +185,6 @@ async function connect(container, display) {
   ws.on('message', (raw) => {
     const msg = JSON.parse(raw);
     heard.push(msg);
-    // What the page does with it, and what the shim does with it: stop being a
-    // window. A socket left open here would be a second window onto tabs that
-    // are on screen somewhere else.
     if (msg.t === 'moved') ws.close();
   });
   await new Promise((resolve, reject) => {
@@ -270,14 +199,6 @@ async function connect(container, display) {
   };
 }
 
-/**
- * The shells this daemon is holding, by pid.
- *
- * The point of the whole exercise: a window moving from one session to another
- * must not cost a single one of these. A pty dies when the last copy of its
- * master descriptor is closed, so a shell with the same pid afterwards is a
- * shell that was never touched — not one that was restarted well.
- */
 function shells(daemonPid) {
   const out = [];
   for (const entry of readdirSync('/proc')) {
@@ -288,10 +209,8 @@ function shells(daemonPid) {
       stat = readFileSync(`/proc/${entry}/stat`, 'utf8');
       cmd = readFileSync(`/proc/${entry}/cmdline`, 'utf8');
     } catch {
-      continue; // it exited while we were looking at it
+      continue;
     }
-    // comm is parenthesised and may have spaces in it; ppid is the field after
-    // the state, which is the one after that.
     const after = stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/);
     if (Number(after[1]) !== daemonPid) continue;
     if (/chrome|chromium|brave|window\.cjs/.test(cmd)) continue;
@@ -302,34 +221,17 @@ function shells(daemonPid) {
 
 console.log(`clio two-display test — sandbox at ${SANDBOX}`);
 
-/* ==================================================== 1. what the rules are */
-
 const LOCAL = ':81';
 const REMOTE = ':82';
-// A window keeps its identity in its own address, and the daemon will take an
-// id it has never seen under the name asked for — so long as it is shaped like
-// one of its own. See CONTAINER_ID in ../src/daemon/manager.js.
 const DESK = 'facade';
 
 console.log(`\n1. one daemon, two sessions: ${LOCAL} at the machine, ${REMOTE} over the wire`);
-/*
- * The daemon comes up in the session that is at the machine and carries that
- * session's variables in its own environment for as long as it runs — which is
- * the other half of this trap. A launcher that names a display and no wayland
- * socket describes a session that has no wayland socket; handing it the one
- * this process happens to have inherited is how a window asked for over RDP
- * comes up on the screen at the machine with every variable agreeing that it
- * did not. The profile a window's browser uses is named after the display, so
- * it is the thing to look at afterwards.
- */
 process.env.WAYLAND_DISPLAY = 'wayland-99';
 clio(LOCAL, 'start');
 await sleep(2500);
 delete process.env.WAYLAND_DISPLAY;
 const daemon = handshake().pid;
 
-// A window in the session that came up first, holding one shell. This is the
-// boot case: the local session's autostart got there before anybody connected.
 const home = await connect(DESK, LOCAL);
 home.send({ t: 'create', cwd: process.env.HOME });
 await sleep(2000);
@@ -382,11 +284,7 @@ check(
   'the window it was in was told, and let go',
   home.said('moved') && home.ws.readyState !== WebSocket.OPEN,
 );
-// The bug this file exists for, in the shape it was found in: a picker offering
-// the tabs by name, or an empty window, in place of the desktop being put back.
 check('it was not offered as a choice', !shimWindows().some((w) => w.pick) && !moved.containers.some((c) => c.saved));
-// A browser per display, or the window is handed to whichever browser is
-// already running and comes up in the session that one is in. See profileFor.
 check(
   'and the browser it came up in is that display’s own, with nothing of the daemon’s in it',
   (shimWindows(key(REMOTE))[0]?.profile || '').endsWith(`browser-profile-${key(REMOTE)}`),
@@ -397,8 +295,6 @@ console.log(`\n3. clio again on ${REMOTE}, where the window already is`);
 clio(REMOTE);
 await sleep(3000);
 const again = shimWindows();
-// A window that is already on screen where it was asked for is left alone, and
-// `clio` with nothing to put back does what it has always done: a new window.
 check(
   'no second window onto the same tabs',
   again.filter((w) => w.container === DESK).length === 1,
@@ -409,8 +305,6 @@ check(
   again.length === 2 && again.every((w) => w.display === key(REMOTE)),
   JSON.stringify(again),
 );
-// Tidy it away again: a spare window with a shell in it would be one more thing
-// for every `clio` below to put back.
 const spare = again.find((w) => w.container !== DESK);
 const spareShell = (await status()).containers.find((c) => c.id === spare?.container)?.sessions[0];
 if (spareShell) {
@@ -450,14 +344,10 @@ check(
 console.log(`   windows told they had moved: ${JSON.stringify(movedLog())}`);
 
 console.log(`\n5. a window that was closed is still a choice, not a move`);
-// Put it away the way a person does — a goodbye, and no window coming back —
-// and check it lands in the picker rather than being dragged to a display.
 const parked = shimWindows().find((w) => w.container === DESK);
 const { port, token } = handshake();
 await fetch(`http://127.0.0.1:${port}/gone?c=${DESK}&token=${token}`, { method: 'POST' });
 closeWindow(parked);
-// Long enough for the grace period a window gets to come back; see
-// WINDOW_GRACE_MS.
 await sleep(13000);
 const away = (await status()).containers.find((c) => c.id === DESK);
 check('it was put away under a name', !!away?.saved, JSON.stringify({ away, parked }));
@@ -476,11 +366,8 @@ check(
   JSON.stringify(asked),
 );
 
-/* ============================================== 2. and with a real browser */
-
 const WINDOW_MANAGERS = ['xfwm4', 'openbox', 'marco', 'icewm', 'fluxbox', 'jwm', 'metacity'];
 
-/** A display of this test's own, with something on it that manages windows. */
 async function startDisplay(wm) {
   for (let n = 91; n < 130; n++) {
     if (existsSync(`/tmp/.X${n}-lock`)) continue;
@@ -488,7 +375,7 @@ async function startDisplay(wm) {
     const xvfb = spawn('Xvfb', [display, '-screen', '0', '1280x900x24'], { stdio: 'ignore' });
     started.push(xvfb);
     await sleep(1500);
-    if (xvfb.exitCode !== null) continue; // that number was taken after all
+    if (xvfb.exitCode !== null) continue;
     started.push(spawn(wm, [], { stdio: 'ignore', env: { ...process.env, DISPLAY: display } }));
     await sleep(1500);
     return display;
@@ -496,7 +383,6 @@ async function startDisplay(wm) {
   return null;
 }
 
-/** Clio's windows on one display, as the window manager there lists them. */
 function windowsOn(display) {
   try {
     return execFileSync('wmctrl', ['-l'], {
@@ -519,8 +405,6 @@ if (!installed('Xvfb') || !wm || !installed('wmctrl')) {
   process.exit(failed ? 1 : 0);
 }
 
-// Everything above ran without a browser on the machine having been asked for
-// anything. This half is the claim that it works on a desktop.
 execFileSync(join(ROOT, 'bin', 'clio'), ['stop'], { stdio: 'ignore', env: process.env });
 await sleep(2000);
 rmSync(join(process.env.XDG_STATE_HOME, 'clio', 'state.json'), { force: true });

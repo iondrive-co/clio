@@ -1,22 +1,3 @@
-/*
- * Files dragged into a window.
- *
- * A page is not told where a dropped file came from — Chrome hands over a name,
- * a size, a modification time and the bytes, and nothing else — so clio works
- * the path out in the daemon, and only asks the window for the contents of
- * files it could not find on disk. Two things have to be true for that to be
- * worth doing, and this file is about both: the path it types is the *real* one
- * whenever the file exists, and a file that exists nowhere still ends up as a
- * path that can be read.
- *
- * The second half drives a real page, because everything above the websocket —
- * the drop landing on the right tab, the bytes going up, the path being typed
- * into the shell rather than at it — only exists in the browser.
- *
- * Runs a sandbox daemon of its own, on a home directory of its own:
- *
- *   node test/drops.mjs
- */
 import {
   mkdirSync,
   mkdtempSync,
@@ -54,10 +35,6 @@ function check(label, ok, detail = '') {
 
 const dir = mkdtempSync(join(tmpdir(), 'clio-drops-'));
 
-// A home directory of this test's own. locate() searches ~/Downloads and the
-// rest of the XDG user directories, and it must be looking in these ones: the
-// person running the tests has files in theirs, and a test that found one of
-// those would be reaching into their home and reporting on what is in it.
 const home = join(dir, 'home');
 const work = join(dir, 'work');
 for (const path of [home, work, join(home, 'Downloads'), join(work, 'deep', 'nested')]) {
@@ -78,17 +55,14 @@ function tearDown() {
   try {
     execFileSync(CLIO, ['stop'], { env, stdio: 'ignore' });
   } catch {
-    /* never started */
   }
   try {
     rmSync(dir, { recursive: true, force: true });
   } catch {
-    /* leave it */
   }
 }
 process.on('exit', tearDown);
 
-/** Wait for something to become true, rather than for a length of time. */
 async function until(condition, timeout = 20000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
@@ -98,7 +72,6 @@ async function until(condition, timeout = 20000) {
   return false;
 }
 
-/** A file on disk, with a modification time this test chose. */
 function put(path, contents, mtime = 1700000000000) {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, contents);
@@ -106,21 +79,16 @@ function put(path, contents, mtime = 1700000000000) {
   return path;
 }
 
-/** A file described the way a drag describes it to the page. */
 function asDropped(path, dir = false) {
   const st = statSync(path);
   return { name: basename(path), size: st.size, mtime: Math.floor(st.mtimeMs), dir };
 }
-
-// ---- the files this test drops ------------------------------------------
 
 const note = put(join(work, 'note.txt'), 'a note in the working directory');
 const nested = put(join(work, 'deep', 'nested', 'buried.txt'), 'further down');
 const download = put(join(home, 'Downloads', 'photo of me.png'), 'pretend png');
 const folder = join(work, 'deep');
 
-// Same name, different file: dropping one of these must not type the path of
-// the other.
 put(join(work, 'twin.txt'), 'the twin in the working directory');
 const otherTwin = put(join(home, 'Downloads', 'twin.txt'), 'a different twin, of a different size');
 
@@ -152,18 +120,11 @@ async function main() {
     return null;
   };
 
-  // A tab in the working directory, which is where locate() looks first.
   ws.send(JSON.stringify({ t: 'create', cwd: work, cols: 80, rows: 24 }));
   const created = await waitFor((m) => m.t === 'created');
   if (!created) throw new Error('the daemon never made a tab');
   const id = created.id;
 
-  /**
-   * Drop files on the tab and wait for the line it produces.
-   *
-   * `bytes` stands in for the window reading the file: a Buffer for an index the
-   * daemon asks about, null to answer that it could not be read.
-   */
   const drop = async (items, bytes = {}) => {
     const token = `t${messages.length}-${randomBytes(3).toString('hex')}`;
     const before = messages.length;
@@ -199,8 +160,6 @@ async function main() {
     check('a file further down the tree is found too', result.text === `${nested} `, result.text);
   }
   {
-    // ~/Downloads, which is where a file being dragged into a terminal most
-    // often comes from, and a name that a shell would otherwise split in two.
     const result = await drop([asDropped(download)]);
     check(
       'a file in ~/Downloads is found',
@@ -216,15 +175,10 @@ async function main() {
 
   console.log('\n2. the same name is not the same file');
   {
-    // The one in ~/Downloads was dropped; the one in the working directory has
-    // the same name and is searched first. Size and modification time are what
-    // keep them apart.
     const result = await drop([asDropped(otherTwin)]);
     check('the file that was dropped is the one typed', result.text === `${otherTwin} `, result.text);
   }
   {
-    // Same name and same size as note.txt, but written a day later: not that
-    // file, and not to be typed as though it were.
     const impostor = { ...asDropped(note), mtime: Math.floor(statSync(note).mtimeMs) + 86400000 };
     const result = await drop([impostor], { 0: Buffer.from('brought with it') });
     check('a file that only shares a name is copied instead', result.text.startsWith(DROPS), result.text);
@@ -310,8 +264,6 @@ async function main() {
   ws.send(JSON.stringify({ t: 'close', id }));
   ws.close();
 
-  // ---- and now the half that only exists in a browser --------------------
-
   console.log('\n7. dropping on a real window');
   const browser = await chromium.launch();
   const context = await browser.newContext({ viewport: { width: 1100, height: 700 } });
@@ -325,7 +277,6 @@ async function main() {
   await page.waitForSelector('.xterm-screen', { timeout: 10000 });
   await page.waitForTimeout(1500);
 
-  /** A drag carrying one file, as the browser would hand it to the page. */
   const dragging = (name, contents, mtime) =>
     page.evaluateHandle(
       ([fileName, text, time]) => {
@@ -336,36 +287,20 @@ async function main() {
       [name, contents, mtime],
     );
 
-  // Held over the window but not yet let go: the pane says where it would land.
   const hovering = await dragging('note.txt', 'x', 1700000000000);
   await page.dispatchEvent('.xterm-screen', 'dragover', { dataTransfer: hovering });
   check('the pane it would land in is outlined', (await page.locator('.pane.dropping').count()) === 1);
   await page.dispatchEvent('body', 'dragleave', { dataTransfer: hovering, relatedTarget: null });
   check('and lets go of it again', (await page.locator('.pane.dropping').count()) === 0);
 
-  /**
-   * Drop a file into a tab and read back exactly what the shell received.
-   *
-   * `cat` rather than a prompt, because a prompt would echo and wrap and leave
-   * this asserting on what the screen looks like. The file it writes is what
-   * came down the pty, character for character.
-   */
   const droppedInto = async (name, contents, mtime) => {
     const out = join(dir, `typed-${randomBytes(3).toString('hex')}.txt`);
     await page.locator('.xterm-screen').first().click();
     await page.keyboard.type(`cd ${work} && cat > ${out}\n`);
-    // The redirect creates that file the moment the shell runs the line, which
-    // is also the moment the tab is in `work` — where the dropped file is.
-    // Waiting for it beats guessing how long a busy machine takes to get there,
-    // and guessing is how this came to pass on an idle one and fail on a loaded
-    // one.
     if (!(await until(() => existsSync(out)))) return '(the shell never ran the command)';
 
     const transfer = await dragging(name, contents, mtime);
     await page.dispatchEvent('.xterm-screen', 'drop', { dataTransfer: transfer });
-    // The daemon has to look for the file, and may have to be sent it, before
-    // anything is typed. What arrives is echoed by the tty; the name is in it
-    // whichever path won.
     const screen = () => page.locator('.pane.active .xterm-rows').first().innerText();
     if (!(await until(async () => (await screen()).replace(/\n/g, '').includes(name)))) {
       return '(nothing was typed)';
@@ -383,7 +318,6 @@ async function main() {
     check('and nothing was copied to say it with', !typed.includes(DROPS), JSON.stringify(typed));
   }
   {
-    // Nothing on this disk looks like this, so the bytes have to travel.
     const typed = await droppedInto('from-the-browser.png', 'pretend png bytes', 1500000000000);
     const path = typed.trim();
     check('a file with no path on disk becomes one', path.startsWith(DROPS), JSON.stringify(typed));

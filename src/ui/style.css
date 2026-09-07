@@ -3,33 +3,22 @@
   --bg-raised: #24242c;
   --bg-tab: #2b2b34;
   --fg: #d8d8e0;
-  /* 5.05:1 on the tab background — the previous value sat at 4.12 and read as
-     washed out against the chrome. */
   --fg-dim: #9a9aa8;
   --accent: #7aa2f7;
   --border: #34343f;
-  /* Must track THEME.background in app.js: .term is padded, and the gutter
-     would otherwise frame the terminal in a lighter grey. */
   --term-bg: #000000;
   --danger: #e06c75;
   --activity: #ef7b84;
-  /* An agent that has stopped and is waiting for an answer. Deliberately not
-     --activity: output arriving in a tab and a tab with a question in it are
-     different pieces of news, and the row has to be readable at a glance. */
   --waiting: #e5c07b;
   --tabbar-height: 32px;
+  --grip: 8px;
+  --grip-corner: 16px;
 }
 
 * {
   box-sizing: border-box;
 }
 
-/*
- * The `hidden` attribute is only a UA-stylesheet `display: none`, so any author
- * rule that sets `display` silently defeats it — which is how a full-window
- * overlay ended up invisible but still swallowing every click. Make `hidden`
- * mean hidden, whatever else a rule below says.
- */
 [hidden] {
   display: none !important;
 }
@@ -48,8 +37,6 @@ body {
   display: flex;
   flex-direction: column;
 }
-
-/* ---------- tab bar ---------- */
 
 #tabbar {
   display: flex;
@@ -73,7 +60,6 @@ body {
   display: none;
 }
 
-/* The sandbox's only visible difference from the real thing, so it is loud. */
 #devbadge {
   align-self: center;
   margin: 0 6px;
@@ -115,27 +101,11 @@ body {
   background: var(--accent);
 }
 
-/* Output arrived in a tab you were not watching. Same convention as
-   xfce4-terminal: the label goes red until you look at it. */
 .tab.activity .tab-title {
   color: var(--activity);
   font-weight: 600;
 }
 
-/*
- * A tab whose agent has stopped and is waiting for you.
- *
- * Both flags will usually be on the same tab, because an agent finishing a turn
- * is also output nobody has read. So this rule sits after .tab.activity and
- * takes the label off it: unread output can wait, and somebody being waited on
- * cannot.
- *
- * A pulse rather than a hard blink, and a shallow one that spends most of its
- * time lit: it has to be visible in the corner of an eye from across a row of
- * thirty tabs, survivable by somebody who leaves clio open all day, and legible
- * at every point of it — a tab caught at the bottom of a deeper fade reads as
- * disabled rather than as waiting.
- */
 @keyframes tab-waiting {
   0%,
   55%,
@@ -152,24 +122,10 @@ body {
   font-weight: 600;
 }
 
-/*
- * The pulse is a burst, not a state — it runs for a few seconds after the tab
- * goes quiet and then stops, leaving the colour above to keep saying it.
- *
- * Not because the motion stops being useful, but because it never stops
- * costing: an opacity animation runs on Chrome's compositor, which ticks it
- * every vsync for as long as it is on the page, focused or not, on top or not.
- * With a row of agents in a window somebody leaves open all day, "while
- * anything is waiting" is indistinguishable from "always", and this page ends
- * up holding a 60 Hz compositor open around the clock to fade one word in and
- * out at nobody. See waitingSince in app.js, which decides how long it lasts.
- */
 .tab.waiting.pulsing .tab-title {
   animation: tab-waiting 1.3s ease-in-out infinite;
 }
 
-/* Somebody who has asked the desktop for less motion is not asking for less
-   news: keep the colour, drop the pulse. */
 @media (prefers-reduced-motion: reduce) {
   .tab.waiting.pulsing .tab-title {
     animation: none;
@@ -188,17 +144,10 @@ body {
   box-shadow: inset -2px 0 0 var(--accent);
 }
 
-/* A tab from another window is being held over this row, which will take it.
-   The marks above say where in the row it would land; this says the row is a
-   target at all — the one thing a page cannot show by following the pointer,
-   because the drag it is answering started in a window it cannot see. */
 #tabs.taking {
   background: #2c3348;
 }
 
-/* A file held over the tab bar. The tab it would land in says so, the same way
-   the pane does below — a drop that goes into the tab you were not looking at
-   is the one thing this has to be clear about. */
 .tab.dropping {
   box-shadow: inset 0 0 0 2px var(--accent);
 }
@@ -262,9 +211,6 @@ body {
   color: var(--fg);
 }
 
-/* Terminal text size. Pinned to the right of the tab row and deliberately
-   outside #tabs, so it stays put however many tabs are open. These change the
-   terminal font only — the tab row keeps its own size. */
 #fontsize {
   flex: none;
   display: flex;
@@ -296,11 +242,6 @@ body {
   opacity: 0.35;
 }
 
-/* New window. Deliberately unlike the + that opens a tab: that one is flat text
-   inside the tab strip, this one is an outlined glyph in its own compartment at
-   the end of the row, and it lights up in the accent colour rather than grey.
-   Two buttons that both mean "new" and do very different things have to look
-   different at a glance. */
 #windowbar {
   flex: none;
   display: flex;
@@ -309,9 +250,6 @@ body {
   border-left: 1px solid var(--border);
 }
 
-/* Reads as the window saying what it is called, and only incidentally as the
-   way to change that. Capped so a long name cannot push the tabs off the
-   strip; an unnamed window is quieter still, but never invisible. */
 #windowname {
   max-width: 22ch;
   overflow: hidden;
@@ -328,11 +266,6 @@ body {
   cursor: pointer;
 }
 
-/* A name somebody chose reads as information; the invitation on a window
-   nobody has named reads as a control, in the same dim the rest of this bar
-   uses. Told apart by colour and not by fading one of them out: below about
-   0.9 opacity this stops being legible, and test/ui.mjs's contrast sweep
-   stops scoring it, which is how a 2.6:1 label would get past. */
 #windowname:not(.unnamed) {
   color: var(--fg);
 }
@@ -370,8 +303,6 @@ body {
   color: var(--accent);
 }
 
-/* ---------- panes ---------- */
-
 #panes {
   flex: 1;
   position: relative;
@@ -389,8 +320,6 @@ body {
   display: flex;
 }
 
-/* Drawn over the terminal rather than around it: a border on the pane itself
-   would take two columns off the grid the moment a file crossed the window. */
 .pane.dropping::after {
   content: "";
   position: absolute;
@@ -407,21 +336,73 @@ body {
   background: var(--term-bg);
 }
 
-/* The gutter xterm's scrollbar runs in. xterm paints the slider and nothing
-   else, and a slider is at its 20px floor for most of a day's scrollback — so
-   the bar is only findable if the track it runs in is drawn too, the way the
-   scrollbar in a GTK terminal is. Painted only while the pane has something to
-   scroll: xterm marks the bar `.invisible` otherwise, and that rule wins on
-   opacity whatever this says about the colour.
-
-   The slider's own colours are theme keys, so they sit in app.js with the rest
-   of the palette, and SCROLLBAR_WIDTH there is what makes this 18px wide. */
 .xterm .xterm-scrollable-element > .scrollbar.vertical {
   background: #16161c;
   box-shadow: inset 1px 0 0 var(--border);
 }
 
-/* ---------- context menu ---------- */
+#grips {
+  position: fixed;
+  inset: 0;
+  z-index: 45;
+  pointer-events: none;
+}
+
+.grip {
+  position: absolute;
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.grip[data-edge="w"],
+.grip[data-edge="e"] {
+  top: var(--tabbar-height);
+  bottom: var(--grip-corner);
+  width: var(--grip);
+  cursor: ew-resize;
+}
+
+.grip[data-edge="w"] {
+  left: 0;
+}
+
+.grip[data-edge="e"] {
+  right: 0;
+}
+
+.grip[data-edge="s"] {
+  left: var(--grip-corner);
+  right: var(--grip-corner);
+  bottom: 0;
+  height: var(--grip);
+  cursor: ns-resize;
+}
+
+.grip[data-edge="sw"],
+.grip[data-edge="se"] {
+  bottom: 0;
+  width: var(--grip-corner);
+  height: var(--grip-corner);
+}
+
+.grip[data-edge="sw"] {
+  left: 0;
+  cursor: nesw-resize;
+}
+
+.grip[data-edge="se"] {
+  right: 0;
+  cursor: nwse-resize;
+  background:
+    linear-gradient(315deg, transparent 3px, var(--border) 3px, var(--border) 4px, transparent 4px),
+    linear-gradient(315deg, transparent 7px, var(--border) 7px, var(--border) 8px, transparent 8px);
+}
+
+.grip[data-edge="se"]:hover {
+  background:
+    linear-gradient(315deg, transparent 3px, var(--fg-dim) 3px, var(--fg-dim) 4px, transparent 4px),
+    linear-gradient(315deg, transparent 7px, var(--fg-dim) 7px, var(--fg-dim) 8px, transparent 8px);
+}
 
 #ctxmenu,
 #ctxsub {
@@ -457,8 +438,6 @@ body {
   color: var(--fg-dim);
 }
 
-/* Only worn by the confirmation for closing several tabs at once — the one
-   thing in this menu that ends processes that cannot be got back. */
 #ctxmenu .item.danger {
   color: var(--danger);
 }
@@ -468,8 +447,6 @@ body {
   color: #10101a;
 }
 
-/* Worn by the tick beside a setting. Fixed width so the label sits in the same
-   place whether it is ticked or not. */
 #ctxmenu .item .tick {
   display: inline-block;
   width: 1.2em;
@@ -485,8 +462,6 @@ body {
   color: #10101ab0;
 }
 
-/* A menu item that is typed into — naming this window. Hover does not tint it:
-   it is not a thing being chosen. */
 #ctxmenu .item.field {
   padding: 4px 6px;
 }
@@ -505,16 +480,10 @@ body {
   font: inherit;
 }
 
-/* The second pane of the menu — the browsers under Open Link In. Above the menu
-   it hangs off, because it is placed against its right edge and overlaps it by a
-   couple of pixels so the pointer never crosses bare desktop on the way over. */
 #ctxsub {
   z-index: 51;
 }
 
-/* The line a submenu came from keeps the highlight while the pointer is over in
-   the other pane. Hover cannot do this — the pointer has left the line by then —
-   and without it the menu looks like it is showing a pane belonging to nothing. */
 #ctxmenu .item.sub-open {
   background: var(--accent);
   color: #10101a;
@@ -530,8 +499,6 @@ body {
   margin: 4px 6px;
   background: var(--border);
 }
-
-/* ---------- dead window ---------- */
 
 #deadscreen {
   position: fixed;
@@ -576,14 +543,6 @@ body {
   user-select: all;
 }
 
-/* ---------- window picker ---------- */
-
-/*
- * The one screen in clio that is not a terminal, and it is on screen for a
- * single click. It covers the tab bar as well as the panes: this window has no
- * tabs yet, and a strip of empty chrome above the choice would be inviting a
- * click on a + that means something different from everything below it.
- */
 #picker {
   position: fixed;
   inset: 0;
@@ -634,8 +593,6 @@ body {
   gap: 4px;
 }
 
-/* The row itself is the button: the whole thing is one target, because every
-   part of it is describing the same window. */
 #picker .group-open {
   flex: 1;
   display: flex;
@@ -701,8 +658,6 @@ body {
   color: var(--danger);
 }
 
-/* Ending shells is the only thing here that cannot be undone, so it is asked
-   about in the row it would happen to, not in a dialog somewhere else. */
 #picker .group-question {
   flex: 1;
   display: flex;
@@ -750,8 +705,6 @@ body {
   outline-offset: 2px;
 }
 
-/* ---------- status ---------- */
-
 #status {
   position: fixed;
   bottom: 12px;
@@ -765,8 +718,3 @@ body {
   box-shadow: 0 4px 16px #0009;
 }
 
-/* touched by the test */
-
-/* touched by the test */
-
-/* touched by the test */

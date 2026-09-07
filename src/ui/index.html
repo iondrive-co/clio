@@ -3,7 +3,6 @@
   <head>
     <meta charset="utf-8" />
     <title>clio</title>
-    <!-- Chrome uses these for the app window's taskbar icon, largest first. -->
     <link rel="icon" type="image/png" sizes="256x256" href="/icon.png" />
     <link rel="icon" type="image/png" sizes="128x128" href="/icon-128.png" />
     <link rel="icon" type="image/png" sizes="32x32" href="/icon-32.png" />
@@ -15,21 +14,12 @@
       <div id="tabs">
         <button id="newtab" title="New tab (Ctrl+Shift+T)">+</button>
       </div>
-      <!-- Shown only by a sandbox daemon (CLIO_DEV=1). Two clios on screen are
-           otherwise identical, and typing into the wrong one is the whole
-           risk. -->
       <div id="devbadge" hidden>dev</div>
       <div id="fontsize">
         <button id="font-down" title="Smaller text">&#9662;</button>
         <button id="font-up" title="Larger text">&#9652;</button>
       </div>
-      <!-- Drawn rather than typed: a bare + is what opens a tab a few
-           centimetres to the left, and these two must not be mistaken for each
-           other. A plus inside a window frame says which one this is. -->
       <div id="windowbar">
-        <!-- What this window is called, and the only place it is named. It was
-             a line in a tab's context menu, under Rename Tab, where naming the
-             window and naming the tab were one line apart. -->
         <button id="windowname" class="unnamed">name this window</button>
         <button id="newwindow" title="New window" aria-label="New window">
           <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
@@ -43,16 +33,19 @@
 
     <div id="panes"></div>
 
+    <div id="grips">
+      <div class="grip" data-edge="w"></div>
+      <div class="grip" data-edge="e"></div>
+      <div class="grip" data-edge="s"></div>
+      <div class="grip" data-edge="sw"></div>
+      <div class="grip" data-edge="se"></div>
+    </div>
+
     <div id="status" hidden></div>
 
     <div id="ctxmenu" hidden></div>
-    <!-- The menu's second pane: the browsers under Open Link In. Its own
-         element rather than a child of the menu, so that it can hang past the
-         menu's edge without being clipped or moving anything inside it. -->
     <div id="ctxsub" hidden></div>
 
-    <!-- Which set of tabs this window is going to be. Only ever on screen when
-         windows that were closed are waiting to be opened again. -->
     <div id="picker" hidden></div>
 
     <div id="deadscreen" hidden></div>

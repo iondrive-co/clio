@@ -1,8 +1,3 @@
-/*
- * Rasterise icon.svg into the PNGs the browser and window manager use.
- * ImageMagick has no SVG delegate on this box, so render with the same engine
- * that will display it. Re-run after editing icon.svg.
- */
 import { chromium } from 'playwright';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';

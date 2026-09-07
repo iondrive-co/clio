@@ -1,28 +1,3 @@
-/*
- * A window comes back as it was, and a tab knows what is in it before anybody
- * clicks on it.
- *
- * Both of these are about the state of a desktop rather than the state of a
- * shell, and both were wrong in the same way: the only thing that knew was the
- * page, and a page exists for one window, on one monitor, for as long as that
- * window is open.
- *
- *   1. The title a program announces. It arrives as an escape sequence in the
- *      output, so the browser learns it by parsing the stream — for the one tab
- *      it has a terminal for. Every other tab in the row was named after the
- *      command instead, which after a restore means thirteen tabs called
- *      `claude`. The daemon reads them too now, for all of them.
- *
- *   2. Where the window is. Chrome honours --window-size and --window-position
- *      for the first window of its browser process and quietly ignores them for
- *      every one after, so a morning that opens four windows gets one where it
- *      was asked and three stacked on top of it. The page puts itself in place
- *      instead, and tells the daemon where it ends up.
- *
- * Runs a clio of its own, on its own state, on a display of its own making:
- *
- *   node test/windows.mjs
- */
 import { mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import { execFileSync, execSync, spawn } from 'node:child_process';
 import { join, dirname } from 'node:path';
@@ -32,16 +7,9 @@ import WebSocket from 'ws';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 
-// No window this test opens may land on the desktop of whoever is running it: a
-// window somebody else is clicking on does not move when wmctrl asks it to, and
-// the failure that follows looks like a bug in clio. Dropped here, before
-// anything can inherit it, and handed back only as a display of our own.
 delete process.env.DISPLAY;
 delete process.env.WAYLAND_DISPLAY;
 
-// And a clio of this run's own, from the first line to the last: it kills a
-// daemon outright further down, which is fatal to whatever shells that daemon
-// happens to be holding.
 const SANDBOX = mkdtempSync(join(tmpdir(), 'clio-windows-'));
 process.env.XDG_RUNTIME_DIR = join(SANDBOX, 'run');
 process.env.XDG_STATE_HOME = join(SANDBOX, 'state');
@@ -84,23 +52,19 @@ process.on('exit', () => {
   try {
     execFileSync(join(ROOT, 'bin', 'clio'), ['stop'], { stdio: 'ignore' });
   } catch {
-    /* never started, or already down */
   }
   while (started.length) {
     try {
       started.pop().kill();
     } catch {
-      /* already gone */
     }
   }
   try {
     rmSync(SANDBOX, { recursive: true, force: true });
   } catch {
-    /* leave it, it is in /tmp */
   }
 });
 
-/** A display of this test's own, or null if the machine cannot provide one. */
 async function startDisplay() {
   if (!installed('Xvfb')) return null;
   const wm = WINDOW_MANAGERS.find(installed);
@@ -113,7 +77,7 @@ async function startDisplay() {
     const xvfb = spawn('Xvfb', [display, '-screen', '0', '1920x1080x24'], { stdio: 'ignore' });
     started.push(xvfb);
     await sleep(1500);
-    if (xvfb.exitCode !== null) continue; // that number was taken after all
+    if (xvfb.exitCode !== null) continue;
 
     started.push(spawn(wm, [], { stdio: 'ignore', env: { ...process.env, DISPLAY: display } }));
     await sleep(1500);
@@ -134,21 +98,11 @@ async function status() {
   return res.json();
 }
 
-/**
- * A page saying it is on its way out, the way a real one does — sendBeacon to
- * /gone as it is taken apart. It is the whole of the difference between a window
- * somebody closed and a page that was killed, so a test about that difference
- * has to be able to say it.
- */
 async function goodbye(container) {
   const { port, token } = handshake();
   await fetch(`http://127.0.0.1:${port}/gone?c=${container}&token=${token}`, { method: 'POST' });
 }
 
-/**
- * A second view of one window's tabs, which is how this test plays the part of a
- * page without opening one.
- */
 async function connect(container) {
   const { port, token } = handshake();
   const ws = new WebSocket(`ws://127.0.0.1:${port}/?token=${token}&c=${container}`, {
@@ -158,8 +112,6 @@ async function connect(container) {
   ws.on('message', (raw) => {
     const msg = JSON.parse(raw);
     if (msg.t === 'sessions') {
-      // The daemon has the last word on which container this is; asking for none
-      // is how a fresh window is given one.
       client.container = msg.container;
       client.sessions = msg.sessions;
     }
@@ -178,25 +130,16 @@ console.log(`clio window test — sandbox at ${SANDBOX}`);
 console.log(clio('start').trim());
 await sleep(500);
 
-/* ------------------------------------------- 1. the title a program announces */
-
 console.log('\n1. a tab is named after what is running in it, unopened');
 
 const client = await connect('');
 await sleep(500);
 
-// A daemon with nothing in it: make the tab this test needs. Nothing attaches to
-// it and no window is showing it, which is the whole point — this is the tab that
-// used to come back called `claude`.
 client.send({ t: 'create', cwd: process.env.HOME, cols: 80, rows: 24 });
 await sleep(1500);
 const tab = client.created;
 check('a tab was made', !!tab, JSON.stringify(client.sessions.map((s) => s.id)));
 
-// What Claude Code does, minus Claude Code: announce a title and stay in the
-// foreground. The prompt is deliberately not allowed to come back — a shell sets
-// a title of its own the moment it does, which is the one thing an agent at work
-// never does.
 client.send({
   t: 'input',
   id: tab.id,
@@ -225,16 +168,11 @@ check(
   afterReload.tab(tab.id)?.termTitle === '✳ Fixing the parser',
   JSON.stringify(afterReload.tab(tab.id)?.termTitle),
 );
-// End that tab before going on. A set of tabs left with nobody looking at them
-// is a window that was closed, and `clio` would offer it in the picker rather
-// than opening the plain window the next section is about.
 afterReload.send({ t: 'close', id: tab.id });
 await sleep(1000);
 afterReload.ws.close();
 client.ws.close();
 await sleep(1500);
-
-/* ---------------------------------------------------- 3. where a window sits */
 
 const display = await startDisplay();
 if (!display) {
@@ -264,16 +202,11 @@ const windows = () =>
     })
     .sort((a, b) => a.x - b.x || a.y - b.y);
 
-// The daemon has to be told about the display: it was started from a shell that
-// had none, which is exactly the position a daemon started by a desktop launcher
-// is in when the session it was launched from goes away.
 clio();
 await sleep(7000);
 check('a window is on screen', windows().length === 1, JSON.stringify(windows()));
 
 const showing = (await status()).containers.find((c) => c.sessions.length)?.id;
-// It has to be a window with a shell in it, not the picker: a frame that has not
-// been told what it is showing yet deliberately does not report where it is.
 check('and it is a window with tabs, not the picker', !!showing, JSON.stringify(await status()));
 const page = await connect(showing);
 page.send({ t: 'newwindow', cwd: process.env.HOME });
@@ -282,8 +215,6 @@ page.ws.close();
 
 const two = windows();
 check('a second window opened', two.length === 2, JSON.stringify(two));
-// Not an assertion, a demonstration: the browser puts the second window exactly
-// where it put the first, whatever it was told.
 console.log(`   the browser left them at ${two.map((w) => `${w.x},${w.y} ${w.w}x${w.h}`).join(' | ')}`);
 
 const want = [
@@ -331,22 +262,6 @@ placed.forEach((was, i) => {
   );
 });
 
-/* ------------------------- 5. a place the window cannot get to on its own */
-
-/*
- * The monitor a window was on is the half of "where it was" that a page cannot
- * do anything about. A browser answers a move that would take a window off the
- * display it is on by moving it as far as that display allows and stopping
- * there — so a window whose place is on the next screen along comes back the
- * right size against the wrong edge, and then reports that edge as though
- * somebody had chosen it, which is how a desktop collapses onto one monitor a
- * restore at a time.
- *
- * One display is all a test machine has, so the stand-in for another monitor is
- * a position on this one that a page is refused in exactly the same way: half
- * off the right-hand edge. Nothing the page can do puts a window there. The
- * daemon can, through the window manager, and that is what this checks.
- */
 console.log('\n5. a window comes back somewhere its page could never move it');
 
 const overhang = { x: 1500, y: 300, w: 700, h: 480 };
@@ -385,24 +300,9 @@ check(
   !wmctrl('-l').includes('putting this window back'),
   wmctrl('-l').trim(),
 );
-// The point of the whole exercise: what is on file is still where the window
-// belongs, not the edge the browser would only let it get to.
 const overhangOnFile = savedState().containers.find((c) => c.geometry && Math.abs(c.geometry.x - overhang.x) <= 6);
 check('and the position on file was not overwritten on the way', !!overhangOnFile, JSON.stringify(savedState().containers.map((c) => c.geometry)));
 
-/* --------------------------- 6. what the picker is for, and what it is not */
-
-/*
- * A window that was closed and a window whose page was killed leave the daemon
- * in the same position — a socket gone and nothing coming back — and need
- * opposite answers. One is somebody putting a window away, and belongs in the
- * list `clio` offers by name. The other is a window nobody closed, and the only
- * right answer is to put it back the way it was.
- *
- * The difference is the goodbye a page sends as it is taken apart, and these two
- * sections are the difference: same socket dropping, one with it and one
- * without.
- */
 console.log('\n6. a page that was killed is still a window that is open');
 
 const killedPage = await connect('');
@@ -410,8 +310,6 @@ await sleep(500);
 killedPage.send({ t: 'create', cwd: process.env.HOME, cols: 80, rows: 24 });
 await sleep(1500);
 const killedId = killedPage.container;
-// No goodbye: this is a renderer the system took, with nothing left of it to
-// say anything.
 killedPage.ws.close();
 await sleep(12000);
 
@@ -433,18 +331,6 @@ await sleep(12000);
 listed = (await status()).containers.find((c) => c.id === closedId);
 check('it is in the list', listed && listed.saved, JSON.stringify(listed));
 
-/* ------------------------------ 8. the browser going down under all of them */
-
-/*
- * Every clio window is a page in one browser process. When that process goes —
- * a crash, an update restarting it, the desktop being shut down under it —
- * every window is taken apart at once, and each says goodbye on the way out
- * exactly as it would if somebody had clicked its close button. Nobody closed
- * any of them, and this is the event that used to turn a reboot into a list of
- * names to choose from: four windows, four goodbyes, four entries in the picker.
- *
- * One at a time they cannot be told apart from a close. Together they can.
- */
 console.log('\n8. every window going at once is the browser, not a decision');
 
 const together = [];
@@ -455,7 +341,6 @@ for (const _ of [1, 2]) {
   await sleep(1500);
   together.push(client);
 }
-// Both at once, the way a browser being taken down does it.
 for (const client of together) await goodbye(client.container);
 for (const client of together) client.ws.close();
 await sleep(12000);
@@ -469,17 +354,7 @@ for (const [index, client] of together.entries()) {
     JSON.stringify(seen),
   );
 }
-/* ------------------------------- 9. the desktop going down under a window */
 
-/*
- * The second half of the same thing, from the other side: a close that is still
- * inside its grace period when the daemon is told to stop. Nothing about it has
- * been decided, and the way out of the process is not the place to decide it —
- * so it is left as a window that was open, and `clio` puts it back.
- *
- * A close that had already run its course is untouched, which is the other half
- * of the check.
- */
 console.log('\n9. a shutdown keeps what was still undecided');
 
 const goingDown = await connect('');

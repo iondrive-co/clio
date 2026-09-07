@@ -22,7 +22,6 @@ export function onPath(name, env = process.env) {
       accessSync(candidate, constants.X_OK);
       return candidate;
     } catch {
-      /* not here */
     }
   }
   return null;
@@ -36,35 +35,13 @@ export function findBrowser(env = process.env) {
   return null;
 }
 
-// How a Linux desktop is asked to open something. Both consult the same
-// mimeapps.list your file manager does, so a link clicked in clio lands in the
-// browser you actually use, as a tab next to everything else you have open —
-// which is what clicking a link in any other terminal does.
 const URL_OPENERS = [
   ['xdg-open', []],
   ['gio', ['open']],
 ];
 
-// Schemes a click in a terminal could sensibly mean. The text on screen is not
-// something the user wrote — it is the contents of a file, or the output of
-// whatever ran last — so this list is short on purpose.
 const OPENABLE = new Set(['http:', 'https:', 'mailto:']);
 
-/**
- * Hand a URL to the desktop, and say what opened it.
- *
- * The URL is passed as an argument to a program that is executed directly, so
- * there is no shell for anything in it to reach. Parsing it first is what makes
- * that true: what goes out is a URL with a scheme from the list above, never a
- * loose string that might read as an option.
- *
- * A browser may be named instead, by the id the window was given in the list
- * below. An id and not a command: what starts is only ever something already
- * installed on this machine, found again by looking the id up.
- *
- * CLIO_URL_OPENER names a program to use instead, for a desktop that has
- * neither of these or a person who wants a particular browser.
- */
 export function openUrl(raw, env = process.env, browserId = null) {
   let url;
   try {
@@ -106,30 +83,12 @@ export function openUrl(raw, env = process.env, browserId = null) {
   );
 }
 
-// ------------------------------------------------------------------ browsers
-/*
- * Every browser on this machine, by the desktop's own reckoning.
- *
- * The opener above answers "whichever browser you have chosen", which is the
- * right answer almost always and the wrong one exactly when somebody wants
- * *this* link in *that* browser — the work login in one, everything else in
- * another. The names for that choice are not clio's to invent: every browser on
- * a Linux desktop ships a .desktop file saying what it is called and how it is
- * started, and it is the same list the file manager's Open With is built from.
- */
-
-// Where those files live, most specific first, so a browser somebody installed
-// for themselves is the one found rather than the system copy of the same name.
 function applicationDirs(env) {
   const home = env.XDG_DATA_HOME || (env.HOME ? join(env.HOME, '.local', 'share') : '');
   const shared = (env.XDG_DATA_DIRS || '/usr/local/share:/usr/share').split(':').filter(Boolean);
   return [...(home ? [home] : []), ...shared].map((dir) => join(dir, 'applications'));
 }
 
-// Programs that are not a browser but stand in front of one: the desktop's own
-// launchers, and Debian's alternatives. Following any of them arrives wherever
-// the default already points — which is what clicking the link does without any
-// of this, and is not a choice worth a line in a menu.
 const INDIRECT = new Set([
   'exo-open',
   'xdg-open',
@@ -143,15 +102,6 @@ const INDIRECT = new Set([
   'www-browser',
 ]);
 
-/**
- * The [Desktop Entry] group of a .desktop file, as plain keys.
- *
- * Only that first group: the ones after it are actions — Chrome's New Incognito
- * Window, LibreWolf's profile manager — each with a Name and an Exec of its
- * own, and reading past the header would quietly answer with one of those.
- * Localised keys (Name[de]) are skipped for the same reason: the last one read
- * would win, and it would be in a language nobody here asked for.
- */
 function desktopEntry(path) {
   let text;
   try {
@@ -179,14 +129,6 @@ function desktopEntry(path) {
   return Object.keys(fields).length ? fields : null;
 }
 
-/**
- * Split an Exec line the way the desktop entry spec says to.
- *
- * Quotes and backslashes rather than a shell split, because that is what the
- * file is written in — and because what comes out is argv for a program run
- * directly. Nothing here reaches a shell, so a .desktop file with shell syntax
- * in it is a program with an odd argument rather than a command.
- */
 function execArgv(line) {
   const argv = [];
   let token = '';
@@ -228,12 +170,9 @@ function executable(path) {
   }
 }
 
-/** The program a .desktop file names, as a path that can be run, or null. */
 function runnable(argv, fields, env) {
   const program = argv[0];
   if (!program) return null;
-  // TryExec is the file's own answer to "is this installed?", and a browser
-  // whose package has gone often leaves its .desktop file behind.
   if (fields.TryExec) {
     const tried = fields.TryExec.includes('/')
       ? executable(fields.TryExec)
@@ -243,13 +182,6 @@ function runnable(argv, fields, env) {
   return program.includes('/') ? executable(program) : onPath(program, env);
 }
 
-/**
- * The browsers, each with the name it calls itself and the argv that starts it.
- *
- * Read afresh every time rather than kept: it is a few dozen small files, read
- * when a window connects or a link is opened, and a browser installed this
- * afternoon should be in the menu this afternoon.
- */
 export function listBrowsers(env = process.env) {
   const found = [];
   const seenId = new Set();
@@ -267,23 +199,13 @@ export function listBrowsers(env = process.env) {
       if (!name.endsWith('.desktop') || seenId.has(name)) continue;
       const fields = desktopEntry(join(dir, name));
       if (!fields) continue;
-      // Even an entry that is not a browser claims its id: the same file name
-      // further down the search path is the system copy of what was just read.
       seenId.add(name);
 
       if (fields.Type && fields.Type !== 'Application') continue;
-      // NoDisplay is how a package says "this entry is plumbing" — the second,
-      // identical Chrome entry that exists only to own a MIME type. Hidden
-      // means deleted. Terminal means it wants one, and a link opened from a
-      // menu has no tab waiting to give it.
       if (fields.NoDisplay === 'true' || fields.Hidden === 'true') continue;
       if (fields.Terminal === 'true') continue;
       if (!fields.Exec) continue;
 
-      // What makes something a browser: it says it handles http, or it files
-      // itself under WebBrowser. Firefox on this machine does only the second —
-      // its MimeType line lists text/html and no scheme at all — so either test
-      // used alone leaves out a browser somebody has.
       const handlesHttp = (fields.MimeType || '').includes('x-scheme-handler/http');
       const isBrowser = (fields.Categories || '').split(';').includes('WebBrowser');
       if (!handlesHttp && !isBrowser) continue;
@@ -293,7 +215,6 @@ export function listBrowsers(env = process.env) {
       const program = runnable(argv, fields, env);
       if (!program) continue;
 
-      // Two files naming the same command are one browser listed twice.
       const command = [program, ...argv.slice(1)].join(' ');
       if (seenCommand.has(command)) continue;
       seenCommand.add(command);
@@ -305,20 +226,10 @@ export function listBrowsers(env = process.env) {
   return found.sort((a, b) => a.name.localeCompare(b.name));
 }
 
-/** What a window is told about them: a name to show, and the id to ask back for. */
 export function browserChoices(env = process.env) {
   return listBrowsers(env).map(({ id, name }) => ({ id, name }));
 }
 
-/**
- * The arguments that open one URL in one browser.
- *
- * Field codes are the desktop entry spec's placeholders. The URL goes where the
- * file says to put it, and where a file says nothing it goes on the end — a
- * browser handed a URL it was not asked for still opens it, and a browser
- * handed nothing at all opens an empty window, which is the one outcome worth
- * ruling out.
- */
 function argsFor(browser, url) {
   const args = [];
   let placed = false;
@@ -335,10 +246,7 @@ function argsFor(browser, url) {
       }
       continue;
     }
-    // %i, %c, %k and the rest are about menus and icons, not about this.
     if (/^%[a-zA-Z]$/.test(token)) continue;
-    // Flatpak's way of saying "the arguments go here". The codes inside have
-    // been dealt with already, and the brackets are not arguments themselves.
     if (token === '@@' || token === '@@u' || token === '@@U') continue;
     args.push(token);
   }
@@ -347,32 +255,12 @@ function argsFor(browser, url) {
   return args;
 }
 
-/**
- * Say something on the desktop, and say whether anything was there to hear it.
- *
- * There is one thing clio has to tell somebody who is not looking at a clio
- * window: that a window's page was killed, and what is in that window now is
- * Chrome's error page rather than anything of ours. Nothing inside the window
- * can say it — the page that would have said it is the thing that died — so it
- * is said out here instead.
- *
- * Critical urgency because the notification outliving the glance matters: a
- * desktop that clears it after five seconds is a desktop where a window stays
- * dead all afternoon because nobody happened to be looking. Nothing clio has
- * to say is urgent in the battery-is-empty sense; this is the only thing it
- * says at all, and it is about a window that is not coming back on its own.
- *
- * CLIO_NOTIFIER names a program to use instead, for a desktop without
- * notify-send and for the tests, which read back what was said.
- */
 export function notifyDesktop(summary, body, env = process.env) {
   const override = env.CLIO_NOTIFIER || process.env.CLIO_NOTIFIER;
   const command = override || 'notify-send';
   const found = command.includes('/') ? command : onPath(command, env);
   if (!found) return false;
 
-  // Only notify-send is known to take these; anything named by hand is given
-  // the two strings and nothing to choke on.
   const args = override
     ? [summary, body]
     : ['--app-name=clio', `--icon=${ICON}`, '--urgency=critical', summary, body];
@@ -382,81 +270,23 @@ export function notifyDesktop(summary, body, env = process.env) {
     child.unref();
     return true;
   } catch {
-    // A desktop with nothing listening is one where this was never going to
-    // arrive. The window is still there, and still fixable by hand.
     return false;
   }
 }
 
-/**
- * Put a clio window on screen, showing whichever container the URL names.
- *
- * The daemon does this rather than the launcher because the window is not only
- * ever asked for from a shell: the + in the tab row asks for one too, and a page
- * cannot spawn a process. Both paths land here, so a window opened by either
- * looks the same.
- *
- * Errors are flagged `fatal` when there is nothing to retry — no browser on the
- * machine is not a race, and pretending otherwise only delays the message.
- */
-/*
- * The size a window opens at when nothing is known about where it was.
- * Chrome-family browsers only honour this — and --window-position — for the
- * first window of a profile's browser process; every one after that is placed
- * wherever the browser feels like, which is why the page moves itself into place
- * once it is up. See applyGeometry in ../ui/app.js. Passing them anyway is worth
- * it for the first window of the day, which is the one that would otherwise be
- * seen jumping.
- */
 const DEFAULT_WINDOW_SIZE = '1100,700';
 
-/**
- * What to call the display a window is on, in one word.
- *
- * Both names, not the first one that happens to be set: this desktop is an X11
- * session that also has a live wayland-0 socket, and which of the two a browser
- * attaches to is the browser's decision, not something to guess at. The pair is
- * the address. Two launches with the same pair share a browser, which is what
- * makes a second window appear beside the first; two launches with different
- * pairs never do.
- *
- * Used as a path and as a URL, so it is written to be safe as either: it names
- * the profile below, and it travels in a window's own address so that the
- * window can say afterwards which display it came up on. That is what lets a
- * second session — somebody arriving over RDP to a desktop that is also logged
- * in locally — be told apart from the one that opened the window. See
- * displayOfClient in ../daemon/index.js.
- */
 export function displayKey(env = process.env) {
   const key = [env.DISPLAY, env.WAYLAND_DISPLAY].filter(Boolean).join('+').replace(/^:/, '');
   return key.replace(/[^A-Za-z0-9._+-]/g, '_');
 }
 
-/*
- * The profile a window's browser uses: one for every display.
- *
- * A chrome-family browser started with a --user-data-dir that another process
- * already holds does not open a window itself. It hands the request to that
- * process and exits, and the window comes up wherever *that* process is — on
- * the display it was started on, which is not necessarily the one being asked
- * for. A profile per display is therefore a browser per display, and a window
- * asked for on :10 can no longer appear on :0, or nowhere at all.
- *
- * Nowhere at all is not hypothetical. An autostart entry ran clio at boot,
- * seventeen minutes before the session's X server existed; the browser it
- * spawned had no display, did not exit, and held no X connection — and every
- * window asked for afterwards was handed to it and never seen. The refusal
- * below stops that browser being started; this stops one like it, however it
- * came about, from swallowing the windows that come after.
- */
 function profileFor(env) {
   const slug = displayKey(env);
   return slug ? `${BROWSER_PROFILE_DIR}-${slug}` : BROWSER_PROFILE_DIR;
 }
 
 export function openBrowserWindow(url, env = process.env, { geometry = null } = {}) {
-  // A window has to have somewhere to be. Asked for one with no display, the
-  // honest answer is that there is none — not a browser spawned into nothing.
   if (!env.DISPLAY && !env.WAYLAND_DISPLAY) {
     const err = new Error('no display to put a window on (DISPLAY and WAYLAND_DISPLAY are both unset)');
     err.fatal = true;
@@ -471,8 +301,6 @@ export function openBrowserWindow(url, env = process.env, { geometry = null } = 
   }
 
   return new Promise((resolve, reject) => {
-    // detached, as the launcher does with setsid: without its own session the
-    // browser stays in the daemon's process group and would go down with it.
     const child = spawn(
       browser,
       [
@@ -484,29 +312,11 @@ export function openBrowserWindow(url, env = process.env, { geometry = null } = 
         '--no-first-run',
         '--no-default-browser-check',
         '--disable-features=Translate,MediaRouter',
-        // Never ask the desktop's keyring for anything.
-        //
-        // A chrome-family browser with a profile on disk encrypts what it
-        // stores with a key it fetches from the OS keyring over D-Bus, and that
-        // fetch has no timeout: on a machine whose login keyring is locked —
-        // waiting on a prompt nobody has answered, or one that cannot be shown
-        // — it never returns. Every request the browser makes waits behind it,
-        // which is a blank window and a daemon reporting that no window
-        // appeared, with nothing anywhere to say why. It is not a hypothetical:
-        // a Kicksecure desktop with gcr-prompter waiting did exactly this, and
-        // the netlog showed the connection to clio's own port made and the GET
-        // never sent.
-        //
-        // There is nothing in this profile that wants a keyring. It is clio's
-        // own, it is mode 700, and the single thing in it is a cookie holding a
-        // token that is already on disk in the handshake file next to it.
         '--password-store=basic',
       ],
       { detached: true, stdio: 'ignore', env },
     );
 
-    // A browser that hands off to an already-running instance exits immediately,
-    // so there is nothing to wait for beyond spawn failing outright.
     const failed = (err) => {
       clearTimeout(timer);
       err.fatal = true;
