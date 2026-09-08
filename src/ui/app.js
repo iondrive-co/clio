@@ -1064,29 +1064,49 @@ function popGeometry(at) {
   };
 }
 
-function homeRect() {
-  const home = dragId && el.tabs.querySelector(`.tab[data-id="${dragId}"]`);
-  return home ? home.getBoundingClientRect() : null;
-}
+const centreOf = (rect) => rect.left + rect.width / 2;
 
-function draggedEdge(clientX) {
-  if (!dragGrab) return clientX;
-  const left = clientX - dragGrab.dx;
-  const home = homeRect();
-  const moved = home ? left - home.left : 0;
-  if (moved > 0) return left + dragGrab.width;
-  if (moved < 0) return left;
-  return left + dragGrab.width / 2;
-}
-
-function insertionAt(x) {
+// A tab goes where the middle of it has got to: it passes a neighbour when its
+// own middle passes that neighbour's middle. That is what the browser's own tab
+// strips do, and it is the only measure that reads the same at every width.
+//
+// Until 2026-09-08 this measured the *leading edge* of the dragged tab instead,
+// and every rightward drag landed one or two whole tabs too far along: the
+// leading edge is a tab-width out in front of the tab, so it crossed middles
+// the tab itself had not reached and counted them as passed. The error grew
+// with the width of the tab being dragged — measured on a row like the real
+// ones, two tabs for a 204px claude tab among 90px ones, one for a narrow tab —
+// so it could not even be aimed off by hand. A row of equal-width tabs hides it
+// completely, which is why the tests did not see it: they moved a tab by
+// exactly one tab-width, which in such a row is the same aim.
+//
+// The pointer is not the measure and never was: a tab held near its right edge
+// has its whole body to the left of the pointer, and aiming the pointer throws
+// it a tab the other way. `dragGrab.dx` is where the tab was taken hold of, so
+// `clientX - dx` is where its left edge is now. A tab dragged in from another
+// window is not in this row and has no width here, so for that one the pointer
+// is all there is.
+function insertionAt(clientX) {
   const tabs = [...el.tabs.querySelectorAll('.tab[data-id]')];
-  for (const tab of tabs) {
-    const rect = tab.getBoundingClientRect();
-    if (x < rect.left + rect.width / 2) return { tab, before: true };
+  if (!tabs.length) return null;
+
+  const home = tabs.findIndex((tab) => tab.dataset.id === dragId);
+  const rest = tabs.filter((tab, index) => index !== home);
+  if (!rest.length) return null;
+
+  const own = home === -1 ? null : tabs[home].getBoundingClientRect();
+  const width = dragGrab?.width || own?.width || 0;
+  const aim = dragGrab ? clientX - dragGrab.dx + width / 2 : clientX;
+
+  // Landing exactly on a neighbour's middle is a tie, and a drag of one whole
+  // tab is how a hand lands on it. Half a pixel of slack, given to the
+  // direction the drag was going, means such a drag passes rather than sticks.
+  const slack = own ? Math.sign(aim - centreOf(own)) * 0.5 : 0;
+
+  for (const tab of rest) {
+    if (centreOf(tab.getBoundingClientRect()) > aim + slack) return { tab, before: true };
   }
-  const last = tabs[tabs.length - 1];
-  return last ? { tab: last, before: false } : null;
+  return { tab: rest[rest.length - 1], before: false };
 }
 
 function orderWith(id, spot) {
@@ -1102,27 +1122,40 @@ function changesRow(next) {
   return next.length !== order.length || next.some((id, i) => id !== order[i]);
 }
 
+// A tab drag is aimed along the row, but it is not caught by the row alone.
+// The row is 31px tall at the very top of the window, and while it was the only
+// thing listening, a drag that sank below it landed nowhere: no marker, no
+// reorder, no complaint. Measured on 2026-09-08 — a tab held in the middle and
+// let go 20px lower than it was grabbed did nothing at all, which is most of
+// the drags a hand makes.
+//
+// So the whole window takes a dropped tab, and where it lands is read off the
+// horizontal aim by itself. Nothing else in a window wants a tab: file and text
+// drops carry their own types and `droppable` turns this one away, and a tab let
+// go outside every window pops out from `ondragend` instead. A drag straight
+// down still does nothing, because `changesRow` sees that the order it would
+// produce is the order already there.
 function wireStrip() {
-  el.tabs.addEventListener('dragover', (event) => {
+  window.addEventListener('dragover', (event) => {
     if (!carriesTab(event.dataTransfer)) return;
     event.preventDefault();
     event.dataTransfer.dropEffect = 'move';
     clearDropMarkers();
     if (!dragId) el.tabs.classList.add('taking');
-    const spot = insertionAt(draggedEdge(event.clientX));
+    const spot = insertionAt(event.clientX);
     if (!spot || (dragId && !changesRow(orderWith(dragId, spot)))) return;
     spot.tab.classList.add(spot.before ? 'drop-before' : 'drop-after');
   });
 
-  el.tabs.addEventListener('dragleave', (event) => {
-    if (el.tabs.contains(event.relatedTarget)) return;
+  window.addEventListener('dragleave', (event) => {
+    if (event.relatedTarget !== null) return;
     clearDropMarkers();
   });
 
-  el.tabs.addEventListener('drop', (event) => {
+  window.addEventListener('drop', (event) => {
     if (!carriesTab(event.dataTransfer)) return;
     event.preventDefault();
-    const spot = insertionAt(draggedEdge(event.clientX));
+    const spot = insertionAt(event.clientX);
     clearDropMarkers();
 
     let dropped = null;

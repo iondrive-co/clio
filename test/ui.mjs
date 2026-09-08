@@ -861,15 +861,23 @@ async function main() {
     JSON.stringify([...labelsBefore].sort()) === JSON.stringify([...labelsAfter].sort()),
   );
 
-  const oneAlong = async (index, places, hold) => {
+  // One place over is the tab's own middle reaching the middle of the neighbour
+  // it is passing — not its own width, which means the same thing only in a row
+  // where every tab is equally wide, and a real row is nothing like that.
+  const oneAlong = async (index, places, hold, dip = 0) => {
     const before = await page.evaluate(() => order.slice());
     const box = await page.locator('.tab').nth(index).boundingBox();
+    const past = await page.locator('.tab').nth(index + places).boundingBox();
+    // A pixel beyond that middle, not exactly on it: on it is the switch point
+    // itself, and which side of it a fractional tab width and an integer
+    // pointer coordinate come down on is luck rather than behaviour.
+    const travel = past.x + past.width / 2 - (box.x + box.width / 2) + Math.sign(places);
     const from = hold === 'right' ? box.x + box.width - 8 : box.x + 8;
     const y = box.y + box.height / 2;
     await page.mouse.move(from, y);
     await page.mouse.down();
     for (let step = 1; step <= 10; step++) {
-      await page.mouse.move(from + (box.width * places * step) / 10, y);
+      await page.mouse.move(from + (travel * step) / 10, y + (dip * step) / 10);
       await page.waitForTimeout(20);
     }
     await page.mouse.up();
@@ -877,17 +885,99 @@ async function main() {
     const want = before.slice();
     want.splice(index + places, 0, want.splice(index, 1)[0]);
     const after = await page.evaluate(() => order.slice());
+    const sideways = places < 0 ? 'left' : 'right';
     check(
-      `a tab dragged one place ${places < 0 ? 'left' : 'right'}, held by its ${hold} edge, went one place ${places < 0 ? 'left' : 'right'}`,
+      `a tab dragged one place ${sideways}, held by its ${hold} edge${dip ? ` and let go ${dip}px below the row` : ''}, went one place ${sideways}`,
       JSON.stringify(after) === JSON.stringify(want),
       after.join(' ') === before.join(' ') ? 'it did not move at all' : `landed ${after.join(' ')}, wanted ${want.join(' ')}`,
     );
   };
 
-  await oneAlong(3, -1, 'right');
+  // Every case has to have a neighbour to pass, or it asserts nothing: dragging
+  // the last tab further right is a drag with nowhere to go, and it "passed"
+  // here for as long as the expectation was nowhere either.
+  const inRow = await page.locator('.tab').count();
+  const lastTab = inRow - 1;
+  check(`the row has neighbours to drag between (${inRow} tabs)`, inRow >= 4, String(inRow));
+
+  await oneAlong(lastTab, -1, 'right');
   await oneAlong(2, -1, 'left');
-  await oneAlong(3, +1, 'left');
-  await oneAlong(2, +1, 'right');
+  await oneAlong(1, +1, 'left');
+  await oneAlong(lastTab - 1, +1, 'right');
+
+  // The row is 31px tall, so a hand that dips while it drags is out of it: for
+  // as long as the row was the only drop target, those drags did nothing.
+  await oneAlong(1, +1, 'left', 120);
+  await oneAlong(lastTab, -1, 'right', 400);
+
+  const pulledDown = async (index, dip) => {
+    const before = await page.evaluate(() => order.slice());
+    const box = await page.locator('.tab').nth(index).boundingBox();
+    const x = box.x + box.width / 2;
+    const y = box.y + box.height / 2;
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    for (let step = 1; step <= 10; step++) {
+      await page.mouse.move(x, y + (dip * step) / 10);
+      await page.waitForTimeout(20);
+    }
+    await page.mouse.up();
+    await page.waitForTimeout(900);
+    const after = await page.evaluate(() => order.slice());
+    check(
+      `a tab pulled ${dip}px straight down, with no sideways aim, stays where it is`,
+      JSON.stringify(after) === JSON.stringify(before),
+      `${before.join(' ')} -> ${after.join(' ')}`,
+    );
+  };
+
+  await pulledDown(2, 300);
+
+  // Every row measured above is near enough one width, and that is exactly what
+  // hid the aim bug of 8 Sep: half of a real row is claude conversations with
+  // long names, and a 200px tab measured by one edge landed two whole tabs past
+  // the gap it was aimed at. So widen a tab and aim it by its middle, which with
+  // a middle grab means putting the pointer on the gap itself.
+  await page.evaluate(() =>
+    send({ t: 'rename', id: order[1], title: 'a claude conversation with a long name' }),
+  );
+  await page.waitForTimeout(1000);
+  const widths = await page.$$eval('.tab[data-id]', (tabs) =>
+    tabs.map((tab) => Math.round(tab.getBoundingClientRect().width)),
+  );
+  check(
+    'the row is not all one width, which is the case that hid the last aim bug',
+    Math.max(...widths) - Math.min(...widths) > 40,
+    widths.join(' '),
+  );
+
+  const aimBetween = async (index, gap) => {
+    const before = await page.evaluate(() => order.slice());
+    const box = await page.locator('.tab').nth(index).boundingBox();
+    const edge = await page.locator('.tab').nth(gap).boundingBox();
+    const from = box.x + box.width / 2;
+    const y = box.y + box.height / 2;
+    await page.mouse.move(from, y);
+    await page.mouse.down();
+    for (let step = 1; step <= 12; step++) {
+      await page.mouse.move(from + ((edge.x - from) * step) / 12, y);
+      await page.waitForTimeout(20);
+    }
+    await page.mouse.up();
+    await page.waitForTimeout(900);
+    const want = before.filter((id) => id !== before[index]);
+    want.splice(want.indexOf(before[gap]), 0, before[index]);
+    const after = await page.evaluate(() => order.slice());
+    check(
+      `a ${Math.round(box.width)}px tab, middle put on the gap before tab ${gap}, landed in that gap`,
+      JSON.stringify(after) === JSON.stringify(want),
+      `landed ${after.join(' ')}, wanted ${want.join(' ')}`,
+    );
+  };
+
+  await aimBetween(1, lastTab);
+  await aimBetween(lastTab, 1);
+  await aimBetween(2, 0);
 
   await page.screenshot({ path: join(SHOTS, '05-final.png') });
   check('no console errors overall', consoleErrors.length === 0, consoleErrors.join(' | '));
