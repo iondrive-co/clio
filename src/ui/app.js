@@ -251,7 +251,6 @@ function handle(msg) {
       }
       syncSessions(msg.sessions, msg.home);
       refreshTitle();
-      answeringCheck();
       break;
 
     case 'groups':
@@ -780,7 +779,20 @@ function activate(id) {
   pane.term.focus();
 
   renderTabs();
+  revealTab(id);
   refreshTitle();
+}
+
+// A full row scrolls, so the tab just activated — the new one the + has only
+// this moment made, most of all — can be off the end of it. Bring it into view,
+// and only when it is out of view, so scrolling the row by hand still holds.
+function revealTab(id) {
+  const tab = el.tabs.querySelector(`[data-id="${id}"]`);
+  if (!tab) return;
+  const port = el.tabs.getBoundingClientRect();
+  const box = tab.getBoundingClientRect();
+  if (box.left < port.left) el.tabs.scrollLeft -= port.left - box.left;
+  else if (box.right > port.right) el.tabs.scrollLeft += box.right - port.right;
 }
 
 function refreshTitle() {
@@ -883,6 +895,30 @@ function schedulePulseEnd(now) {
   if (soonest !== Infinity) pulseTimer = setTimeout(() => renderTabs(), soonest + 20);
 }
 
+// What a tab looks like: the same for a tab being made and a tab being
+// brought up to date, so the two cannot drift apart.
+function dressTab(tab, id, meta, now) {
+  tab.className =
+    'tab' +
+    (id === activeId ? ' active' : '') +
+    (meta.unseenOutput ? ' activity' : '') +
+    (meta.waiting && id !== activeId ? ' waiting' : '') +
+    (pulsing(id, meta, now) ? ' pulsing' : '');
+
+  const label = tabLabel(meta);
+  tab.title = [label, meta.cwd].filter(Boolean).join('\n');
+
+  const holder = tab.querySelector('.tab-title');
+  if (!holder) return;
+  // A tab being renamed is holding an input, and what it says is the hand's —
+  // but only until the rename is over: `commit` turns `renaming` off and asks
+  // for a render, and that render is what puts the settled name back in place
+  // of the input.
+  if (renaming && holder.firstElementChild) return;
+  if (holder.firstElementChild) holder.replaceChildren(label);
+  else if (holder.textContent !== label) holder.textContent = label;
+}
+
 function renderTabs(force = false) {
   if (renaming && !force) return;
 
@@ -906,26 +942,38 @@ function renderTabs(force = false) {
   if (!force && signature === lastTabsSignature) return;
   lastTabsSignature = signature;
 
+  const ids = order.filter((id) => sessions.has(id));
+  const drawn = [...el.tabs.children];
+
+  // Almost every render is a tab saying it is called something slightly
+  // different — a working codex or claude spins a frame through its terminal
+  // title ten times a second, and each frame arrives here. Re-dress the tabs
+  // that are already in the row for that, and only build the row again when
+  // the row itself has changed. Taking an element out of the document between
+  // the press and the release of a click loses that click, so a row rebuilt
+  // ten times a second is a row whose × cannot be clicked, and it used to take
+  // the + with it.
+  if (drawn.length === ids.length && drawn.every((tab, at) => tab.dataset.id === ids[at])) {
+    ids.forEach((id, at) => dressTab(drawn[at], id, sessions.get(id), now));
+    schedulePulseEnd(now);
+    return;
+  }
+
+  // Rebuilding the row throws its scroll position away as well. Put it back, or
+  // a hand that scrolls along a full row has it snatched back to the first tab
+  // before it can click anything.
+  const scrolled = el.tabs.scrollLeft;
   el.tabs.replaceChildren();
 
-  for (const id of order) {
+  for (const id of ids) {
     const meta = sessions.get(id);
-    if (!meta) continue;
 
     const tab = document.createElement('div');
-    tab.className =
-      'tab' +
-      (id === activeId ? ' active' : '') +
-      (meta.unseenOutput ? ' activity' : '') +
-      (meta.waiting && id !== activeId ? ' waiting' : '') +
-      (pulsing(id, meta, now) ? ' pulsing' : '');
     tab.draggable = true;
     tab.dataset.id = id;
-    tab.title = [tabLabel(meta), meta.cwd].filter(Boolean).join('\n');
 
     const title = document.createElement('span');
     title.className = 'tab-title';
-    title.textContent = tabLabel(meta);
     tab.append(title);
 
     const close = document.createElement('span');
@@ -955,11 +1003,12 @@ function renderTabs(force = false) {
       openContextMenu(event.clientX, event.clientY, id);
     };
 
+    dressTab(tab, id, meta, now);
     wireDrag(tab, id);
     el.tabs.append(tab);
   }
 
-  el.tabs.append(el.newtab);
+  el.tabs.scrollLeft = scrolled;
 
   schedulePulseEnd(now);
 }
@@ -1902,24 +1951,6 @@ function showStatus(text, timeout = 0) {
 
 function hideStatus() {
   el.status.hidden = true;
-  quietSaid = false;
-}
-
-let quietSaid = false;
-
-function answeringCheck() {
-  const meta = sessions.get(activeId);
-  const quiet = meta && meta.unanswered > 0 && meta.unansweredFor >= 3;
-  if (quiet) {
-    const chars = meta.unanswered === 1 ? '1 character' : `${meta.unanswered} characters`;
-    showStatus(
-      `${chars} typed here, and nothing in this tab has answered — the program ` +
-        'in it is not reading. What you typed is in the terminal, not lost.',
-    );
-    quietSaid = true;
-    return;
-  }
-  if (quietSaid) hideStatus();
 }
 
 wireStrip();

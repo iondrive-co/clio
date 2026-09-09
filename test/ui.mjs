@@ -1095,6 +1095,71 @@ async function main() {
     `+ at ${geometry.plusLeft} of ${geometry.windowWidth}`,
   );
 
+  console.log('\n13a. a row too full to fit still has a + on it');
+  const roomy = page.viewportSize();
+  await page.setViewportSize({ width: 520, height: roomy.height });
+  await page.waitForTimeout(600);
+
+  const full = await page.evaluate(() => {
+    const tabs = document.getElementById('tabs');
+    const plus = document.getElementById('newtab');
+    const box = plus.getBoundingClientRect();
+    const hit = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+    return {
+      rowScrolls: tabs.scrollWidth > tabs.clientWidth + 1,
+      onScreen: box.left >= 0 && box.right <= window.innerWidth + 0.5,
+      onTop: hit === plus,
+      outsideTheScroller: !tabs.contains(plus),
+    };
+  });
+  check('the row has more tabs than it can show', full.rowScrolls);
+  check('the + is still on screen', full.onScreen);
+  check('and is the topmost thing where it is drawn', full.onTop);
+  check('because it is not inside the box that scrolls', full.outsideTheScroller);
+
+  const beforePlus = await page.locator('.tab').count();
+  const plusBox = await page.locator('#newtab').boundingBox();
+  await page.mouse.click(plusBox.x + plusBox.width / 2, plusBox.y + plusBox.height / 2);
+  await page.waitForTimeout(1500);
+  const afterPlus = await page.locator('.tab').count();
+  check('a real mouse click on it opens a tab', afterPlus === beforePlus + 1, `${beforePlus} -> ${afterPlus}`);
+  const inView = await page.evaluate(() => {
+    const tabs = document.getElementById('tabs');
+    const active = tabs.querySelector('.tab.active');
+    if (!active) return null;
+    const port = tabs.getBoundingClientRect();
+    const box = active.getBoundingClientRect();
+    return { end: Math.round(box.right), edge: Math.round(port.right), wider: box.width > port.width };
+  });
+  check(
+    'and the tab it opened was scrolled to, not left off the end',
+    !!inView && inView.end <= inView.edge + 1,
+    JSON.stringify(inView),
+  );
+
+  const held = await page.evaluate(() => {
+    const tabs = document.getElementById('tabs');
+    tabs.scrollLeft = tabs.scrollWidth;
+    const scrolled = tabs.scrollLeft;
+    renderTabs(true);
+    return { scrolled, after: tabs.scrollLeft };
+  });
+  check(
+    'a row rebuilt while scrolled keeps where it was scrolled to',
+    held.scrolled > 0 && held.after === held.scrolled,
+    `${held.scrolled} -> ${held.after}`,
+  );
+
+  await page.setViewportSize(roomy);
+  await page.waitForTimeout(600);
+  await page.locator('.tab.active .tab-close').click();
+  await page.waitForTimeout(1200);
+  check(
+    'and the row is back as it was',
+    (await page.locator('.tab').count()) === beforePlus,
+    `${await page.locator('.tab').count()} vs ${beforePlus}`,
+  );
+
   console.log('\n13b. the new-window button');
   const winButton = await page.evaluate(() => {
     const button = document.getElementById('newwindow').getBoundingClientRect();

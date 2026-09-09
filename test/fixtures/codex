@@ -1,0 +1,54 @@
+#!/usr/bin/env node
+// Stands in for the codex TUI. It does the two things clio reads a codex by:
+// it holds its thread's writer lock open for as long as it is running, and it
+// puts the directory — behind a braille spinner while it is working — in the
+// terminal title. The name codex gives the thread goes into the session index,
+// first message first and the settled name after it, as codex writes it.
+import { mkdirSync, appendFileSync, openSync } from 'node:fs';
+import { basename, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+
+const argv = process.argv.slice(2);
+const words = argv.filter((word) => !word.startsWith('-'));
+const resuming = words[0] === 'resume' ? words[1] || null : null;
+
+const home = process.env.CODEX_HOME || join(process.env.HOME, '.codex');
+const id = resuming || randomUUID();
+
+mkdirSync(join(home, 'thread-writer-locks'), { recursive: true });
+openSync(join(home, 'thread-writer-locks', `${id}.lock`), 'w');
+
+const index = join(home, 'session_index.jsonl');
+const named = (name) =>
+  appendFileSync(
+    index,
+    `${JSON.stringify({ id, thread_name: name, updated_at: new Date().toISOString() })}\n`,
+  );
+
+if (!resuming) named('the first thing that was said in this thread, cut o');
+named(process.env.CODEX_TEST_NAME || `thread ${id.slice(0, 8)}`);
+
+const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const FRAME_MS = 120;
+const WORK_MS = 2400;
+
+const where = basename(process.cwd());
+const announce = (glyph) =>
+  process.stdout.write(`\x1b]0;${glyph ? `${glyph} ` : ''}${where}\x07`);
+
+process.stdout.write(`${resuming ? 'RESUMED' : 'STARTED'} ${id}\r\n`);
+announce(null);
+
+let spinning = null;
+process.stdin.on('data', () => {
+  if (spinning) return;
+  let frame = 0;
+  spinning = setInterval(() => announce(SPINNER[frame++ % SPINNER.length]), FRAME_MS);
+  setTimeout(() => {
+    clearInterval(spinning);
+    spinning = null;
+    announce(null);
+  }, WORK_MS);
+});
+
+setInterval(() => {}, 1 << 30);

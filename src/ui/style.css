@@ -48,12 +48,16 @@ body {
   user-select: none;
 }
 
+/* The row scrolls once it is full, so the strip takes only the width its tabs
+   need and shrinks from there — the + button beside it is not a child of the
+   scrolling box and cannot be scrolled out of reach. Its auto margin holds the
+   font arrows and the window bar at the right end of the row. */
 #tabs {
   display: flex;
   align-items: stretch;
   overflow-x: auto;
   scrollbar-width: none;
-  flex: 1;
+  flex: 0 1 auto;
 }
 
 #tabs::-webkit-scrollbar {
@@ -144,7 +148,8 @@ body {
   box-shadow: inset -2px 0 0 var(--accent);
 }
 
-#tabs.taking {
+#tabs.taking,
+#tabbar:has(#tabs.taking) {
   background: #2c3348;
 }
 
@@ -193,6 +198,7 @@ body {
 
 #newtab {
   flex: none;
+  margin-right: auto;
   align-self: center;
   width: 28px;
   height: 24px;
