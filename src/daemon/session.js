@@ -29,6 +29,10 @@ const SHORT_ESCAPE = /\x1b[()#][0-9A-Za-z]|\x1b[=>78]/g;
 
 const REDRAW_MS = 500;
 
+// How long a row has to have been left alone before what is on it counts as
+// something to be read rather than something in the middle of being drawn.
+export const ROW_STILL_MS = 500;
+
 const ARRIVING_QUIET_MS = 10000;
 const ARRIVING_MAX_MS = 120000;
 
@@ -264,11 +268,16 @@ export class Session {
 
   markSeen() {
     this.seenScreen = this.screen.snapshot();
+    this.screen.forgetChurn();
   }
 
-  screenIsNew() {
+  // What is on the screen that was not there when somebody last looked. Rows
+  // still being repainted are left out of the count until they hold still, so a
+  // tab with an animation in a corner of it is judged on the rest of its screen;
+  // MOVING comes back when that is all there was, and the answer may yet change.
+  screenIsNew({ now = Date.now(), still = ROW_STILL_MS } = {}) {
     if (!this.screen.sure || this.seenScreen === null) return null;
-    return isNews(this.seenScreen, this.screen.snapshot());
+    return isNews(this.seenScreen, this.screen.snapshot(), { settledBy: now - still });
   }
 
   append(data) {

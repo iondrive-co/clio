@@ -11,6 +11,23 @@ const CHECKING = 'Checking for update';
 const HINTS = ['283539 tokens', 'new task? /clear to save 283.5k'];
 const HINT_WIDTH = Math.max(...HINTS.map((text) => text.length));
 
+// Three rows of dots, ten times a second, the way codex 0.154 draws behind its
+// composer: most of the screen untouched, and nothing anybody can read.
+const DUST = [21, 22, 23];
+
+let speck = 0;
+let dusting = null;
+
+const dust = () => {
+  speck += 1;
+  let out = '\x1b[?25l';
+  for (const [n, row] of DUST.entries()) {
+    out += `\x1b[${row};1H\x1b[K`;
+    for (let i = 0; i < 3; i++) out += `\x1b[${row};${1 + ((speck * (7 + n * 3) + i * 17) % 70)}H⠁`;
+  }
+  return `${out}\x1b[24;1H\x1b[?25h`;
+};
+
 const at = (body) => `\x1b[?25l\x1b[H\r\x1b[19C\x1b[9B${body}\x1b[24;1H\x1b[?25h`;
 const under = (body) => `\x1b[?25l\x1b[H\r\x1b[2C\x1b[10B${body}\x1b[24;1H\x1b[?25h`;
 
@@ -24,6 +41,13 @@ process.stdin.on('data', (data) => {
     setTimeout(() => write(at(`${' '.repeat(CURRENT.length)}\x1b[52G${' '.repeat(CHECKING.length)}`)), 500);
   } else if (typed.includes('h')) {
     write(under(HINTS[hint++ % HINTS.length].padEnd(HINT_WIDTH)));
+  } else if (typed.includes('d')) {
+    if (dusting) {
+      clearInterval(dusting);
+      dusting = null;
+    } else {
+      dusting = setInterval(() => write(dust()), 90);
+    }
   } else if (typed.includes('n')) {
     write(`\x1b[${12 + ++said};1Hthe build failed (${said})\r\n`);
   }

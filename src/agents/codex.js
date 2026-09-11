@@ -13,8 +13,18 @@ const INDEX = 'session_index.jsonl';
 const TAIL_BYTES = 64 * 1024;
 
 // Codex spins the braille frames through the terminal title while it is working,
-// the way Claude Code spins ◐◑◒◓ through its own.
+// the way Claude Code spins ◐◑◒◓ through its own. Since 0.154 it may wrap the
+// frame in brackets — `[ ⠹ ] Working | …` — so the frame is looked for at the
+// front of the title rather than only as its first character.
 const SPINNER = new Set([...'⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏']);
+
+const SPINNER_IN = 4;
+
+// And when it is blocked on the person at the keyboard it says so outright,
+// blinking the marker between these two forms about twice a second. A title
+// that never stands still can never satisfy the rule below, so codex is taken
+// at its word instead of being timed.
+const BLOCKED = /\[\s*[!.]\s*\]\s*Action Required/i;
 
 const WAITING_STILL_MS = 1500;
 
@@ -196,7 +206,8 @@ export default {
 
   activity(state, { termTitle = null, titleAt = 0, now = Date.now() } = {}) {
     if (!termTitle) return null;
-    if (SPINNER.has([...termTitle][0])) return 'working';
+    if ([...termTitle].slice(0, SPINNER_IN).some((glyph) => SPINNER.has(glyph))) return 'working';
+    if (BLOCKED.test(termTitle)) return 'waiting';
     return now - titleAt >= WAITING_STILL_MS ? 'waiting' : null;
   },
 

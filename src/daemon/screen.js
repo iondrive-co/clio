@@ -11,6 +11,15 @@ const MAX_ROWS = 500;
 
 const STATUS_ROWS = 2;
 
+// What `isNews` says when the only rows that differ are still being repainted:
+// neither news nor the absence of it, ask again once they hold still.
+export const MOVING = 'moving';
+
+// How many times a row can have been rewritten since somebody last looked and
+// still be taken for something they ought to read. Above it the row is being
+// animated, and an animation is only worth reading once it stops.
+const CHURN = 3;
+
 const SCREEN_MODES = new Set([47, 1047, 1049]);
 const PRIVATE_MODE = /\x1b\[\?([0-9;]*)([hl])/g;
 
@@ -57,6 +66,8 @@ class Grid {
     this.known = known;
     this.lines = [];
     this.hashes = [];
+    this.stamps = new Array(rows).fill(0);
+    this.rewrites = new Array(rows).fill(0);
     for (let y = 0; y < rows; y++) this.lines.push(this.blank());
   }
 
@@ -72,8 +83,14 @@ class Grid {
     return line;
   }
 
-  changed(y) {
+  // When a row was last rewritten, and how often, as well as that it was: a row
+  // being repainted ten times a second is an animation, and telling that from
+  // something somebody ought to read takes the clock and the tally as well as
+  // the contents.
+  changed(y, at = 0) {
     this.hashes[y] = null;
+    this.stamps[y] = at;
+    this.rewrites[y] = (this.rewrites[y] || 0) + 1;
   }
 
   digest() {
@@ -103,6 +120,7 @@ export class Screen {
     this.savedCursor = null;
     this.placed = known;
     this.carry = '';
+    this.at = 0;
   }
 
   get sure() {
@@ -112,6 +130,15 @@ export class Screen {
   forget() {
     this.grid.known = false;
     this.placed = false;
+  }
+
+  // Somebody has looked, so how often each row has been rewritten counts again
+  // from here: what makes a row an animation is that it keeps changing between
+  // one look at the screen and the next.
+  forgetChurn() {
+    for (const grid of [this.main, this.alt]) {
+      if (grid) grid.rewrites = new Array(this.rows).fill(0);
+    }
   }
 
   digest() {
@@ -128,6 +155,8 @@ export class Screen {
       grid: this.grid === this.alt ? 'alt' : 'main',
       cols: this.cols,
       rows,
+      stamps: this.grid.stamps.slice(0, this.rows),
+      rewrites: this.grid.rewrites.slice(0, this.rows),
       blank: blankHash(this.cols),
     };
   }
@@ -153,6 +182,8 @@ export class Screen {
       if (!grid) continue;
       grid.cols = wide;
       grid.hashes = [];
+      grid.stamps = new Array(tall).fill(this.at);
+      grid.rewrites = new Array(tall).fill(0);
       while (grid.lines.length < tall) grid.lines.push(grid.blank());
       grid.rows = tall;
     }
@@ -163,7 +194,8 @@ export class Screen {
     this.pendingWrap = false;
   }
 
-  write(text) {
+  write(text, at = Date.now()) {
+    this.at = at;
     try {
       this.parse(this.carry + String(text ?? ''));
     } catch {
@@ -216,7 +248,7 @@ export class Screen {
         x += 1;
         i += code > 0xffff ? 2 : 1;
       }
-      this.grid.changed(this.y);
+      this.grid.changed(this.y, this.at);
       if (x < this.cols) {
         this.x = x;
         continue;
@@ -615,8 +647,14 @@ export class Screen {
     this.restack();
   }
 
+  // Rows that have been shuffled — scrolled, inserted, deleted, erased wholesale
+  // — have all changed their contents, so they are all stamped with this write.
   restack() {
     this.grid.hashes = [];
+    this.grid.stamps = new Array(this.rows).fill(this.at);
+    for (let y = 0; y < this.rows; y++) {
+      this.grid.rewrites[y] = (this.grid.rewrites[y] || 0) + 1;
+    }
   }
 
   insertCells(n) {
@@ -626,7 +664,7 @@ export class Screen {
       row.splice(this.x, 0, UNWRITTEN);
       row.pop();
     }
-    this.grid.changed(this.y);
+    this.grid.changed(this.y, this.at);
   }
 
   deleteCells(n) {
@@ -636,7 +674,7 @@ export class Screen {
       row.splice(this.x, 1);
       row.push(UNWRITTEN);
     }
-    this.grid.changed(this.y);
+    this.grid.changed(this.y, this.at);
   }
 
   eraseCells(n) {
@@ -644,7 +682,7 @@ export class Screen {
     const row = this.grid.row(this.y);
     const to = Math.min(this.cols, this.x + n);
     for (let x = this.x; x < to; x++) row[x] = UNWRITTEN;
-    this.grid.changed(this.y);
+    this.grid.changed(this.y, this.at);
   }
 
   eraseLine(how) {
@@ -653,7 +691,7 @@ export class Screen {
     const from = how === 0 ? this.x : 0;
     const to = how === 1 ? this.x : this.cols - 1;
     for (let x = from; x <= to; x++) row[x] = UNWRITTEN;
-    this.grid.changed(this.y);
+    this.grid.changed(this.y, this.at);
   }
 
   eraseScreen(how) {
@@ -696,18 +734,34 @@ function clamp(value, low, high) {
   return Math.max(low, Math.min(high, Math.trunc(number)));
 }
 
-export function isNews(seen, now) {
+// Whether what is on the screen now is worth telling somebody about, given what
+// was on it when they last looked.
+//
+// A row that is still being repainted is not an answer yet — an animation moves
+// three rows ten times a second, and an agent part-way through a reply moves
+// more than that — so with `settledBy` such a row only counts once it has been
+// left alone, and MOVING comes back to say the question is still open. It takes
+// both the clock and the tally to say that: a row written once and still warm is
+// a line somebody printed, and waiting on it would lose it if the daemon stood
+// down in between. Without `settledBy` every row counts, which is what a caller
+// with no clock gets.
+export function isNews(seen, now, { settledBy = null } = {}) {
   if (!seen || !now) return true;
   if (seen.grid !== now.grid || seen.cols !== now.cols || seen.rows.length !== now.rows.length) {
     return true;
   }
   let rewritten = 0;
+  let moving = false;
   for (let y = 0; y < now.rows.length; y++) {
     if (seen.rows[y] === now.rows[y]) continue;
+    if (settledBy !== null && (now.stamps?.[y] ?? 0) > settledBy && (now.rewrites?.[y] ?? 0) > CHURN) {
+      moving = true;
+      continue;
+    }
     if (seen.rows[y] === seen.blank || now.rows[y] === now.blank) return true;
     if (++rewritten > STATUS_ROWS) return true;
   }
-  return false;
+  return moving ? MOVING : false;
 }
 
 export function lastScreenSwap(text) {

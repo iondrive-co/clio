@@ -191,7 +191,22 @@ function readsTheCommand() {
     check(`${argv.join(' ')}  →  not one`, !codex.matches({ argv, exe: null }), 'matched');
   }
 
-  console.log('\n2. coming back on a thread keeps the command it was given');
+  console.log('\n2. what its terminal title says it is doing');
+
+  const now = Date.now();
+  const says = (termTitle, titleAt = now) => codex.activity({}, { termTitle, titleAt, now });
+
+  // 0.154 blinks the marker between these two, twice a second, for as long as it
+  // is blocked — so the title is never still and only what it says can be read.
+  check('[ ! ] Action Required  →  waiting', says('[ ! ] Action Required | Add strategies | hermes') === 'waiting');
+  check('[ . ] Action Required  →  waiting, blinked or not', says('[ . ] Action Required | Add strategies | hermes') === 'waiting');
+  check('a braille frame  →  working', says('⠹ hermes') === 'working');
+  check('and a braille frame in brackets  →  working too', says('[ ⠹ ] Working | Add strategies | hermes') === 'working');
+  check('a title that has stood still  →  waiting', says('hermes', now - 3000) === 'waiting');
+  check('a title that has just moved  →  no answer yet', says('hermes', now - 100) === null);
+  check('no title at all  →  no answer', says(null) === null);
+
+  console.log('\n3. coming back on a thread keeps the command it was given');
 
   const thread = '01a08106-af63-7811-90fb-565bf6e00384';
   const shapes = [
@@ -237,7 +252,7 @@ async function main() {
   console.log(`\nsandbox at ${TMP}\n`);
   const info = await startDaemon();
 
-  console.log('3. a codex in a tab, and an ordinary command next to it');
+  console.log('4. a codex in a tab, and an ordinary command next to it');
   const win = 'c'.repeat(8);
   const client = new Client(info, win);
   await client.connect();
@@ -263,7 +278,7 @@ async function main() {
   );
   const thread = started?.[1];
 
-  console.log('\n4. the tab is named after the thread, not the directory');
+  console.log('\n5. the tab is named after the thread, not the directory');
   const named = await until(() => client.tab(codexTab)?.ext?.title === THREAD_NAME, 20000);
   check('the tab is marked as holding a codex', client.tab(codexTab)?.ext?.kind === 'codex',
     JSON.stringify(client.tab(codexTab)?.ext));
@@ -280,7 +295,7 @@ async function main() {
     savedCodex?.kind === 'codex' && savedCodex?.state?.threadId === thread,
     JSON.stringify(savedCodex));
 
-  console.log('\n5. codex renames the thread, and the tab follows');
+  console.log('\n6. codex renames the thread, and the tab follows');
   const renamed = 'Audit completed plans boards';
   appendFileSync(
     INDEX,
@@ -292,7 +307,7 @@ async function main() {
     JSON.stringify(client.tab(codexTab)?.ext),
   );
 
-  console.log('\n6. the daemon is killed outright, and started again');
+  console.log('\n7. the daemon is killed outright, and started again');
   client.close();
   daemon.kill('SIGKILL');
   await sleep(700);
@@ -324,7 +339,7 @@ async function main() {
     JSON.stringify(since.slice(-300)),
   );
 
-  console.log('\n7. a one-shot codex is not a thread to come back to');
+  console.log('\n8. a one-shot codex is not a thread to come back to');
   const oneShot = await back.newTab();
   await sleep(800);
   back.send({ t: 'input', id: oneShot, data: 'codex exec do a thing\n' });

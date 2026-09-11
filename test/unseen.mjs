@@ -5,7 +5,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import WebSocket from 'ws';
 
-import { Screen, isNews, lastScreenSwap } from '../src/daemon/screen.js';
+import { Screen, isNews, lastScreenSwap, MOVING } from '../src/daemon/screen.js';
 import { drawsSomething } from '../src/daemon/output.js';
 import { Session } from '../src/daemon/session.js';
 
@@ -124,6 +124,51 @@ function screenTests() {
   check('two rows rewritten in place is a status block', !isNews(start, creep.snapshot()));
   creep.write('\x1b[3;1H3rd  ');
   check('three is a program drawing', isNews(start, creep.snapshot()));
+
+  // Three rows repainted ten times a second is an animation, not a program
+  // drawing something to be read — codex 0.154 draws a field of braille dots
+  // behind its composer, in greys a shade off the background, and never stops.
+  const dusty = new Screen({ cols: 80, rows: 10 });
+  dusty.write('\x1b[H\x1b[2Jwhat it said before\r\n❯ ', 1000);
+  let clock = 1000;
+  const puff = (n) =>
+    [8, 9, 10]
+      .map((row, i) => `\x1b[${row};1H\x1b[K${' '.repeat((n * (3 + i * 5) + i * 7) % 40)}⠁`)
+      .join('');
+  dusty.write(puff(0), (clock += 90));
+  const glanced = dusty.snapshot();
+  for (let n = 1; n <= 12; n++) dusty.write(puff(n), (clock += 90));
+
+  check('dust still moving is not an answer either way', isNews(glanced, dusty.snapshot(), { settledBy: clock - 500 }) === MOVING);
+  check('and to a caller with no clock it is news, as it always was', isNews(glanced, dusty.snapshot()) === true);
+
+  dusty.write('\x1b[4;1H  the build failed', (clock += 90));
+  for (let n = 13; n <= 20; n++) dusty.write(puff(n), (clock += 90));
+  check('a line printed behind the dust is news while it is still falling', isNews(glanced, dusty.snapshot(), { settledBy: clock - 500 }) === true);
+
+  check('and dust that stops is a change like any other', isNews(glanced, dusty.snapshot(), { settledBy: clock + 500 }) === true);
+
+  const status = new Screen({ cols: 80, rows: 10 });
+  status.write('\x1b[H\x1b[2Jone\r\ntwo\r\nthree\r\nfour', 1000);
+  const read = status.snapshot();
+  status.write('\x1b[1;1H1st', 2000);
+  check('a status line that has settled is no news, as before', isNews(read, status.snapshot(), { settledBy: 2500 }) === false);
+
+  // A row written once and still warm is a line somebody printed, not an
+  // animation — waiting for that one to settle would lose it if the daemon
+  // stood down in between.
+  const printed = new Screen({ cols: 80, rows: 10 });
+  printed.write('\x1b[H\x1b[2J$ ', 1000);
+  const atPrompt = printed.snapshot();
+  printed.write('\x1b[5;1Hthe build failed', 2000);
+  check('a line printed a moment ago is news at once, not once it settles', isNews(atPrompt, printed.snapshot(), { settledBy: 1900 }) === true);
+  check('and three rows written once each are a program drawing, warm or not', (() => {
+    const drawing = new Screen({ cols: 80, rows: 10 });
+    drawing.write('\x1b[H\x1b[2Jone\r\ntwo\r\nthree\r\nfour', 1000);
+    const looked = drawing.snapshot();
+    drawing.write('\x1b[1;1H1st\x1b[2;1H2nd\x1b[3;1H3rd', 2000);
+    return isNews(looked, drawing.snapshot(), { settledBy: 1900 }) === true;
+  })());
 
   const inPlace = new Screen({ cols: 80, rows: 10 });
   inPlace.write('\x1b[H\x1b[2Jdownloading… 99%');
@@ -475,6 +520,24 @@ async function daemonTests() {
   client.send({ t: 'focus', id: painting.id });
   await sleep(400);
   check('and looking at the tab puts the red out', !client.red(painting.id));
+
+  client.send({ t: 'input', id: painting.id, data: 'd' });
+  await sleep(600);
+  client.send({ t: 'focus', id: other.id });
+  await sleep(400);
+  client.everRed.delete(painting.id);
+  await sleep(4000);
+  check('three rows of dust, ten times a second, do not turn the tab red',
+    !client.red(painting.id) && !client.everRed.has(painting.id));
+
+  client.send({ t: 'input', id: painting.id, data: 'n' });
+  await sleep(3000);
+  check('and a line printed behind the dust still does', client.red(painting.id));
+
+  client.send({ t: 'input', id: painting.id, data: 'd' });
+  client.send({ t: 'focus', id: painting.id });
+  await sleep(600);
+  check('looking at it puts that red out too', !client.red(painting.id));
 
   console.log('\n5. and after a reload, on a screen this daemon never saw');
   await sleep(3500);

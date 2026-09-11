@@ -11,6 +11,8 @@ import { isAlive, cwdOf } from './procinfo.js';
 import { locate, spool, quote, searchBudget, MAX_SPOOL_BYTES } from './drops.js';
 import { SessionManager } from './manager.js';
 import { drawsSomething } from './output.js';
+import { MOVING } from './screen.js';
+import { ROW_STILL_MS } from './session.js';
 import {
   openBrowserWindow,
   openUrl,
@@ -715,7 +717,7 @@ async function main() {
     if (successorEntry !== ENTRY) console.log(`[clio] handing over to ${successorEntry}`);
 
     manager.pauseAll();
-    for (const id of [...bursts.keys()]) decideUnseen(id);
+    for (const id of [...bursts.keys()]) decideUnseen(id, { wait: false });
     manager.saveNow();
 
     const fds = [];
@@ -1085,7 +1087,7 @@ async function main() {
   function noteUnseen(session, data) {
     let burst = bursts.get(session.id);
     if (!burst) {
-      burst = { drew: false, forClio: false, timer: null };
+      burst = { drew: false, forClio: false, again: false, timer: null };
       burst.timer = setTimeout(() => decideUnseen(session.id), UNSEEN_SETTLE_MS);
       burst.timer.unref?.();
       bursts.set(session.id, burst);
@@ -1101,8 +1103,8 @@ async function main() {
     bursts.delete(id);
   }
 
-  function decideUnseen(id) {
-    const burst = bursts.get(id) || { drew: false, forClio: false };
+  function decideUnseen(id, { wait = true } = {}) {
+    const burst = bursts.get(id) || { drew: false, forClio: false, again: false };
     forgetUnseen(id);
     const session = manager.get(id);
     if (!session) return;
@@ -1116,6 +1118,24 @@ async function main() {
     }
 
     const news = session.screenIsNew();
+
+    // Rows that were still moving when the question was asked are not an answer
+    // to it: an animation repaints them ten times a second, and so does an agent
+    // half way through a reply. Give them one settling time to stop. If they are
+    // still going by then the tab is animating and there is nothing to say —
+    // its next burst of output asks again anyway, and anything that arrives
+    // outside the moving rows is still news while it does. A daemon standing
+    // down cannot wait for anything, so it takes that silence for its answer.
+    if (news === MOVING) {
+      if (wait && !burst.again) {
+        const settling = { ...burst, again: true, timer: null };
+        settling.timer = setTimeout(() => decideUnseen(id), ROW_STILL_MS);
+        settling.timer.unref?.();
+        bursts.set(id, settling);
+      }
+      return;
+    }
+
     let wants = session.unseenOutput;
     if (news === false) {
       wants = false;
