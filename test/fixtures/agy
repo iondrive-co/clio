@@ -1,0 +1,43 @@
+#!/usr/bin/env node
+// Stands in for the agy TUI. It does what clio reads an antigravity session by:
+// it holds its conversation's presence lock open for as long as it is running,
+// and writes the conversation's title to annotations/<id>.pbtxt.
+import { mkdirSync, writeFileSync, openSync } from 'node:fs';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+
+const argv = process.argv.slice(2);
+let resuming = null;
+for (let i = 0; i < argv.length; i++) {
+  if (argv[i] === '--conversation' && argv[i + 1]) {
+    resuming = argv[i + 1];
+    break;
+  }
+  const m = /^--conversation=(.+)$/.exec(argv[i]);
+  if (m) {
+    resuming = m[1];
+    break;
+  }
+}
+
+const home =
+  process.env.ANTIGRAVITY_HOME ||
+  process.env.ANTIGRAVITY_CONFIG_DIR ||
+  process.env.GEMINI_DIR ||
+  join(process.env.HOME, '.gemini', 'antigravity-cli');
+
+const id = resuming || randomUUID();
+
+mkdirSync(join(home, 'presence'), { recursive: true });
+mkdirSync(join(home, 'annotations'), { recursive: true });
+
+openSync(join(home, 'presence', `${id}.lock`), 'w');
+
+const named = (name) =>
+  writeFileSync(join(home, 'annotations', `${id}.pbtxt`), `title:"${name}"\n`);
+
+if (!resuming) named(process.env.ANTIGRAVITY_TEST_NAME || `session ${id.slice(0, 8)}`);
+
+process.stdout.write(`${resuming ? 'RESUMED' : 'STARTED'} ${id}\r\n`);
+
+setInterval(() => {}, 1 << 30);
