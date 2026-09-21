@@ -1606,6 +1606,18 @@ async function main() {
       if (!handingOver) unlinkSync(HANDSHAKE_FILE);
     } catch {
     }
+    // Going down for good: take the session trees with us. A handover is the one case that must
+    // not, because the daemon taking over adopts these ptys by fd — see Manager.reapAll. Without
+    // this every stop left one shell per tab running under init, and whatever was inside it: the
+    // box had six abandoned daemons' worth of them, some three weeks old, still holding files open.
+    if (!handingOver) {
+      try {
+        const ended = manager.reapAll();
+        if (ended) console.log(`[clio] ended ${ended} process(es) belonging to open sessions`);
+      } catch (err) {
+        console.error(`[clio] could not end session processes: ${err?.message || err}`);
+      }
+    }
     process.exit(0);
   };
 

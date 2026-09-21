@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { Session } from './session.js';
-import { childEnvirons, cwdOf, environOf, startedAt, markedProcesses } from './procinfo.js';
+import { childEnvirons, cwdOf, environOf, startedAt, markedProcesses, killTree, killTrees } from './procinfo.js';
 import {
   observeExtension,
   observeAttention,
@@ -521,6 +521,13 @@ export class SessionManager extends EventEmitter {
 
     if (session.pty) {
       session.onExit = null;
+      // The whole tree, not just the shell. `pty.kill()` signals the shell alone, so anything the
+      // user was running in the tab — an agent CLI, an ssh, a dev server — was handed to init and
+      // went on running with nothing able to reach it. See [killTree].
+      try {
+        killTree(session.pty.pid, { session: id });
+      } catch {
+      }
       try {
         session.pty.kill();
       } catch {
@@ -529,6 +536,33 @@ export class SessionManager extends EventEmitter {
 
     this.scheduleSave();
     this.emit('update');
+  }
+
+  /**
+   * Ends every session's process tree. The daemon going down for good, and nothing else.
+   *
+   * Not on a handover, where the point is the opposite: the incoming daemon adopts these same ptys
+   * by fd (see [adoptHandover]), so killing them would take the sessions the handover exists to
+   * preserve. Immortality is a promise about a daemon being replaced, not about one being stopped
+   * — a session nothing can ever reach again is a leak, and before this every `clio` shutdown left
+   * one per tab behind.
+   */
+  reapAll() {
+    const specs = [];
+    for (const session of this.sessions.values()) {
+      const pid = session.pty?.pid;
+      if (!pid) continue;
+      session.onExit = null;
+      specs.push({ pid, session: session.id });
+    }
+    if (!specs.length) return 0;
+    // One grace for the lot — see [killTrees]. Per session it made shutdown slow enough to be
+    // killed part-way through.
+    try {
+      return killTrees(specs).length;
+    } catch {
+      return 0;
+    }
   }
 
   rename(id, title) {
